@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"xui-end-bot/internal/config"
+	"xui-reseller-bot/internal/config"
 )
 
 func TestGetSubscriptionLinksUsesPublicSubscriptionBaseURL(t *testing.T) {

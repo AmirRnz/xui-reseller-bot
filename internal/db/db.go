@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"xui-end-bot/internal/config"
+	"xui-reseller-bot/internal/config"
 )
 
 var Pool *pgxpool.Pool

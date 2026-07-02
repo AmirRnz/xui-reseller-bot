@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"gopkg.in/telebot.v3"
-	"xui-end-bot/internal/bot"
-	"xui-end-bot/internal/config"
-	"xui-end-bot/internal/db"
-	"xui-end-bot/internal/xui"
+	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/config"
+	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/xui"
 )
 
 const servicesPageSize = 6
@@ -1039,7 +1039,7 @@ func clientConfigFromSubscription(sub *db.Subscription, email string) xui.Client
 			planName = plan.Name
 		}
 	}
-	comment := fmt.Sprintf("created by xui-end-bot, %s, %s", planName, userIdentifier(user))
+	comment := fmt.Sprintf("created by xui-reseller-bot, %s, %s", planName, userIdentifier(user))
 	client := newClientConfig(email, group, tgID, total, expireMilli, sub.IPLimit, flow, sub.SubID, sub.ClientUUID, comment)
 	return client
 }

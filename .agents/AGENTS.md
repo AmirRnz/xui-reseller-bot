@@ -20,8 +20,8 @@ Be proactive and explicit in using the available MCP servers:
 - **`context7`**: Use this to query up-to-date documentation for third-party libraries and resolve library IDs.
 
 ## Deployment & Naming
-- The project is named `xui-end-bot`. All Go files and module name use the module path `xui-end-bot`.
+- The project is named `xui-reseller-bot`. All Go files and module name use the module path `xui-reseller-bot`.
 - The bot is deployed to the 203.202.232.117 VPS using the `ssh-mcp` MCP server.
-- The remote deployment directory on the VPS is `/opt/xui-end-bot`.
-- The systemd service on the VPS is `xui-end-bot.service`.
+- The remote deployment directory on the VPS is `/opt/xui-reseller-bot`.
+- The systemd service on the VPS is `xui-reseller-bot.service`.
 

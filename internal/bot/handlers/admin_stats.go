@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"gopkg.in/telebot.v3"
-	"xui-end-bot/internal/db"
+	"xui-reseller-bot/internal/db"
 )
 
 func RegisterAdminStats(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.MiddlewareFunc) {

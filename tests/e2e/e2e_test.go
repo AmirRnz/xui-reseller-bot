@@ -14,12 +14,12 @@ import (
 	"time"
 
 	"gopkg.in/telebot.v3"
-	"xui-end-bot/internal/bot"
-	"xui-end-bot/internal/bot/handlers"
-	"xui-end-bot/internal/config"
-	"xui-end-bot/internal/db"
-	"xui-end-bot/internal/scheduler"
-	"xui-end-bot/internal/xui"
+	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/bot/handlers"
+	"xui-reseller-bot/internal/config"
+	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/scheduler"
+	"xui-reseller-bot/internal/xui"
 )
 
 func getStr(resp map[string]interface{}, key string) string {

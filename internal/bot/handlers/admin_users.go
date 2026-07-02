@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"gopkg.in/telebot.v3"
-	"xui-end-bot/internal/bot"
-	"xui-end-bot/internal/db"
+	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/db"
 )
 
 const usersPageSize = 15

@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"gopkg.in/telebot.v3"
-	"xui-end-bot/internal/bot"
-	"xui-end-bot/internal/config"
-	"xui-end-bot/internal/db"
-	"xui-end-bot/internal/xui"
+	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/config"
+	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/xui"
 )
 
 var walletAdminCfg *config.AdminConfig
@@ -510,7 +510,7 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 	totalBytes := int64(req.DataGB) * 1073741824
 	subID := makeSubID()
 	clientUUID := makeClientUUID()
-	comment := fmt.Sprintf("created by xui-end-bot, %s, %s", plan.Name, userIdentifier(user))
+	comment := fmt.Sprintf("created by xui-reseller-bot, %s, %s", plan.Name, userIdentifier(user))
 	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
 	adjustedIPLimit := ApplyIPLimitFactor(req.IPLimit, factor)
 	client := newClientConfig(req.ClientEmail, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, adjustedIPLimit, plan.Flow, subID, clientUUID, comment)

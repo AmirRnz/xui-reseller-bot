@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"gopkg.in/telebot.v3"
-	"xui-end-bot/internal/bot"
-	"xui-end-bot/internal/db"
-	"xui-end-bot/internal/qr"
-	"xui-end-bot/internal/xui"
+	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/qr"
+	"xui-reseller-bot/internal/xui"
 )
 
 var safeNamePattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]{1,63}$`)

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"xui-end-bot/internal/config"
+	"xui-reseller-bot/internal/config"
 )
 
 type Client struct {

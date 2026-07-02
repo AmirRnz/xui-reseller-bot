@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"xui-end-bot/internal/db"
+	"xui-reseller-bot/internal/db"
 )
 
 func TestCalculateRefund(t *testing.T) {

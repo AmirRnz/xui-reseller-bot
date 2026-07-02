@@ -8,9 +8,9 @@ import (
 
 	"gopkg.in/telebot.v3"
 	"gopkg.in/telebot.v3/middleware"
-	"xui-end-bot/internal/config"
-	"xui-end-bot/internal/fsm"
-	"xui-end-bot/internal/xui"
+	"xui-reseller-bot/internal/config"
+	"xui-reseller-bot/internal/fsm"
+	"xui-reseller-bot/internal/xui"
 )
 
 var (

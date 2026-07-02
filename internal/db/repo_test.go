@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"xui-end-bot/internal/config"
+	"xui-reseller-bot/internal/config"
 )
 
 func setupTestDB(t *testing.T) context.Context {

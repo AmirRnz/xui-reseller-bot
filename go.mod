@@ -1,4 +1,4 @@
-module xui-end-bot
+module xui-reseller-bot
 
 go 1.25.0
 

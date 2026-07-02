@@ -9,9 +9,9 @@ import (
 	"time"
 
 	"gopkg.in/telebot.v3"
-	"xui-end-bot/internal/bot"
-	"xui-end-bot/internal/db"
-	"xui-end-bot/internal/xui"
+	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/xui"
 )
 
 func RegisterTestSub(b *telebot.Bot, auth telebot.MiddlewareFunc) {
@@ -198,7 +198,7 @@ func createAndSendTest(c telebot.Context, user *db.User, plan *db.TestPlan, emai
 	var expireAt time.Time
 	subID := makeSubID()
 	clientUUID := makeClientUUID()
-	comment := fmt.Sprintf("created by xui-end-bot, %s, %s", plan.Name, userIdentifier(user))
+	comment := fmt.Sprintf("created by xui-reseller-bot, %s, %s", plan.Name, userIdentifier(user))
 	client := newClientConfig(email, serviceGroup(user), user.TelegramID, plan.MaxDataBytes, expireMilli, 1, plan.Flow, subID, clientUUID, comment)
 	inboundIDs := validInboundIDs(plan.InboundIDs)
 	if len(inboundIDs) == 0 {

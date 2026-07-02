@@ -5,8 +5,8 @@ import (
 	"log"
 
 	"gopkg.in/telebot.v3"
-	"xui-end-bot/internal/config"
-	"xui-end-bot/internal/db"
+	"xui-reseller-bot/internal/config"
+	"xui-reseller-bot/internal/db"
 )
 
 func AuthMiddleware() telebot.MiddlewareFunc {
