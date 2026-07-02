@@ -1,0 +1,6 @@
+bot_linux
+bot_linux.exe
+bot.exe
+*.zip
+config.yaml
+.gocache/

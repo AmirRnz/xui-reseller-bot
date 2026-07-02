@@ -1,0 +1,17 @@
+bot:
+  token: "YOUR_TELEGRAM_BOT_TOKEN"
+  webhook_domain: "" # Set this for webhook, leave empty for polling
+  webhook_port: 88
+  tls_key_file: ""
+  tls_cert_file: ""
+database:
+  url: "postgres://user:password@localhost:5432/xui_bot"
+xui:
+  url: "http://your_xui_panel_url"
+  base_url: "http://your_xui_panel_url"
+  subscription_base_url: "https://your_subscription_domain:10882"
+  subscription_path: "/sub/"
+  api_token: "YOUR_3X_UI_API_TOKEN"
+admin:
+  admin_ids:
+    - 123456789 # Replace with your Telegram User ID
