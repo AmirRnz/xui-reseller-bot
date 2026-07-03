@@ -139,8 +139,6 @@ func HandleText(c telebot.Context) error {
 			return ProcessAdminDraftInput(c, text)
 		case "awaiting_admin_plan_access":
 			return ProcessAdminPlanAccess(c, text)
-		case "awaiting_claim_subscription_link":
-			return ProcessClaimSubscriptionLink(c, text)
 		case "awaiting_service_name":
 			return ProcessServiceName(c, text)
 		}

@@ -9,7 +9,6 @@ func RegisterAdminMenu(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebo
 	b.Handle("\fadmin_menu", HandleAdminMenu, auth, admin)
 	b.Handle("\fadmin_flow", HandleAdminFlow, auth, admin)
 	b.Handle("\fadmin_pending_topups", HandleAdminPendingTopups, auth, admin)
-	b.Handle("\fadmin_pending_claims", HandleAdminPendingClaims, auth, admin)
 
 	RegisterAdminUsers(b, auth, admin)
 	RegisterAdminSettings(b, auth, admin)
@@ -24,7 +23,6 @@ func HandleAdminMenu(c telebot.Context) error {
 		menu.Row(menu.Data("⚙️ Settings", "admin_settings"), menu.Data("📊 Stats", "admin_stats")),
 		menu.Row(
 			menu.Data("📥 Pending Top-Ups", "admin_pending_topups"),
-			menu.Data("🔍 Pending Claims", "admin_pending_claims"),
 		),
 	)
 	return maybeEditOrSend(c, "⚙️ **Admin Panel**", menu)
