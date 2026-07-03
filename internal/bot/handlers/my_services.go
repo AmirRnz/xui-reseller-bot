@@ -74,7 +74,6 @@ func showServicesPage(c telebot.Context, page int) error {
 		if user.ServiceName != nil && *user.ServiceName != "" {
 			allClients, err := bot.XUIClient.ListClients()
 			if err == nil {
-				activeSubs := make([]*db.Subscription, 0)
 				existingClients := make(map[string]bool)
 				existingSubsByEmail := make(map[string]*db.Subscription)
 
