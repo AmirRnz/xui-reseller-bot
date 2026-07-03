@@ -72,21 +72,23 @@ func showServicesPage(c telebot.Context, page int) error {
 
 	if bot.XUIClient != nil {
 		if user.ServiceName != nil && *user.ServiceName != "" {
-			emails, err := bot.XUIClient.GetClientEmailsByGroup(*user.ServiceName)
+			allClients, err := bot.XUIClient.ListClients()
 			if err == nil {
+				activeSubs := make([]*db.Subscription, 0)
 				existingClients := make(map[string]bool)
 				existingSubsByEmail := make(map[string]*db.Subscription)
+
 				for _, sub := range subs {
 					existingSubsByEmail[sub.ClientEmail] = sub
 				}
 
-				for _, email := range emails {
-					client, err := bot.XUIClient.GetClientByEmail(email)
-					if err != nil || client == nil {
+				for _, client := range allClients {
+					if client.Group != *user.ServiceName {
 						continue
 					}
-					existingClients[client.SubID] = true
 					
+					existingClients[client.Email] = true
+
 					if _, found := existingSubsByEmail[client.Email]; !found {
 						expTime := client.ExpiryTime
 						if expTime == 0 {
@@ -118,10 +120,10 @@ func showServicesPage(c telebot.Context, page int) error {
 
 				var activeSubs []*db.Subscription
 				for _, sub := range subs {
-					if existingClients[sub.SubID] {
+					if existingClients[sub.ClientEmail] {
 						activeSubs = append(activeSubs, sub)
 					} else {
-						log.Printf("Deleting orphan subscription %s (SubID: %s) from DB because it no longer exists on 3x-ui in group.", sub.ClientEmail, sub.SubID)
+						log.Printf("Deleting orphan subscription %s from DB because it no longer exists on 3x-ui in group.", sub.ClientEmail)
 						_ = db.DeleteSubscription(context.Background(), sub.ID)
 					}
 				}
