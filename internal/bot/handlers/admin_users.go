@@ -22,6 +22,9 @@ func RegisterAdminUsers(b *telebot.Bot, auth telebot.MiddlewareFunc, admin teleb
 	b.Handle("\fadmin_user_approve", HandleAdminUserApprove, auth, admin)
 	b.Handle("\fadmin_user_credit", HandleAdminUserCreditPrompt, auth, admin)
 	b.Handle("\fbulk_credit", HandleBulkCreditPrompt, auth, admin)
+	b.Handle("\fadmin_user_clients", HandleAdminUserClients, auth, admin)
+	b.Handle("\fadmin_assign_plan", HandleAdminAssignPlanPrompt, auth, admin)
+	b.Handle("\fadmin_assign_plan_confirm", HandleAdminAssignPlanConfirm, auth, admin)
 }
 
 func HandleAdminUsers(c telebot.Context) error {
@@ -120,6 +123,7 @@ func showAdminViewUser(c telebot.Context, user *db.User) error {
 
 	menu := &telebot.ReplyMarkup{}
 	rows := []telebot.Row{
+		menu.Row(menu.Data("👥 View User's Clients", "admin_user_clients", fmt.Sprintf("%d", user.ID))),
 		menu.Row(menu.Data("💳 Manual credit", "admin_user_credit", fmt.Sprintf("%d", user.ID))),
 	}
 	if user.Status == db.UserStatusBanned {
@@ -240,5 +244,128 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func HandleAdminUserClients(c telebot.Context) error {
+	userID, err := parseInt64(callbackPayload(c))
+	if err != nil {
+		return c.Send("Invalid user.")
+	}
+	user, err := db.GetUserByID(context.Background(), userID)
+	if err != nil || user == nil {
+		return c.Send("User not found.")
+	}
+	
+	subs, err := db.GetSubscriptionsByUserID(context.Background(), user.ID)
+	if err != nil {
+		return c.Send("Failed to get clients.")
+	}
+	
+	menu := &telebot.ReplyMarkup{}
+	var rows []telebot.Row
+	
+	var text strings.Builder
+	text.WriteString(fmt.Sprintf("👥 **Clients for @%s**\n\n", user.Username))
+	
+	hasUnassigned := false
+	for _, sub := range subs {
+		if sub.PlanID == nil {
+			hasUnassigned = true
+			break
+		}
+	}
+	
+	if hasUnassigned {
+		text.WriteString("⚠️ **Unassigned Clients (Need Plan)**\n")
+		for _, sub := range subs {
+			if sub.PlanID == nil {
+				text.WriteString(fmt.Sprintf("🔸 %s\n", sub.ClientEmail))
+				rows = append(rows, menu.Row(
+					menu.Data(fmt.Sprintf("Assign Plan: %s", sub.ClientEmail), "admin_assign_plan", fmt.Sprintf("%d", sub.ID)),
+				))
+			}
+		}
+		text.WriteString("\n")
+	}
+	
+	text.WriteString("✅ **Assigned Clients**\n")
+	for _, sub := range subs {
+		if sub.PlanID != nil {
+			text.WriteString(fmt.Sprintf("🔹 %s\n", sub.ClientEmail))
+		}
+	}
+	if len(subs) == 0 {
+		text.WriteString("No clients found.\n")
+	}
+	
+	rows = append(rows, menu.Row(menu.Data("« Back to User", "admin_view_user", fmt.Sprintf("%d", user.ID))))
+	menu.Inline(rows...)
+	return maybeEditOrSend(c, text.String(), menu)
+}
+
+func HandleAdminAssignPlanPrompt(c telebot.Context) error {
+	subID, err := parseInt64(callbackPayload(c))
+	if err != nil {
+		return c.Send("Invalid subscription.")
+	}
+	
+	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
+	if err != nil || sub == nil {
+		return c.Send("Subscription not found.")
+	}
+	
+	paidPlans, err := db.GetPaidPlans(context.Background(), false)
+	if err != nil {
+		return c.Send("Failed to load plans.")
+	}
+	
+	menu := &telebot.ReplyMarkup{}
+	var rows []telebot.Row
+	for _, plan := range paidPlans {
+		rows = append(rows, menu.Row(
+			menu.Data(plan.Name, "admin_assign_plan_confirm", fmt.Sprintf("%d:%d", sub.ID, plan.ID)),
+		))
+	}
+	rows = append(rows, menu.Row(menu.Data("« Cancel", "admin_user_clients", fmt.Sprintf("%d", sub.UserID))))
+	menu.Inline(rows...)
+	
+	return maybeEditOrSend(c, fmt.Sprintf("Please select a plan to assign to **%s**:", sub.ClientEmail), menu)
+}
+
+func HandleAdminAssignPlanConfirm(c telebot.Context) error {
+	parts := strings.Split(callbackPayload(c), ":")
+	if len(parts) != 2 {
+		return c.Send("Invalid request.")
+	}
+	subID, _ := parseInt64(parts[0])
+	planID, _ := parseInt64(parts[1])
+	
+	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
+	if err != nil || sub == nil {
+		return c.Send("Subscription not found.")
+	}
+	
+	plan, err := db.GetPaidPlanByID(context.Background(), planID)
+	if err != nil || plan == nil {
+		return c.Send("Plan not found.")
+	}
+	
+	pID := int(plan.ID)
+	sub.PlanID = &pID
+	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
+		return c.Send("Failed to update subscription.")
+	}
+	
+	user, _ := db.GetUserByID(context.Background(), sub.UserID)
+	if user != nil {
+		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ اشتراک %s با موفقیت به طرح %s متصل شد. هم‌اکنون می‌توانید از امکانات تمدید و ارتقا استفاده کنید.", sub.ClientEmail, plan.Name))
+	}
+	
+	_ = c.Respond(&telebot.CallbackResponse{Text: "Plan assigned successfully."})
+	
+	if c.Callback() != nil {
+		c.Callback().Data = fmt.Sprintf("\fadmin_user_clients|%d", sub.UserID)
+	}
+	return HandleAdminUserClients(c)
 }
 

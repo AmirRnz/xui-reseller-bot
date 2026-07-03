@@ -318,4 +318,20 @@ func (c *Client) ListClients() ([]XUIClientInfo, error) {
 	return clients, nil
 }
 
+func (c *Client) GetClientEmailsByGroup(group string) ([]string, error) {
+	var emails []string
+	if err := c.doRequest("GET", "/panel/api/clients/groups/"+pathEscape(group)+"/emails", nil, &emails); err != nil {
+		return nil, err
+	}
+	return emails, nil
+}
+
+func (c *Client) GetClientByEmail(email string) (*XUIClientInfo, error) {
+	var client XUIClientInfo
+	if err := c.doRequest("GET", "/panel/api/clients/get/"+pathEscape(email), nil, &client); err != nil {
+		return nil, err
+	}
+	return &client, nil
+}
+
 

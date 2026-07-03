@@ -21,7 +21,7 @@ const servicesPageSize = 6
 func RegisterMyServices(b *telebot.Bot, auth telebot.MiddlewareFunc) {
 	b.Handle("\fmenu_my_services", HandleMyServicesFlow, auth)
 	b.Handle("\fsvc_page", HandleMyServicesPage, auth)
-	b.Handle("\fsvc_claim", HandleClaimSubscriptionPrompt, auth)
+	b.Handle("\fsub_request_assign", HandleRequestPlanAssignment, auth)
 	b.Handle("\fview_sub", HandleViewSubscription, auth)
 	b.Handle("\fsub_get_link", HandleGetLink, auth)
 	b.Handle("\fsub_toggle", HandleToggleSubscription, auth)
@@ -72,35 +72,71 @@ func showServicesPage(c telebot.Context, page int) error {
 	subs = paidSubs
 
 	if bot.XUIClient != nil {
-		clients, err := bot.XUIClient.ListClients()
-		if err == nil {
-			existingClients := make(map[string]bool)
-			for _, client := range clients {
-				if client.SubID != "" {
-					existingClients[client.SubID] = true
+		if user.ServiceName != nil && *user.ServiceName != "" {
+			emails, err := bot.XUIClient.GetClientEmailsByGroup(*user.ServiceName)
+			if err == nil {
+				existingClients := make(map[string]bool)
+				existingSubsByEmail := make(map[string]*db.Subscription)
+				for _, sub := range subs {
+					existingSubsByEmail[sub.ClientEmail] = sub
 				}
-			}
 
-			var activeSubs []*db.Subscription
-			for _, sub := range subs {
-				if existingClients[sub.SubID] {
-					activeSubs = append(activeSubs, sub)
-				} else {
-					log.Printf("Deleting orphan subscription %s (SubID: %s) from DB because it no longer exists on 3x-ui.", sub.ClientEmail, sub.SubID)
-					_ = db.DeleteSubscription(context.Background(), sub.ID)
+				for _, email := range emails {
+					client, err := bot.XUIClient.GetClientByEmail(email)
+					if err != nil || client == nil {
+						continue
+					}
+					existingClients[client.SubID] = true
+					
+					if _, found := existingSubsByEmail[client.Email]; !found {
+						expTime := client.ExpiryTime
+						if expTime == 0 {
+							expTime = -1
+						}
+						
+						newSub := &db.Subscription{
+							UserID:            user.ID,
+							PlanID:            nil,
+							ClientEmail:       client.Email,
+							ClientUUID:        client.UUID,
+							SubID:             client.SubID,
+							Status:            "active",
+							PlanType:          db.PlanTypePaid,
+							DisplayName:       client.Email,
+							IPLimit:           client.LimitIP,
+							ExpireTime:        &expTime,
+							IsActive:          client.Enable,
+							StartDate:         time.Now().UTC(),
+							TrafficLimitBytes: client.TotalGB,
+						}
+						if expTime > 0 {
+							newSub.EndDate = time.UnixMilli(expTime)
+						}
+						_ = db.CreateSubscription(context.Background(), newSub)
+						subs = append(subs, newSub)
+					}
 				}
+
+				var activeSubs []*db.Subscription
+				for _, sub := range subs {
+					if existingClients[sub.SubID] {
+						activeSubs = append(activeSubs, sub)
+					} else {
+						log.Printf("Deleting orphan subscription %s (SubID: %s) from DB because it no longer exists on 3x-ui in group.", sub.ClientEmail, sub.SubID)
+						_ = db.DeleteSubscription(context.Background(), sub.ID)
+					}
+				}
+				subs = activeSubs
 			}
-			subs = activeSubs
 		}
 	}
 
 	if len(subs) == 0 {
 		menu := &telebot.ReplyMarkup{}
 		menu.Inline(
-			menu.Row(menu.Data("➕ ثبت اشتراک خریداری شده", "svc_claim")),
 			menu.Row(menu.Data("« بازگشت", "menu_main")),
 		)
-		return maybeEditOrSend(c, "📋 شما در حال حاضر هیچ اشتراکی ندارید.\nجهت شروع می‌توانید از گزینه‌های 🧪 تست رایگان یا 💼 خرید سرویس استفاده کنید. یا اگر از قبل اشتراکی دارید، آن را ثبت کنید تا در ربات نمایش داده شود.", menu)
+		return maybeEditOrSend(c, "📋 شما در حال حاضر هیچ اشتراکی ندارید.\nجهت شروع می‌توانید از گزینه‌های 🧪 تست رایگان یا 💼 خرید سرویس استفاده کنید.", menu)
 	}
 
 	totalPages := (len(subs) + servicesPageSize - 1) / servicesPageSize
@@ -140,7 +176,6 @@ func showServicesPage(c telebot.Context, page int) error {
 	if len(navRow) > 0 {
 		rows = append(rows, navRow)
 	}
-	rows = append(rows, menu.Row(menu.Data("➕ ثبت اشتراک خریداری شده", "svc_claim")))
 	rows = append(rows, menu.Row(menu.Data("« بازگشت", "menu_main")))
 	menu.Inline(rows...)
 	return maybeEditOrSend(c, text.String(), menu)
@@ -240,10 +275,16 @@ func showSubscriptionDetail(c telebot.Context, user *db.User, sub *db.Subscripti
 		),
 	}
 	if sub.PlanType == db.PlanTypePaid {
-		rows = append(rows, menu.Row(
-			menu.Data("📶 افزایش کاربر همزمان", "sub_limit", fmt.Sprintf("%d", sub.ID)),
-			menu.Data("⏳ تمدید سرویس", "sub_extend", fmt.Sprintf("%d", sub.ID)),
-		))
+		if sub.PlanID != nil {
+			rows = append(rows, menu.Row(
+				menu.Data("📶 افزایش کاربر همزمان", "sub_limit", fmt.Sprintf("%d", sub.ID)),
+				menu.Data("⏳ تمدید سرویس", "sub_extend", fmt.Sprintf("%d", sub.ID)),
+			))
+		} else {
+			rows = append(rows, menu.Row(
+				menu.Data("📥 درخواست تخصیص طرح", "sub_request_assign", fmt.Sprintf("%d", sub.ID)),
+			))
+		}
 	}
 	
 	toggleText := "🔴 غیرفعال کردن"
@@ -1057,155 +1098,32 @@ func monthsRemainingFrom(expire time.Time) int {
 	return months
 }
 
-func HandleClaimSubscriptionPrompt(c telebot.Context) error {
-	user := userFromContext(c)
-	if user == nil {
-		return c.Send("خطا در بارگذاری حساب کاربری.")
-	}
-	bot.FSM.SetState(user.TelegramID, "awaiting_claim_subscription_link")
-
-	menu := &telebot.ReplyMarkup{}
-	menu.Inline(
-		menu.Row(menu.Data("❌ انصراف", "menu_my_services")),
-	)
-
-	return maybeEditOrSend(c, "🔗 لطفا لینک اشتراک خریداری شده خود را ارسال کنید:\n\nمثال:\n`https://sub.domain.com/sub/xxxxxx`", menu)
-}
-
-func ProcessClaimSubscriptionLink(c telebot.Context, text string) error {
-	user := userFromContext(c)
-	if user == nil {
-		return c.Send("خطا در بارگذاری حساب کاربری.")
+func HandleRequestPlanAssignment(c telebot.Context) error {
+	sub, user, ok := loadOwnedSubscription(c)
+	if !ok {
+		return nil
 	}
 
-	text = strings.TrimSpace(text)
-	u, err := url.Parse(text)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return c.Send("لینک وارد شده نامعتبر است. لطفا یک لینک معتبر با قالب http/https ارسال کنید.")
+	if sub.PlanID != nil {
+		return c.Send("این اشتراک قبلاً به یک طرح متصل شده است.")
 	}
 
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) == 0 || parts[len(parts)-1] == "" {
-		return c.Send("لینک وارد شده نامعتبر است. شناسه اشتراک یافت نشد.")
-	}
-	subID := parts[len(parts)-1]
-
-	unlock := bot.Locker.Lock(fmt.Sprintf("claim_sub:%s", subID))
-	defer unlock()
-
-	// 1. Check if subID already exists in local DB
-	existingSub, err := db.GetSubscriptionBySubID(context.Background(), subID)
-	if err != nil {
-		log.Printf("Error checking DB for subID %s: %v", subID, err)
-	}
-	if existingSub != nil {
-		bot.FSM.ClearState(user.TelegramID)
-		if existingSub.UserID == user.ID {
-			return c.Send("این اشتراک در حال حاضر در لیست سرویس‌های شما قرار دارد.")
-		}
-		return c.Send("این اشتراک قبلا توسط کاربر دیگری ثبت شده است. در صورت نیاز با پشتیبانی در ارتباط باشید.")
-	}
-
-	// Check if there is already a pending claim for this subID
-	pendingExists, err := db.HasPendingClaimRequest(context.Background(), subID)
-	if err != nil {
-		log.Printf("Error checking DB for pending claim subID %s: %v", subID, err)
-	}
-	if pendingExists {
-		bot.FSM.ClearState(user.TelegramID)
-		return c.Send("درخواست ثبت برای این اشتراک قبلا ثبت شده است و در انتظار بررسی ادمین می‌باشد.")
-	}
-
-	// 2. Fetch all clients from 3x-ui to verify it exists
-	if bot.XUIClient == nil {
-		return c.Send("خطا: کلاینت x-ui متصل نیست.")
-	}
-
-	clients, err := bot.XUIClient.ListClients()
-	if err != nil {
-		log.Printf("XUI ListClients failed: %v", err)
-		return c.Send("خطا در دریافت لیست اشتراک‌ها از پنل. لطفا مجددا تلاش کنید.")
-	}
-
-	var targetClient *xui.XUIClientInfo
-	for _, client := range clients {
-		if client.SubID == subID {
-			targetClient = &client
-			break
-		}
-	}
-
-	if targetClient == nil {
-		return c.Send("اشتراک معتبری با این مشخصات در پنل یافت نشد. لطفا مطمئن شوید لینک ارسال شده صحیح است.")
-	}
-
-	// 3. Check if client email already exists in local DB (avoid UNIQUE violation on client_email)
-	existingEmailSub, err := db.GetSubscriptionByEmail(context.Background(), targetClient.Email)
-	if err != nil {
-		log.Printf("Error checking DB for email %s: %v", targetClient.Email, err)
-	}
-	if existingEmailSub != nil {
-		bot.FSM.ClearState(user.TelegramID)
-		if existingEmailSub.UserID == user.ID {
-			return c.Send("این اشتراک در حال حاضر در لیست سرویس‌های شما قرار دارد.")
-		}
-		return c.Send("این اشتراک قبلا توسط کاربر دیگری ثبت شده است. در صورت نیاز با پشتیبانی در ارتباط باشید.")
-	}
-
-	// 4. Create pending claim PurchaseRequest
-	req := &db.PurchaseRequest{
-		UserID:         user.ID,
-		Type:           "claim",
-		PlanID:         nil,
-		SubscriptionID: nil,
-		Price:          0,
-		Months:         0,
-		IPLimit:        targetClient.LimitIP,
-		DataGB:         int(targetClient.TotalGB / 1073741824),
-		CustomName:     subID,
-		ClientEmail:    targetClient.Email,
-		TelegramFileID: "claim",
-		Status:         "pending",
-	}
-
-	if err := db.CreatePurchaseRequest(context.Background(), req); err != nil {
-		log.Printf("Failed to create claim purchase request: %v", err)
-		return c.Send("خطا در ثبت درخواست ثبت اشتراک دستی.")
-	}
-
-	bot.FSM.ClearState(user.TelegramID)
-
-	// Notify User
-	_ = c.Send("📥 درخواست ثبت اشتراک شما ثبت شد و در انتظار تایید ادمین می‌باشد.\nپس از تایید ادمین، سرویس به بخش «سرویس‌های من» اضافه خواهد شد.")
-
-	// Notify Admins with Plan selection buttons
-	paidPlans, err := db.GetPaidPlans(context.Background(), false)
-	if err != nil {
-		log.Printf("Failed to fetch paid plans for claim approval menu: %v", err)
-	}
-
+	// Notify Admins
 	if config.Global != nil {
 		for _, adminID := range config.Global.Admin.AdminIDs {
 			menu := &telebot.ReplyMarkup{}
-			var rows []telebot.Row
-			for _, plan := range paidPlans {
-				rows = append(rows, menu.Row(
-					menu.Data(fmt.Sprintf("طرح: %s", plan.Name), "admin_claim_assign", fmt.Sprintf("%d:%d", req.ID, plan.ID)),
-				))
-			}
-			rows = append(rows, menu.Row(
-				menu.Data("❌ رد درخواست", "admin_reject_purchase", fmt.Sprintf("%d", req.ID)),
-			))
-			menu.Inline(rows...)
-
-			caption := fmt.Sprintf("📥 **درخواست ثبت اشتراک دستی #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک: `%s`\nشناسه اشتراک: `%s`\nکاربر همزمان: %d\nحجم: %d گیگابایت\n\nلطفا یکی از طرح‌های زیر را برای این اشتراک انتخاب کنید تا تایید شود:",
-				req.ID, user.Username, user.TelegramID, req.ClientEmail, req.CustomName, req.IPLimit, req.DataGB)
-
+			menu.Inline(
+				menu.Row(
+					menu.Data("تخصیص طرح", "admin_assign_plan", fmt.Sprintf("%d", sub.ID)),
+				),
+			)
+			caption := fmt.Sprintf("📥 **درخواست تخصیص طرح**\n\nنماینده: @%s (%d)\nایمیل اشتراک: `%s`\nشناسه اشتراک: `%s`\n\nلطفا برای این اشتراک یک طرح انتخاب کنید:",
+				user.Username, user.TelegramID, sub.ClientEmail, sub.SubID)
 			_, _ = bot.Bot.Send(&telebot.User{ID: adminID}, FormatMarkdown(caption), menu, telebot.ModeMarkdown)
 		}
 	}
 
-	return showMainMenu(c, user)
+	return c.Send("درخواست شما برای تخصیص طرح با موفقیت به مدیریت ارسال شد. پس از بررسی، امکانات تمدید و ارتقا فعال خواهد شد.")
 }
 
 func syncIPLimitFromXUI(sub *db.Subscription) {
