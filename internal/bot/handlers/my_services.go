@@ -867,6 +867,7 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		val := *sub.ExpireTime
 		oldExpireTime = &val
 	}
+	oldIsActive := sub.IsActive
 
 	var newExpiryMilli int64
 	var newExpiryLabel string
@@ -887,15 +888,19 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		newExpiryLabel = sub.EndDate.Format("2006-01-02")
 	}
 
+	sub.IsActive = true
+
 	if err := updateXUIFromSubscription(sub); err != nil {
 		sub.EndDate = oldEnd
 		sub.ExpireTime = oldExpireTime
+		sub.IsActive = oldIsActive
 		_ = db.CreditWalletBalance(context.Background(), user.ID, cost, "refund failed extension")
 		return c.Send("خطا در بروزرسانی پنل. مبلغ تمدید به کیف پول شما بازگردانده شد.")
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		sub.EndDate = oldEnd
 		sub.ExpireTime = oldExpireTime
+		sub.IsActive = oldIsActive
 		_ = db.CreditWalletBalance(context.Background(), user.ID, cost, "refund failed extension save")
 		return c.Send("خطا در ذخیره‌سازی دیتابیس. مبلغ تمدید به کیف پول شما بازگردانده شد.")
 	}

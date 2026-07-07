@@ -606,6 +606,7 @@ func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, 
 		val := *sub.ExpireTime
 		oldExpireTime = &val
 	}
+	oldIsActive := sub.IsActive
 
 	var newExpiryMilli int64
 	var newExpiryLabel string
@@ -626,14 +627,18 @@ func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, 
 		newExpiryLabel = sub.EndDate.Format("2006-01-02")
 	}
 
+	sub.IsActive = true
+
 	if err := updateXUIFromSubscription(sub); err != nil {
 		sub.EndDate = oldEnd
 		sub.ExpireTime = oldExpireTime
+		sub.IsActive = oldIsActive
 		return fmt.Errorf("خطا در بروزرسانی پنل: %w", err)
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		sub.EndDate = oldEnd
 		sub.ExpireTime = oldExpireTime
+		sub.IsActive = oldIsActive
 		return fmt.Errorf("خطا در ذخیره‌سازی دیتابیس: %w", err)
 	}
 

@@ -1010,6 +1010,40 @@ func TestE2ESuite(t *testing.T) {
 				t.Fatalf("Wallet balance should be 1000, got %d", u.WalletBalance)
 			}
 		})
+
+		// 25b. Extend expired/inactive subscription and make sure it becomes active in both DB and Mock XUI panel
+		t.Run("ExtendExpiredSubscription", func(t *testing.T) {
+			setupApprovedUserWithSub()
+			// Set subscription to expired & inactive in DB
+			pastTime := time.Now().UTC().AddDate(0, -1, 0).UnixMilli()
+			_, _ = db.Pool.Exec(env.ctx, `UPDATE subscriptions SET expire_time = $1, is_active = false WHERE id = 1`, pastTime)
+			// Mock XUI has it disabled/inactive
+			env.mockXUI.Clients["myservice_deviceA"] = xui.ClientConfig{
+				Email:  "myservice_deviceA",
+				Enable: false,
+			}
+
+			env.SendCallback(userTGID, userUsername, 999, "\fview_sub|1")
+			_ = env.ExpectResponse(t, 2*time.Second)
+			env.SendCallback(userTGID, userUsername, 999, "\fsub_extend|1")
+			_ = env.ExpectResponse(t, 2*time.Second) // month selector
+
+			env.SendCallback(userTGID, userUsername, 999, "\fsub_extend_run|1:1") // 1 month extension
+			resp := env.ExpectResponse(t, 2*time.Second)
+			if !strings.Contains(getStr(resp, "text"), "extended successfully") {
+				t.Fatalf("Expected extension success, got: %+v", resp)
+			}
+
+			// Verify in DB that it is active now
+			sub, _ := db.GetSubscriptionByID(env.ctx, 1)
+			if !sub.IsActive {
+				t.Fatalf("Expected subscription to be active in DB after extension")
+			}
+			// Verify in Mock XUI that it is enabled/active now
+			if !env.mockXUI.Clients["myservice_deviceA"].Enable {
+				t.Fatalf("Expected client to be enabled in XUI after extension")
+			}
+		})
 	})
 
 	// ==========================================
