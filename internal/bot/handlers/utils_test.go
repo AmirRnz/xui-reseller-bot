@@ -72,6 +72,8 @@ func TestApplyIPLimitFactor(t *testing.T) {
 		{"addition +3", 2, "+3", 5},
 		{"addition +0", 2, "+0", 2},
 		{"addition -3 invalid sign", 2, "-3", 2},
+		{"zero limit with *2", 0, "*2", 0},
+		{"zero limit with +3", 0, "+3", 0},
 	}
 
 	for _, tc := range tests {
@@ -98,6 +100,8 @@ func TestReverseIPLimitFactor(t *testing.T) {
 		{"multiplier *2 underflow limit", 1, "*2", 1},
 		{"addition +3", 5, "+3", 2},
 		{"addition +5 underflow limit", 3, "+5", 1},
+		{"zero limit with *2", 0, "*2", 0},
+		{"zero limit with +3", 0, "+3", 0},
 	}
 
 	for _, tc := range tests {

@@ -62,15 +62,16 @@ type TestPlan struct {
 	Description      string    `json:"description"`
 	UsageDescription string    `json:"usage_description"`
 	InboundIDs       []int     `json:"inbound_ids"`
-	ExpireSeconds int64     `json:"expire_seconds"`
-	MaxDataBytes  int64     `json:"max_data_bytes"`
-	Flow          string    `json:"flow"`
-	MaxPerDay     int       `json:"max_per_day"`
-	IsGlobal      bool      `json:"is_global"`
-	Enabled       bool      `json:"enabled"`
-	SyncSubs      bool      `json:"sync_subs"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ExpireSeconds    int64     `json:"expire_seconds"`
+	MaxDataBytes     int64     `json:"max_data_bytes"`
+	Flow             string    `json:"flow"`
+	MaxPerDay        int       `json:"max_per_day"`
+	IsGlobal         bool      `json:"is_global"`
+	Enabled          bool      `json:"enabled"`
+	SyncSubs         bool      `json:"sync_subs"`
+	IPLimit          int       `json:"ip_limit"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type PaidPlan struct {

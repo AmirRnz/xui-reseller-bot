@@ -14,7 +14,7 @@ func GetTestPlansForUser(ctx context.Context, userID int64, includeDisabled bool
 	defer cancel()
 
 	query := `
-		SELECT p.id, p.name, p.description, p.usage_description, p.inbound_ids, p.expire_seconds, p.max_data_bytes, p.flow, p.max_per_day, p.is_global, p.enabled, p.sync_subs, p.created_at, p.updated_at
+		SELECT p.id, p.name, p.description, p.usage_description, p.inbound_ids, p.expire_seconds, p.max_data_bytes, p.flow, p.max_per_day, p.is_global, p.enabled, p.sync_subs, p.ip_limit, p.created_at, p.updated_at
 		FROM test_plans p
 		WHERE ($2 OR p.enabled)
 		  AND (
@@ -52,7 +52,7 @@ func GetTestPlanByID(ctx context.Context, id int64) (*TestPlan, error) {
 	defer cancel()
 
 	row := Pool.QueryRow(ctx, `
-		SELECT id, name, description, usage_description, inbound_ids, expire_seconds, max_data_bytes, flow, max_per_day, is_global, enabled, sync_subs, created_at, updated_at
+		SELECT id, name, description, usage_description, inbound_ids, expire_seconds, max_data_bytes, flow, max_per_day, is_global, enabled, sync_subs, ip_limit, created_at, updated_at
 		FROM test_plans WHERE id = $1
 	`, id)
 	p, err := scanTestPlanRow(row)
@@ -74,11 +74,11 @@ func CreateTestPlan(ctx context.Context, p *TestPlan) error {
 		p.MaxPerDay = 1
 	}
 	query := `
-		INSERT INTO test_plans (name, description, usage_description, inbound_ids, expire_seconds, max_data_bytes, flow, max_per_day, is_global, enabled, sync_subs)
-		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11)
+		INSERT INTO test_plans (name, description, usage_description, inbound_ids, expire_seconds, max_data_bytes, flow, max_per_day, is_global, enabled, sync_subs, ip_limit)
+		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id, created_at, updated_at
 	`
-	return Pool.QueryRow(ctx, query, p.Name, p.Description, p.UsageDescription, string(inboundJSON), p.ExpireSeconds, p.MaxDataBytes, p.Flow, p.MaxPerDay, p.IsGlobal, p.Enabled, p.SyncSubs).
+	return Pool.QueryRow(ctx, query, p.Name, p.Description, p.UsageDescription, string(inboundJSON), p.ExpireSeconds, p.MaxDataBytes, p.Flow, p.MaxPerDay, p.IsGlobal, p.Enabled, p.SyncSubs, p.IPLimit).
 		Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 }
 
@@ -93,9 +93,9 @@ func UpdateTestPlan(ctx context.Context, p *TestPlan) error {
 	_, err = Pool.Exec(ctx, `
 		UPDATE test_plans
 		SET name = $1, description = $2, usage_description = $3, inbound_ids = $4::jsonb, expire_seconds = $5, max_data_bytes = $6,
-			flow = $7, max_per_day = $8, is_global = $9, enabled = $10, sync_subs = $11, updated_at = NOW()
-		WHERE id = $12
-	`, p.Name, p.Description, p.UsageDescription, string(inboundJSON), p.ExpireSeconds, p.MaxDataBytes, p.Flow, p.MaxPerDay, p.IsGlobal, p.Enabled, p.SyncSubs, p.ID)
+			flow = $7, max_per_day = $8, is_global = $9, enabled = $10, sync_subs = $11, ip_limit = $12, updated_at = NOW()
+		WHERE id = $13
+	`, p.Name, p.Description, p.UsageDescription, string(inboundJSON), p.ExpireSeconds, p.MaxDataBytes, p.Flow, p.MaxPerDay, p.IsGlobal, p.Enabled, p.SyncSubs, p.IPLimit, p.ID)
 	return err
 }
 
@@ -361,7 +361,7 @@ func GetPlanByID(ctx context.Context, id int) (*Plan, error) {
 		if len(p.InboundIDs) > 0 {
 			inboundID = p.InboundIDs[0]
 		}
-		return &Plan{ID: int(p.ID), Name: p.Name, Type: PlanTypeTest, DurationDays: int(p.ExpireSeconds / 86400), TrafficGB: float64(p.MaxDataBytes) / 1073741824, IPLimit: 1, InboundID: inboundID, CreatedAt: p.CreatedAt}, nil
+		return &Plan{ID: int(p.ID), Name: p.Name, Type: PlanTypeTest, DurationDays: int(p.ExpireSeconds / 86400), TrafficGB: float64(p.MaxDataBytes) / 1073741824, IPLimit: p.IPLimit, InboundID: inboundID, CreatedAt: p.CreatedAt}, nil
 	}
 
 	if p, err := GetPaidPlanByID(ctx, int64(id)); err != nil {
@@ -386,6 +386,7 @@ func CreatePlan(ctx context.Context, p *Plan) error {
 			MaxPerDay:     1,
 			IsGlobal:      true,
 			Enabled:       true,
+			IPLimit:       p.IPLimit,
 		}
 		if err := CreateTestPlan(ctx, testPlan); err != nil {
 			return err
@@ -416,7 +417,7 @@ func CreatePlan(ctx context.Context, p *Plan) error {
 func scanTestPlanRows(rows pgx.Rows) (*TestPlan, error) {
 	var inboundJSON []byte
 	p := &TestPlan{}
-	err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.UsageDescription, &inboundJSON, &p.ExpireSeconds, &p.MaxDataBytes, &p.Flow, &p.MaxPerDay, &p.IsGlobal, &p.Enabled, &p.SyncSubs, &p.CreatedAt, &p.UpdatedAt)
+	err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.UsageDescription, &inboundJSON, &p.ExpireSeconds, &p.MaxDataBytes, &p.Flow, &p.MaxPerDay, &p.IsGlobal, &p.Enabled, &p.SyncSubs, &p.IPLimit, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -429,7 +430,7 @@ func scanTestPlanRows(rows pgx.Rows) (*TestPlan, error) {
 func scanTestPlanRow(row pgx.Row) (*TestPlan, error) {
 	var inboundJSON []byte
 	p := &TestPlan{}
-	err := row.Scan(&p.ID, &p.Name, &p.Description, &p.UsageDescription, &inboundJSON, &p.ExpireSeconds, &p.MaxDataBytes, &p.Flow, &p.MaxPerDay, &p.IsGlobal, &p.Enabled, &p.SyncSubs, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(&p.ID, &p.Name, &p.Description, &p.UsageDescription, &inboundJSON, &p.ExpireSeconds, &p.MaxDataBytes, &p.Flow, &p.MaxPerDay, &p.IsGlobal, &p.Enabled, &p.SyncSubs, &p.IPLimit, &p.CreatedAt, &p.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}

@@ -258,11 +258,18 @@ func showSubscriptionDetail(c telebot.Context, user *db.User, sub *db.Subscripti
 	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
 	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
 
+	var displayIPLimitStr string
+	if displayIPLimit == 0 {
+		displayIPLimitStr = "نامحدود"
+	} else {
+		displayIPLimitStr = fmt.Sprintf("%d", displayIPLimit)
+	}
+
 	var text strings.Builder
 	text.WriteString(fmt.Sprintf("📦 **%s**\n\n", sub.DisplayName))
 	text.WriteString(fmt.Sprintf("📧 **ایمیل اشتراک:** `%s`\n", sub.ClientEmail))
 	text.WriteString(fmt.Sprintf("⚡ **وضعیت سرویس:** %s\n", statusIcon))
-	text.WriteString(fmt.Sprintf("👥 **کاربر همزمان:** %d\n", displayIPLimit))
+	text.WriteString(fmt.Sprintf("👥 **کاربر همزمان:** %s\n", displayIPLimitStr))
 	text.WriteString("⏳ " + expiryStr + "\n")
 	if trafficStr != "" {
 		text.WriteString("📊 " + trafficStr)
@@ -276,10 +283,19 @@ func showSubscriptionDetail(c telebot.Context, user *db.User, sub *db.Subscripti
 	}
 	if sub.PlanType == db.PlanTypePaid {
 		if sub.PlanID != nil {
-			rows = append(rows, menu.Row(
-				menu.Data("📶 افزایش کاربر همزمان", "sub_limit", fmt.Sprintf("%d", sub.ID)),
-				menu.Data("⏳ تمدید سرویس", "sub_extend", fmt.Sprintf("%d", sub.ID)),
-			))
+			plan, _ := paidPlanForSub(sub)
+			var row telebot.Row
+			if plan != nil && plan.MaxIPLimit > displayIPLimit && displayIPLimit > 0 {
+				row = menu.Row(
+					menu.Data("📶 افزایش کاربر همزمان", "sub_limit", fmt.Sprintf("%d", sub.ID)),
+					menu.Data("⏳ تمدید سرویس", "sub_extend", fmt.Sprintf("%d", sub.ID)),
+				)
+			} else {
+				row = menu.Row(
+					menu.Data("⏳ تمدید سرویس", "sub_extend", fmt.Sprintf("%d", sub.ID)),
+				)
+			}
+			rows = append(rows, row)
 		} else {
 			rows = append(rows, menu.Row(
 				menu.Data("📥 درخواست تخصیص طرح", "sub_request_assign", fmt.Sprintf("%d", sub.ID)),
