@@ -21,7 +21,7 @@ Be proactive and explicit in using the available MCP servers:
 
 ## Deployment & Naming
 - The project is named `xui-reseller-bot`. All Go files and module name use the module path `xui-reseller-bot`.
-- The bot is deployed to the 203.202.232.117 VPS using the `ssh-mcp` MCP server.
+- The bot is deployed to the 203.202.232.117 VPS using the `turk1-mcp-server` MCP server.
 - The remote deployment directory on the VPS is `/opt/xui-reseller-bot`.
 - The systemd service on the VPS is `xui-reseller-bot.service`.
 

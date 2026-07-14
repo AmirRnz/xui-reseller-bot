@@ -74,7 +74,7 @@ func showServicesPage(c telebot.Context, page int) error {
 		if user.ServiceName != nil && *user.ServiceName != "" {
 			allClients, err := bot.XUIClient.ListClients()
 			if err == nil {
-				existingClients := make(map[string]bool)
+				existingClients := make(map[string]xui.XUIClientInfo)
 				existingSubsByEmail := make(map[string]*db.Subscription)
 
 				for _, sub := range subs {
@@ -86,7 +86,7 @@ func showServicesPage(c telebot.Context, page int) error {
 						continue
 					}
 					
-					existingClients[client.Email] = true
+					existingClients[client.Email] = client
 
 					if _, found := existingSubsByEmail[client.Email]; !found {
 						expTime := client.ExpiryTime
@@ -119,7 +119,19 @@ func showServicesPage(c telebot.Context, page int) error {
 
 				var activeSubs []*db.Subscription
 				for _, sub := range subs {
-					if existingClients[sub.ClientEmail] {
+					if client, exists := existingClients[sub.ClientEmail]; exists {
+						changed := false
+						if devLimit, ok := parseDeviceLimitFromXUI(client); ok && devLimit != sub.IPLimit {
+							log.Printf("Syncing device limit for %s during page load: DB had %d, XUI has %d", sub.ClientEmail, sub.IPLimit, devLimit)
+							sub.IPLimit = devLimit
+							changed = true
+						}
+						if syncActivationExpiry(sub, client) {
+							changed = true
+						}
+						if changed {
+							_ = db.UpdateSubscription(context.Background(), sub)
+						}
 						activeSubs = append(activeSubs, sub)
 					} else {
 						log.Printf("Deleting orphan subscription %s from DB because it no longer exists on 3x-ui in group.", sub.ClientEmail)
@@ -161,8 +173,13 @@ func showServicesPage(c telebot.Context, page int) error {
 		if sub.IsActive {
 			icon = "🟢"
 		}
-		expires := sub.EndDate.Format("2006-01-02")
-		text.WriteString(fmt.Sprintf("%s %s — تاریخ انقضا %s\n", icon, sub.ClientEmail, expires))
+		var expires string
+		if sub.ExpireTime != nil && *sub.ExpireTime < 0 {
+			expires = "شروع پس از اولین اتصال"
+		} else {
+			expires = "تاریخ انقضا " + sub.EndDate.Format("2006-01-02")
+		}
+		text.WriteString(fmt.Sprintf("%s %s — %s\n", icon, sub.ClientEmail, expires))
 		rows = append(rows, menu.Row(menu.Data(icon+" "+sub.DisplayName, "view_sub", fmt.Sprintf("%d", sub.ID))))
 	}
 
@@ -255,8 +272,7 @@ func showSubscriptionDetail(c telebot.Context, user *db.User, sub *db.Subscripti
 		}
 	}
 
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 
 	var displayIPLimitStr string
 	if displayIPLimit == 0 {
@@ -511,8 +527,7 @@ func HandleSubscriptionLimitMenu(c telebot.Context) error {
 	if err != nil || plan == nil {
 		return c.Send("طرح مرتبط یافت نشد.")
 	}
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 
 	if displayIPLimit >= plan.MaxIPLimit {
 		return c.Send(fmt.Sprintf("اشتراک شما در حال حاضر در حداکثر سقف کاربر همزمان مجاز طرح خود (%d کاربر) قرار دارد.", plan.MaxIPLimit))
@@ -558,8 +573,7 @@ func HandleSubscriptionLimitConfirmPrompt(c telebot.Context) error {
 		return c.Send("طرح یافت نشد.")
 	}
 
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 
 	months := monthsRemainingFrom(sub.EndDate)
 	if months < 1 {
@@ -608,8 +622,7 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 		return c.Send("طرح یافت نشد.")
 	}
 
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 
 	months := monthsRemainingFrom(sub.EndDate)
 	if months < 1 {
@@ -626,7 +639,7 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 	}
 
 	oldLimit := sub.IPLimit
-	sub.IPLimit = ApplyIPLimitFactor(newLimit, factor)
+	sub.IPLimit = newLimit
 	if err := updateXUIFromSubscription(sub); err != nil {
 		sub.IPLimit = oldLimit
 		_ = db.CreditWalletBalance(context.Background(), user.ID, cost, "refund failed IP upgrade")
@@ -659,8 +672,7 @@ func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 		return c.Send("طرح یافت نشد.")
 	}
 
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 
 	months := monthsRemainingFrom(sub.EndDate)
 	if months < 1 {
@@ -721,8 +733,7 @@ func HandleSubscriptionExtendMenu(c telebot.Context) error {
 		currency = "IRR"
 	}
 
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 
 	priceFor := func(months int) float64 {
 		dataGB := int(sub.TrafficLimitBytes / 1073741824)
@@ -811,8 +822,7 @@ func showExtendConfirmation(c telebot.Context, user *db.User, subID int, months 
 		return c.Send("طرح مرتبط یافت نشد.")
 	}
 	dataGB := int(sub.TrafficLimitBytes / 1073741824)
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 	cost := calculatePaidPrice(plan, months, displayIPLimit, dataGB)
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
@@ -865,8 +875,7 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		return c.Send("طرح یافت نشد.")
 	}
 	dataGB := int(sub.TrafficLimitBytes / 1073741824)
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 	cost := calculatePaidPrice(plan, months, displayIPLimit, dataGB)
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
@@ -948,8 +957,7 @@ func HandleExtendSubscriptionDirect(c telebot.Context) error {
 		return c.Send("طرح یافت نشد.")
 	}
 	dataGB := int(sub.TrafficLimitBytes / 1073741824)
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	displayIPLimit := ReverseIPLimitFactor(sub.IPLimit, factor)
+	displayIPLimit := sub.IPLimit
 	cost := calculatePaidPrice(plan, months, displayIPLimit, dataGB)
 
 	card, _ := db.GetSetting(context.Background(), "card_number")
@@ -1101,8 +1109,7 @@ func clientConfigFromSubscription(sub *db.Subscription, email string) xui.Client
 			planName = plan.Name
 		}
 	}
-	comment := fmt.Sprintf("created by xui-reseller-bot, %s, %s", planName, userIdentifier(user))
-	client := newClientConfig(email, group, tgID, total, expireMilli, sub.IPLimit, flow, sub.SubID, sub.ClientUUID, comment)
+	client := prepareClientConfig(email, group, tgID, total, expireMilli, sub.IPLimit, flow, sub.SubID, sub.ClientUUID, planName, user)
 	return client
 }
 
@@ -1147,6 +1154,17 @@ func HandleRequestPlanAssignment(c telebot.Context) error {
 	return c.Send("درخواست شما برای تخصیص طرح با موفقیت به مدیریت ارسال شد. پس از بررسی، امکانات تمدید و ارتقا فعال خواهد شد.")
 }
 
+func syncActivationExpiry(sub *db.Subscription, client xui.XUIClientInfo) bool {
+	if client.ExpiryTime > 0 && (sub.ExpireTime == nil || *sub.ExpireTime < 0) {
+		log.Printf("Syncing activation expiry time for %s: XUI has %s", sub.ClientEmail, time.UnixMilli(client.ExpiryTime).Format("2006-01-02"))
+		val := client.ExpiryTime
+		sub.ExpireTime = &val
+		sub.EndDate = time.UnixMilli(client.ExpiryTime)
+		return true
+	}
+	return false
+}
+
 func syncIPLimitFromXUI(sub *db.Subscription) {
 	if bot.XUIClient == nil {
 		return
@@ -1158,9 +1176,16 @@ func syncIPLimitFromXUI(sub *db.Subscription) {
 	}
 	for _, client := range clients {
 		if client.Email == sub.ClientEmail {
-			if client.LimitIP > 0 && client.LimitIP != sub.IPLimit {
-				log.Printf("Syncing IP limit for %s: DB had %d, XUI has %d", sub.ClientEmail, sub.IPLimit, client.LimitIP)
-				sub.IPLimit = client.LimitIP
+			changed := false
+			if devLimit, ok := parseDeviceLimitFromXUI(client); ok && devLimit != sub.IPLimit {
+				log.Printf("Syncing device limit for %s: DB had %d, XUI has %d", sub.ClientEmail, sub.IPLimit, devLimit)
+				sub.IPLimit = devLimit
+				changed = true
+			}
+			if syncActivationExpiry(sub, client) {
+				changed = true
+			}
+			if changed {
 				_ = db.UpdateSubscription(context.Background(), sub)
 			}
 			break

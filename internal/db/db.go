@@ -61,3 +61,44 @@ func dbCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, 10*time.Second)
 }
 
+func NormalizeIPLimits(ctx context.Context) error {
+	var migrated string
+	err := Pool.QueryRow(ctx, `SELECT value FROM bot_settings WHERE key = 'ip_limit_migrated'`).Scan(&migrated)
+	if err == nil && migrated == "true" {
+		return nil
+	}
+
+	var factor string
+	err = Pool.QueryRow(ctx, `SELECT value FROM bot_settings WHERE key = 'ip_limit_factor'`).Scan(&factor)
+	if err != nil {
+		factor = ""
+	}
+
+	factor = strings.TrimSpace(factor)
+	if factor != "" && strings.HasPrefix(factor, "*") {
+		var mult int
+		_, err := fmt.Sscanf(factor, "*%d", &mult)
+		if err == nil && mult > 1 {
+			_, err = Pool.Exec(ctx, `
+				UPDATE subscriptions 
+				SET ip_limit = ip_limit / $1 
+				WHERE ip_limit >= $1
+			`, mult)
+			if err != nil {
+				return fmt.Errorf("failed to normalize subscriptions ip_limit: %w", err)
+			}
+		}
+	}
+
+	_, err = Pool.Exec(ctx, `
+		INSERT INTO bot_settings (key, value, updated_at) 
+		VALUES ('ip_limit_migrated', 'true', NOW())
+		ON CONFLICT (key) DO UPDATE SET value = 'true', updated_at = NOW()
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to save ip_limit_migrated setting: %w", err)
+	}
+
+	return nil
+}
+

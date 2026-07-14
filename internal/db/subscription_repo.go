@@ -330,3 +330,24 @@ func GetSubscriptionBySubID(ctx context.Context, subID string) (*Subscription, e
 	return s, err
 }
 
+func GetActiveSubscriptions(ctx context.Context) ([]*Subscription, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	rows, err := Pool.Query(ctx, subscriptionSelect()+` WHERE is_active = TRUE ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var subs []*Subscription
+	for rows.Next() {
+		s, err := scanSubscriptionRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, s)
+	}
+	return subs, rows.Err()
+}
+

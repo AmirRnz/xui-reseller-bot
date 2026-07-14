@@ -753,10 +753,7 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 	totalBytes := int64(dataGB) * 1073741824
 	subID := makeSubID()
 	clientUUID := makeClientUUID()
-	comment := fmt.Sprintf("created by xui-reseller-bot, %s, %s", plan.Name, userIdentifier(user))
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-	adjustedIPLimit := ApplyIPLimitFactor(ipLimit, factor)
-	client := newClientConfig(email, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, adjustedIPLimit, plan.Flow, subID, clientUUID, comment)
+	client := prepareClientConfig(email, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, ipLimit, plan.Flow, subID, clientUUID, plan.Name, user)
 
 	err := bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: inboundIDs})
 	if err != nil {
@@ -786,7 +783,7 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 		Status:            "active",
 		PlanType:          db.PlanTypePaid,
 		DisplayName:       displayName,
-		IPLimit:           adjustedIPLimit,
+		IPLimit:           ipLimit,
 		ExpireTime:        &expireMilli,
 		IsActive:          true,
 		StartDate:         nowUTC(),

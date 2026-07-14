@@ -113,3 +113,27 @@ func TestReverseIPLimitFactor(t *testing.T) {
 		})
 	}
 }
+
+func TestParseDevicesFromComment(t *testing.T) {
+	tests := []struct {
+		name     string
+		comment  string
+		expected int
+		found    bool
+	}{
+		{"no devices", "created by reseller bot, gold plan", 0, false},
+		{"simple devices", "created by reseller bot, devices: 2", 2, true},
+		{"devices with spaces", "created by reseller bot, devices:  3", 3, true},
+		{"devices in middle", "created by reseller bot, devices: 4, some user", 4, true},
+		{"invalid number", "created by reseller bot, devices: abc", 0, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res, ok := parseDevicesFromComment(tc.comment)
+			if ok != tc.found || res != tc.expected {
+				t.Errorf("parseDevicesFromComment(%q) = (%d, %t); expected (%d, %t)", tc.comment, res, ok, tc.expected, tc.found)
+			}
+		})
+	}
+}

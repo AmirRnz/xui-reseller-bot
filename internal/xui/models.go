@@ -102,5 +102,6 @@ type XUIClientInfo struct {
 	LimitIP    int    `json:"limitIp"`
 	TgID       int64  `json:"tgId"`
 	Group      string `json:"group"`
+	Comment    string `json:"comment"`
 }
 

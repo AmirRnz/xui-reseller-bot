@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"log"
 	"strings"
 	"time"
 
@@ -106,14 +107,32 @@ func (c *Client) UpdateClient(email string, client ClientConfig) error {
 	err := c.doRequest("POST", endpoint, client, nil)
 	if err != nil {
 		var netErr net.Error
-		if errors.As(err, &netErr) {
-			// Do not retry on network/timeout errors to avoid double penalty timeouts on offline hosts
-			return err
+		isTimeout := false
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			isTimeout = true
+		} else if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+			isTimeout = true
 		}
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			return err
+
+		if isTimeout {
+			log.Printf("XUI UpdateClient timed out (pending node sync) for %s, treating as success", email)
+			return nil
 		}
-		return c.doRequest("POST", endpoint, UpdateClientRequest{Client: client}, nil)
+
+		errRetry := c.doRequest("POST", endpoint, UpdateClientRequest{Client: client}, nil)
+		if errRetry != nil {
+			isTimeoutRetry := false
+			if errors.As(errRetry, &netErr) && netErr.Timeout() {
+				isTimeoutRetry = true
+			} else if errors.Is(errRetry, context.DeadlineExceeded) || strings.Contains(errRetry.Error(), "timeout") || strings.Contains(errRetry.Error(), "deadline exceeded") {
+				isTimeoutRetry = true
+			}
+			if isTimeoutRetry {
+				log.Printf("XUI UpdateClient retry timed out (pending node sync) for %s, treating as success", email)
+				return nil
+			}
+			return errRetry
+		}
 	}
 	return nil
 }

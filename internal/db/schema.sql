@@ -218,7 +218,8 @@ INSERT INTO bot_settings (key, value) VALUES
     ('currency_symbol', ''),
     ('expiry_notify_days', '3,1'),
     ('ip_limit_factor', ''),
-    ('unapproved_test_limit_per_plan', '1')
+    ('unapproved_test_limit_per_plan', '1'),
+    ('ip_limit_mode', 'factor')
 ON CONFLICT (key) DO NOTHING;
 
 DELETE FROM bot_settings WHERE key = 'group_name';
