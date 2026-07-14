@@ -357,7 +357,13 @@ func HandleGetLink(c telebot.Context) error {
 	if subLink == "" {
 		subLink = bot.XUIClient.SubscriptionURLFor(sub.SubID)
 	}
-	detailsMsg := fmt.Sprintf("🔗 اشتراک: **%s**\n📅 تاریخ انقضا: %s", sub.DisplayName, sub.EndDate.Format("2006-01-02 15:04 UTC"))
+	var expiryStr string
+	if (sub.ExpireTime != nil && *sub.ExpireTime < 0) || sub.EndDate.IsZero() {
+		expiryStr = "شروع پس از اولین اتصال"
+	} else {
+		expiryStr = sub.EndDate.Format("2006-01-02 15:04 UTC")
+	}
+	detailsMsg := fmt.Sprintf("🔗 اشتراک: **%s**\n📅 تاریخ انقضا: %s", sub.DisplayName, expiryStr)
 	return sendSubscriptionResult(c, subLink, detailsMsg)
 }
 
@@ -752,16 +758,22 @@ func HandleSubscriptionExtendMenu(c telebot.Context) error {
 		menu.Row(menu.Data("« بازگشت", "view_sub", fmt.Sprintf("%d", sub.ID))),
 	)
 
-	expiryLabel := sub.EndDate.Format("2006-01-02")
-	if sub.ExpireTime != nil && *sub.ExpireTime < 0 {
-		durMs := -*sub.ExpireTime
-		days := durMs / (24 * 3600 * 1000)
-		if days > 0 {
-			expiryLabel = fmt.Sprintf("شروع پس از اولین اتصال (مدت زمان %d روز)", days)
+	var expiryLabel string
+	if (sub.ExpireTime != nil && *sub.ExpireTime < 0) || sub.EndDate.IsZero() {
+		if sub.ExpireTime != nil && *sub.ExpireTime < 0 {
+			durMs := -*sub.ExpireTime
+			days := durMs / (24 * 3600 * 1000)
+			if days > 0 {
+				expiryLabel = fmt.Sprintf("شروع پس از اولین اتصال (مدت زمان %d روز)", days)
+			} else {
+				hours := durMs / (3600 * 1000)
+				expiryLabel = fmt.Sprintf("شروع پس از اولین اتصال (مدت زمان %d ساعت)", hours)
+			}
 		} else {
-			hours := durMs / (3600 * 1000)
-			expiryLabel = fmt.Sprintf("شروع پس از اولین اتصال (مدت زمان %d ساعت)", hours)
+			expiryLabel = "شروع پس از اولین اتصال"
 		}
+	} else {
+		expiryLabel = sub.EndDate.Format("2006-01-02")
 	}
 	return maybeEditOrSend(c, fmt.Sprintf("⏳ تمدید سرویس **%s**\nتاریخ انقضای فعلی: %s\n\nمدت زمان تمدید را انتخاب کنید:", sub.DisplayName, expiryLabel), menu)
 }
@@ -1155,7 +1167,7 @@ func HandleRequestPlanAssignment(c telebot.Context) error {
 }
 
 func syncActivationExpiry(sub *db.Subscription, client xui.XUIClientInfo) bool {
-	if client.ExpiryTime > 0 && (sub.ExpireTime == nil || *sub.ExpireTime < 0) {
+	if client.ExpiryTime > 0 && (sub.ExpireTime == nil || *sub.ExpireTime <= 0 || sub.EndDate.IsZero()) {
 		log.Printf("Syncing activation expiry time for %s: XUI has %s", sub.ClientEmail, time.UnixMilli(client.ExpiryTime).Format("2006-01-02"))
 		val := client.ExpiryTime
 		sub.ExpireTime = &val
