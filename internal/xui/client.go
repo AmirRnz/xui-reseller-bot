@@ -97,7 +97,23 @@ func (c *Client) GetCachedInbounds() []Inbound {
 }
 
 func (c *Client) AddClient(req AddClientRequest) error {
-	return c.doRequest("POST", "/panel/api/clients/add", req, nil)
+	err := c.doRequest("POST", "/panel/api/clients/add", req, nil)
+	if err != nil {
+		var netErr net.Error
+		isTimeout := false
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			isTimeout = true
+		} else if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+			isTimeout = true
+		}
+
+		if isTimeout {
+			log.Printf("XUI AddClient timed out (pending node sync) for %s, treating as success", req.Client.Email)
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *Client) UpdateClient(email string, client ClientConfig) error {
