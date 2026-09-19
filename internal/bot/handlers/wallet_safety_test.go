@@ -122,6 +122,115 @@ func TestRemoteCreateSuccessDbFailureCompensation(t *testing.T) {
 		}
 	})
 
+	// Case B: remote delete confirmed -> refund fails -> refund reconciliation persists -> outcome = refund pending
+	t.Run("Scenario A2 (Case B): delete confirmed -> refund fails -> refund recon persists -> CompensationRefundPending", func(t *testing.T) {
+		refundCalls := 0
+		deleteCalls := 0
+		refundErr := errors.New("wallet credit failed")
+
+		res := compensateRemoteCreateDbFailure(
+			nil, user, plan, client, inbounds, "display", 500, "op_case_b", dbErr,
+			func(email string) error {
+				deleteCalls++
+				return nil // delete confirmed
+			},
+			nil,
+			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult {
+				refundCalls++
+				return SafeRefundResult{
+					Refunded:                false,
+					RefundErr:               refundErr,
+					ReconciliationPersisted: true,
+					ReconciliationErr:       nil,
+				}
+			},
+			nil,
+		)
+
+		if res.Outcome != CompensationRefundPending {
+			t.Fatalf("expected outcome %s, got %s", CompensationRefundPending, res.Outcome)
+		}
+		if res.Refunded {
+			t.Fatal("must not report refunded")
+		}
+		if !errors.Is(res.RefundErr, refundErr) {
+			t.Fatalf("expected RefundErr %v, got %v", refundErr, res.RefundErr)
+		}
+		if res.ReconErr != nil {
+			t.Fatalf("expected nil ReconErr, got %v", res.ReconErr)
+		}
+		if deleteCalls != 1 || refundCalls != 1 {
+			t.Fatalf("expected 1 delete call and 1 refund call, got %d and %d", deleteCalls, refundCalls)
+		}
+
+		// Formatter assertions:
+		msg := formatCompensationUserMessage(res, "op_case_b")
+		if strings.Contains(msg, "نامشخص") {
+			t.Fatalf("formatter must NOT say delete is unknown for confirmed deletion, got: %s", msg)
+		}
+		if !strings.Contains(msg, "سرویس ایجاد شده در پنل با موفقیت حذف شد") {
+			t.Fatalf("formatter must state panel service was deleted, got: %s", msg)
+		}
+		if !strings.Contains(msg, "درخواست استرداد وجه برای بررسی پشتیبانی ثبت شد") {
+			t.Fatalf("formatter must say refund is pending/registered, got: %s", msg)
+		}
+	})
+
+	// Case C: remote delete confirmed -> refund fails -> refund reconciliation also fails -> CompensationRefundPending with ReconErr
+	t.Run("Scenario A3 (Case C): delete confirmed -> refund fails -> refund recon also fails -> CompensationRefundPending with ReconErr", func(t *testing.T) {
+		refundCalls := 0
+		deleteCalls := 0
+		refundErr := errors.New("wallet credit failed")
+		reconErr := errors.New("reconciliation insert failed")
+
+		res := compensateRemoteCreateDbFailure(
+			nil, user, plan, client, inbounds, "display", 500, "op_case_c", dbErr,
+			func(email string) error {
+				deleteCalls++
+				return nil // delete confirmed
+			},
+			nil,
+			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult {
+				refundCalls++
+				return SafeRefundResult{
+					Refunded:                false,
+					RefundErr:               refundErr,
+					ReconciliationPersisted: false,
+					ReconciliationErr:       reconErr,
+				}
+			},
+			nil,
+		)
+
+		if res.Outcome != CompensationRefundPending {
+			t.Fatalf("expected outcome %s, got %s", CompensationRefundPending, res.Outcome)
+		}
+		if res.Refunded {
+			t.Fatal("must not report refunded")
+		}
+		if !errors.Is(res.RefundErr, refundErr) {
+			t.Fatalf("expected RefundErr %v, got %v", refundErr, res.RefundErr)
+		}
+		if !errors.Is(res.ReconErr, reconErr) {
+			t.Fatalf("expected ReconErr %v, got %v", reconErr, res.ReconErr)
+		}
+		if deleteCalls != 1 || refundCalls != 1 {
+			t.Fatalf("expected 1 delete call and 1 refund call, got %d and %d", deleteCalls, refundCalls)
+		}
+
+		// Formatter assertions:
+		msg := formatCompensationUserMessage(res, "op_case_c")
+		if strings.Contains(msg, "نامشخص") {
+			t.Fatalf("formatter must NOT say delete is unknown for confirmed deletion, got: %s", msg)
+		}
+		if !strings.Contains(msg, "سرویس ایجاد شده در پنل با موفقیت حذف شد") {
+			t.Fatalf("formatter must state panel service was deleted, got: %s", msg)
+		}
+		if !strings.Contains(msg, "هیچ درخواستی به‌طور خودکار ثبت نشده است") {
+			t.Fatalf("formatter must say no automatic request was durably registered, got: %s", msg)
+		}
+	})
+
 	// b. remote create succeeds -> DB insert fails -> delete times out -> verification unavailable -> no refund, reconciliation required
 	t.Run("Scenario B: delete timeout -> verify unavailable -> no refund, reconciliation required", func(t *testing.T) {
 		refundCalls := 0

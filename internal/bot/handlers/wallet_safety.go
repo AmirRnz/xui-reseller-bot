@@ -182,6 +182,7 @@ type RemoteCreateCompensationOutcome string
 
 const (
 	CompensationRefunded               RemoteCreateCompensationOutcome = "refunded"
+	CompensationRefundPending          RemoteCreateCompensationOutcome = "refund_pending"
 	CompensationReconciliationRequired RemoteCreateCompensationOutcome = "reconciliation_required"
 	CompensationClientStillPresent     RemoteCreateCompensationOutcome = "client_still_present"
 )
@@ -211,6 +212,11 @@ func formatCompensationUserMessage(res RemoteCreateCompensationResult, operation
 	switch res.Outcome {
 	case CompensationRefunded:
 		return "خطا در ثبت نهایی اشتراک در دیتابیس رخ داد. سرویس ایجاد شده در پنل خنثی شد و مبلغ پرداختی به کیف پول شما عودت داده شد."
+	case CompensationRefundPending:
+		if res.ReconErr != nil {
+			return fmt.Sprintf("سرویس ایجاد شده در پنل با موفقیت حذف شد، اما استرداد وجه به کیف پول ناموفق بود و ثبت خودکار درخواست تطبیق نیز با خطا مواجه شد (%v). هیچ درخواستی به‌طور خودکار ثبت نشده است؛ لطفاً فوراً با شناسه پیگیری زیر با پشتیبانی تماس بگیرید:\n%s", res.ReconErr, operationKey)
+		}
+		return fmt.Sprintf("سرویس ایجاد شده در پنل با موفقیت حذف شد، اما عودت خودکار مبلغ به کیف پول انجام نشد. درخواست استرداد وجه برای بررسی پشتیبانی ثبت شد؛ شناسه پیگیری شما:\n%s", operationKey)
 	case CompensationReconciliationRequired:
 		if res.ReconErr != nil {
 			return fmt.Sprintf("خطا در ثبت نهایی اشتراک رخ داد و وضعیت حذف سرویس از پنل نامشخص است؛ همچنین ثبت خودکار درخواست در سیستم نیز با خطا مواجه شد (%v). هیچ درخواستی به‌طور خودکار ثبت نشده است. لطفا فورا با پشتیبانی تماس گرفته و شناسه پیگیری زیر را ارسال کنید:\n%s", res.ReconErr, operationKey)
@@ -273,7 +279,7 @@ func compensateRemoteCreateDbFailure(
 			}
 		}
 		return RemoteCreateCompensationResult{
-			Outcome:   CompensationReconciliationRequired,
+			Outcome:   CompensationRefundPending,
 			Refunded:  false,
 			DBErr:     dbErr,
 			DeleteErr: deleteErr,
