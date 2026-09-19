@@ -44,21 +44,36 @@ type ClientStat struct {
 }
 
 type ClientConfig struct {
-	ID         string `json:"id,omitempty"`
-	Email      string `json:"email"`
-	Enable     bool   `json:"enable"`
-	ExpiryTime int64  `json:"expiryTime"`
-	Flow       string `json:"flow,omitempty"`
-	Group      string `json:"group,omitempty"`
-	LimitIP    int    `json:"limitIp"`
-	Reset      int    `json:"reset"`
-	Security   string `json:"security,omitempty"`
-	SubID      string `json:"subId"`
-	TgID       int64  `json:"tgId"`
-	TotalGB    int64  `json:"totalGB"`
-	Comment    string `json:"comment,omitempty"`
-	Password   string `json:"password,omitempty"`
-	Auth       string `json:"auth,omitempty"`
+	ID                  string              `json:"id,omitempty"`
+	Email               string              `json:"email"`
+	Enable              bool                `json:"enable"`
+	ExpiryTime          int64               `json:"expiryTime"`
+	Flow                string              `json:"flow,omitempty"`
+	Group               string              `json:"group,omitempty"`
+	LimitIP             int                 `json:"limitIp"`
+	Reset               int                 `json:"reset"`
+	Security            string              `json:"security,omitempty"`
+	SubID               string              `json:"subId"`
+	TgID                int64               `json:"tgId"`
+	TotalGB             int64               `json:"totalGB"`
+	Comment             string              `json:"comment,omitempty"`
+	Password            string              `json:"password,omitempty"`
+	Auth                string              `json:"auth,omitempty"`
+	LimitHWID           int                 `json:"limitHwid,omitempty"`
+	ResetDay            int                 `json:"resetDay,omitempty"`
+	ResetMax            int                 `json:"resetMax,omitempty"`
+	KeepAlive           *int                `json:"keepAlive,omitempty"`
+	ForwardedPorts      string              `json:"forwardedPorts,omitempty"`
+	PrivateKey          string              `json:"privateKey,omitempty"`
+	PublicKey           string              `json:"publicKey,omitempty"`
+	PreSharedKey        string              `json:"preSharedKey,omitempty"`
+	AllowedIPs          string              `json:"allowedIPs,omitempty"`
+	AllowedIPsByInbound map[string][]string `json:"allowedIPsByInbound,omitempty"`
+	Secret              string              `json:"secret,omitempty"`
+	AdTag               string              `json:"adTag,omitempty"`
+	TrafficReset        string              `json:"trafficReset,omitempty"`
+	TrafficResetDay     int                 `json:"trafficResetDay,omitempty"`
+	Reverse             map[string]any      `json:"reverse,omitempty"`
 }
 
 type AddClientRequest struct {
@@ -90,18 +105,36 @@ type ClientTraffic struct {
 }
 
 type XUIClientInfo struct {
-	ID         int    `json:"id"`
-	Email      string `json:"email"`
-	SubID      string `json:"subId"`
-	UUID       string `json:"uuid"`
-	Password   string `json:"password"`
-	TotalGB    int64  `json:"totalGB"`
-	ExpiryTime int64  `json:"expiryTime"`
-	Enable     bool   `json:"enable"`
-	InboundIDs []int  `json:"inboundIds"`
-	LimitIP    int    `json:"limitIp"`
-	TgID       int64  `json:"tgId"`
-	Group      string `json:"group"`
-	Comment    string `json:"comment"`
+	ID                  int                 `json:"id"`
+	Email               string              `json:"email"`
+	SubID               string              `json:"subId"`
+	UUID                string              `json:"uuid"`
+	Password            string              `json:"password"`
+	Auth                string              `json:"auth"`
+	TotalGB             int64               `json:"totalGB"`
+	ExpiryTime          int64               `json:"expiryTime"`
+	Enable              bool                `json:"enable"`
+	InboundIDs          []int               `json:"inboundIds"`
+	LimitIP             int                 `json:"limitIp"`
+	TgID                int64               `json:"tgId"`
+	Group               string              `json:"group"`
+	Comment             string              `json:"comment"`
+	Flow                string              `json:"flow"`
+	Reset               int                 `json:"reset"`
+	ResetDay            int                 `json:"resetDay"`
+	ResetMax            int                 `json:"resetMax"`
+	LimitHWID           int                 `json:"limitHwid"`
+	KeepAlive           *int                `json:"keepAlive"`
+	Security            string              `json:"security"`
+	PrivateKey          string              `json:"privateKey"`
+	PublicKey           string              `json:"publicKey"`
+	PreSharedKey        string              `json:"preSharedKey"`
+	AllowedIPs          string              `json:"allowedIPs"`
+	AllowedIPsByInbound map[string][]string `json:"allowedIPsByInbound"`
+	Secret              string              `json:"secret"`
+	AdTag               string              `json:"adTag"`
+	ForwardedPorts      string              `json:"forwardedPorts"`
+	TrafficReset        string              `json:"trafficReset"`
+	TrafficResetDay     int                 `json:"trafficResetDay"`
+	Reverse             map[string]any      `json:"reverse"`
 }
-

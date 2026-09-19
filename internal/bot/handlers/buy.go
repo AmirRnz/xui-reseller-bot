@@ -509,14 +509,14 @@ func ProcessBuyCustomName(c telebot.Context, customName string) error {
 	}
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
-		"plan_id":      fmt.Sprintf("%d", plan.ID),
-		"months":       fmt.Sprintf("%d", months),
-		"ip_limit":     fmt.Sprintf("%d", ipLimit),
-		"price":        fmt.Sprintf("%.2f", price),
-		"custom_name":  name,
-		"email":        email,
-		"data_gb":      fmt.Sprintf("%d", dataGB),
-		"type":         "buy",
+		"plan_id":     fmt.Sprintf("%d", plan.ID),
+		"months":      fmt.Sprintf("%d", months),
+		"ip_limit":    fmt.Sprintf("%d", ipLimit),
+		"price":       fmt.Sprintf("%.2f", price),
+		"custom_name": name,
+		"email":       email,
+		"data_gb":     fmt.Sprintf("%d", dataGB),
+		"type":        "buy",
 	})
 
 	var dataLabel = "نامحدود"
@@ -601,14 +601,14 @@ func HandleBuyAutoName(c telebot.Context) error {
 	}
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
-		"plan_id":      fmt.Sprintf("%d", plan.ID),
-		"months":       fmt.Sprintf("%d", months),
-		"ip_limit":     fmt.Sprintf("%d", ipLimit),
-		"price":        fmt.Sprintf("%.2f", price),
-		"custom_name":  baseName,
-		"email":        email,
-		"data_gb":      fmt.Sprintf("%d", dataGB),
-		"type":         "buy",
+		"plan_id":     fmt.Sprintf("%d", plan.ID),
+		"months":      fmt.Sprintf("%d", months),
+		"ip_limit":    fmt.Sprintf("%d", ipLimit),
+		"price":       fmt.Sprintf("%.2f", price),
+		"custom_name": baseName,
+		"email":       email,
+		"data_gb":     fmt.Sprintf("%d", dataGB),
+		"type":        "buy",
 	})
 
 	var dataLabel = "نامحدود"
@@ -677,12 +677,26 @@ func HandleBuyConfirm(c telebot.Context) error {
 	}
 
 	price := calculatePaidPrice(plan, months, ipLimit, dataGB)
-	if err := db.DebitWalletBalance(context.Background(), user.ID, price, "subscription purchase: "+email); err != nil {
+	debitKey := fmt.Sprintf("wallet_purchase:%d:%s", user.ID, email)
+	if err := db.DebitWalletBalanceWithKey(context.Background(), user.ID, price, "subscription purchase: "+email, debitKey); err != nil {
 		return c.Send("موجودی کیف پول شما کافی نیست. لطفا ابتدا کیف پول خود را شارژ کنید یا از گزینه پرداخت مستقیم استفاده کنید.")
 	}
 
 	if err := createPaidSubscription(c, user, plan, email, name, months, ipLimit, price, dataGB); err != nil {
-		_ = db.CreditWalletBalance(context.Background(), user.ID, price, "refund for failed purchase: "+email)
+		if xui.IsUnknownOutcome(err) {
+			record := &db.ReconciliationRecord{
+				OperationKey:  fmt.Sprintf("purchase_provisioning:%d:%s", user.ID, email),
+				Kind:          "purchase_provisioning_unknown",
+				DesiredState:  map[string]any{"email": email, "months": months, "ip_limit": ipLimit, "data_gb": dataGB},
+				ObservedState: map[string]any{"outcome": "unknown"},
+				ErrorMessage:  err.Error(),
+			}
+			if recErr := db.CreateReconciliationRecord(context.Background(), record); recErr != nil {
+				log.Printf("[CRITICAL] failed to persist purchase reconciliation for %s: %v", email, recErr)
+			}
+			return c.Send("نتیجه ایجاد سرویس در پنل نامشخص است؛ برای جلوگیری از ایجاد سرویس تکراری، مبلغ فعلا در کیف پول محفوظ ماند و درخواست برای بررسی ثبت شد.")
+		}
+		_ = db.CreditWalletBalanceWithKey(context.Background(), user.ID, price, "refund for failed purchase: "+email, fmt.Sprintf("wallet_purchase_refund:%d:%s", user.ID, email))
 		return c.Send("خطا در ایجاد اشتراک در پنل. مبلغ کسر شده به کیف پول شما عودت داده شد. " + err.Error())
 	}
 	return nil
@@ -756,7 +770,7 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 	client := prepareClientConfig(email, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, ipLimit, plan.Flow, subID, clientUUID, plan.Name, user)
 
 	err := bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: inboundIDs})
-	if err != nil {
+	if err != nil && !xui.IsUnknownOutcome(err) {
 		log.Printf("XUI AddClient failed: %v. Refreshing cache and retrying...", err)
 		if bot.XUIClient.Cache != nil {
 			bot.XUIClient.Cache.RefreshSync()
@@ -836,8 +850,7 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 	}
 
 	if err := sendSubscriptionResult(c, subLink, detailsMsg); err != nil {
-		_ = c.Send(detailsMsg + "\n`" + subLink + "`", telebot.ModeMarkdown)
+		_ = c.Send(detailsMsg+"\n`"+subLink+"`", telebot.ModeMarkdown)
 	}
 	return showMainMenu(c, user)
 }
-

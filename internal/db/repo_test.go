@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,19 +226,65 @@ func TestSubscriptionRepo(t *testing.T) {
 		t.Fatalf("expected 0 active subscriptions, got %d", len(activeSubs2))
 	}
 
-	// 8. DeleteSubscription
+	// 8. DeleteSubscription is a non-destructive lifecycle transition.
 	err = DeleteSubscription(ctx, sub.ID)
 	if err != nil {
 		t.Fatalf("failed to delete subscription: %v", err)
 	}
 
-	// Verify deleted
+	// Verify the auditable row remains.
 	gotSubDeleted, err := GetSubscriptionByID(ctx, sub.ID)
 	if err != nil {
 		t.Fatalf("failed to check deleted subscription: %v", err)
 	}
-	if gotSubDeleted != nil {
-		t.Fatalf("subscription was not deleted: %+v", gotSubDeleted)
+	if gotSubDeleted == nil || gotSubDeleted.Status != SubscriptionStatusDeleted || gotSubDeleted.IsActive {
+		t.Fatalf("subscription was not marked deleted: %+v", gotSubDeleted)
+	}
+}
+
+func TestCancelSubscriptionWithRefundIsAuditable(t *testing.T) {
+	ctx := setupTestDB(t)
+	const telegramID int64 = 999999997
+	const email = "test_cancel_refund@example.com"
+	defer func() {
+		if Pool != nil {
+			_, _ = Pool.Exec(ctx, "DELETE FROM refund_requests WHERE subscription_id IN (SELECT id FROM subscriptions WHERE client_email = $1)", email)
+			_, _ = Pool.Exec(ctx, "DELETE FROM subscriptions WHERE client_email = $1", email)
+			_, _ = Pool.Exec(ctx, "DELETE FROM bot_users WHERE telegram_id = $1", telegramID)
+		}
+	}()
+
+	var userID int64
+	if err := Pool.QueryRow(ctx, `
+		INSERT INTO bot_users (telegram_id, username, first_name)
+		VALUES ($1, 'cancel_refund_test', 'Cancel')
+		RETURNING id
+	`, telegramID).Scan(&userID); err != nil {
+		t.Fatalf("create test user: %v", err)
+	}
+	expire := time.Now().Add(90 * 24 * time.Hour).UnixMilli()
+	sub := &Subscription{UserID: userID, PlanType: PlanTypePaid, ClientEmail: email, ClientUUID: "uuid", SubID: "sub", DisplayName: "cancel", IPLimit: 1, ExpireTime: &expire, IsActive: true}
+	if err := CreateSubscription(ctx, sub); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	req, err := CancelSubscriptionWithRefund(ctx, sub.ID, userID, 1234, "test_cancel_refund:1")
+	if err != nil {
+		t.Fatalf("cancel subscription: %v", err)
+	}
+	if req == nil || req.ID == 0 {
+		t.Fatalf("expected a persisted refund request with a non-zero ID, got %#v", req)
+	}
+	gotSub, err := GetSubscriptionByID(ctx, sub.ID)
+	if err != nil || gotSub == nil {
+		t.Fatalf("cancelled subscription row missing: sub=%#v err=%v", gotSub, err)
+	}
+	if gotSub.Status != SubscriptionStatusCancelled || gotSub.IsActive {
+		t.Fatalf("unexpected cancelled state: %+v", gotSub)
+	}
+	gotReq, err := GetRefundRequestByID(ctx, req.ID)
+	if err != nil || gotReq == nil || gotReq.SubscriptionID == nil || *gotReq.SubscriptionID != int64(sub.ID) {
+		t.Fatalf("refund is not linked to the preserved subscription: req=%#v err=%v", gotReq, err)
 	}
 }
 
@@ -465,8 +513,8 @@ func TestPurchaseRollbackAndClaim(t *testing.T) {
 	if approvedReq == nil {
 		t.Fatalf("approved request is nil")
 	}
-	if approvedReq.Status != "approved" {
-		t.Fatalf("expected status 'approved', got %q", approvedReq.Status)
+	if approvedReq.Status != "approved" || approvedReq.ProvisioningStatus != PurchaseProvisioningPending {
+		t.Fatalf("expected payment approved and provisioning pending, got status=%q provisioning=%q", approvedReq.Status, approvedReq.ProvisioningStatus)
 	}
 
 	// Verify transaction was created
@@ -494,31 +542,94 @@ func TestPurchaseRollbackAndClaim(t *testing.T) {
 		t.Fatalf("failed to rollback purchase request: %v", err)
 	}
 
-	// Verify request is pending again
+	// Provisioning failure/retry must not erase the approved payment fact.
 	rolledReq, err := GetPurchaseRequestByID(ctx, req.ID)
 	if err != nil {
 		t.Fatalf("failed to get purchase request: %v", err)
 	}
-	if rolledReq.Status != "pending" || rolledReq.AdminID != nil {
-		t.Fatalf("expected status 'pending' and nil AdminID, got status %q, AdminID %v", rolledReq.Status, rolledReq.AdminID)
+	if rolledReq.Status != "approved" || rolledReq.ProvisioningStatus != PurchaseProvisioningRetryable || rolledReq.AdminID == nil {
+		t.Fatalf("expected approved payment and retryable provisioning, got status %q provisioning %q AdminID %v", rolledReq.Status, rolledReq.ProvisioningStatus, rolledReq.AdminID)
 	}
 
-	// Verify transaction was deleted
+	// Verify transaction history remains intact.
 	err = Pool.QueryRow(ctx, "SELECT count(*) FROM transactions WHERE reference_type = 'purchase_request' AND reference_id = $1", req.ID).Scan(&txCount)
 	if err != nil {
 		t.Fatalf("failed to count transactions after rollback: %v", err)
 	}
-	if txCount != 0 {
-		t.Fatalf("expected 0 transactions after rollback, got %d", txCount)
+	if txCount != 1 {
+		t.Fatalf("expected 1 transaction after provisioning rollback, got %d", txCount)
 	}
 
-	// Verify HasPendingClaimRequest is true again
+	// The claim is no longer pending because the payment was approved.
 	hasPending, err = HasPendingClaimRequest(ctx, "sub_claim_123")
 	if err != nil {
 		t.Fatalf("failed to check pending claim: %v", err)
 	}
-	if !hasPending {
-		t.Fatalf("expected HasPendingClaimRequest to be true after rollback, got false")
+	if hasPending {
+		t.Fatalf("expected HasPendingClaimRequest to remain false after provisioning retry state")
 	}
 }
 
+func TestWalletOperationKeyIsConcurrentIdempotent(t *testing.T) {
+	ctx := setupTestDB(t)
+	operationKey := "test_wallet_operation:" + time.Now().UTC().Format("20060102150405.000000000")
+	defer func() {
+		if Pool != nil {
+			_, _ = Pool.Exec(ctx, "DELETE FROM transactions WHERE operation_key = $1", operationKey)
+			_, _ = Pool.Exec(ctx, "DELETE FROM bot_users WHERE telegram_id = 999999997")
+		}
+	}()
+
+	var userID int64
+	err := Pool.QueryRow(ctx, `
+		INSERT INTO bot_users (telegram_id, username, first_name, last_name, wallet_balance)
+		VALUES (999999997, 'wallet_idempotency_user', 'Wallet', 'Idempotency', 0)
+		ON CONFLICT (telegram_id) DO UPDATE SET wallet_balance = 0
+		RETURNING id
+	`).Scan(&userID)
+	if err != nil {
+		t.Fatalf("failed to create test user: %v", err)
+	}
+
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- AddWalletBalanceWithKey(ctx, userID, 100, "concurrent wallet test", operationKey)
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	applied, duplicate := 0, 0
+	for err := range results {
+		switch {
+		case err == nil:
+			applied++
+		case errors.Is(err, ErrWalletOperationAlreadyApplied):
+			duplicate++
+		default:
+			t.Fatalf("unexpected wallet operation error: %v", err)
+		}
+	}
+	if applied != 1 || duplicate != 1 {
+		t.Fatalf("expected one applied operation and one duplicate, got applied=%d duplicate=%d", applied, duplicate)
+	}
+
+	var balance int64
+	if err := Pool.QueryRow(ctx, "SELECT wallet_balance FROM bot_users WHERE id = $1", userID).Scan(&balance); err != nil {
+		t.Fatalf("failed to read wallet balance: %v", err)
+	}
+	if balance != 100 {
+		t.Fatalf("expected one wallet credit, got balance %d", balance)
+	}
+	var transactionCount int
+	if err := Pool.QueryRow(ctx, "SELECT count(*) FROM transactions WHERE operation_key = $1", operationKey).Scan(&transactionCount); err != nil {
+		t.Fatalf("failed to count wallet operations: %v", err)
+	}
+	if transactionCount != 1 {
+		t.Fatalf("expected one durable wallet operation, got %d", transactionCount)
+	}
+}

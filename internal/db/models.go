@@ -11,6 +11,16 @@ const (
 
 	PlanTypeTest = "test"
 	PlanTypePaid = "paid"
+
+	SubscriptionStatusActive         = "active"
+	SubscriptionStatusCancelled      = "cancelled"
+	SubscriptionStatusDeleted        = "deleted"
+	SubscriptionStatusReconciliation = "reconciliation_required"
+
+	PurchaseProvisioningPending   = "pending"
+	PurchaseProvisioningSucceeded = "succeeded"
+	PurchaseProvisioningRetryable = "retryable"
+	PurchaseProvisioningFailed    = "failed"
 )
 
 type User struct {
@@ -47,6 +57,7 @@ type WalletTransaction struct {
 	Description   string    `json:"description"`
 	ReferenceType string    `json:"reference_type"`
 	ReferenceID   *int64    `json:"reference_id"`
+	OperationKey  string    `json:"operation_key"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
@@ -111,23 +122,27 @@ type Plan struct {
 }
 
 type Subscription struct {
-	ID                int       `json:"id"`
-	UserID            int64     `json:"user_id"`
-	PlanID            *int      `json:"plan_id"`
-	ClientEmail       string    `json:"client_email"`
-	ClientUUID        string    `json:"client_uuid"`
-	SubID             string    `json:"sub_id"`
-	Status            string    `json:"status"`
-	PlanType          string    `json:"plan_type"`
-	DisplayName       string    `json:"display_name"`
-	IPLimit           int       `json:"ip_limit"`
-	ExpireTime        *int64    `json:"expire_time"`
-	IsActive          bool      `json:"is_active"`
-	StartDate         time.Time `json:"start_date"`
-	EndDate           time.Time `json:"end_date"`
-	TrafficLimitBytes int64     `json:"traffic_limit_bytes"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                 int       `json:"id"`
+	UserID             int64     `json:"user_id"`
+	PlanID             *int      `json:"plan_id"`
+	ClientEmail        string    `json:"client_email"`
+	ClientUUID         string    `json:"client_uuid"`
+	SubID              string    `json:"sub_id"`
+	Status             string    `json:"status"`
+	PlanType           string    `json:"plan_type"`
+	DisplayName        string    `json:"display_name"`
+	IPLimit            int       `json:"ip_limit"`
+	ExpireTime         *int64    `json:"expire_time"`
+	IsActive           bool      `json:"is_active"`
+	StartDate          time.Time `json:"start_date"`
+	EndDate            time.Time `json:"end_date"`
+	TrafficLimitBytes  int64     `json:"traffic_limit_bytes"`
+	DesiredIPLimit     *int      `json:"desired_ip_limit"`
+	DesiredExpireTime  *int64    `json:"desired_expire_time"`
+	DesiredIsActive    *bool     `json:"desired_is_active"`
+	ReconciliationNote string    `json:"reconciliation_note"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type TopupRequest struct {
@@ -147,22 +162,23 @@ type Setting struct {
 }
 
 type PurchaseRequest struct {
-	ID             int64     `json:"id"`
-	UserID         int64     `json:"user_id"`
-	Type           string    `json:"type"` // 'buy', 'extend', 'upgrade_ip'
-	PlanID         *int64    `json:"plan_id"`
-	SubscriptionID *int64    `json:"subscription_id"`
-	Price          float64   `json:"price"`
-	Months         int       `json:"months"`
-	IPLimit        int       `json:"ip_limit"`
-	DataGB         int       `json:"data_gb"`
-	CustomName     string    `json:"custom_name"`
-	ClientEmail    string    `json:"client_email"`
-	TelegramFileID string    `json:"telegram_file_id"`
-	Status         string    `json:"status"` // 'pending', 'approved', 'rejected'
-	AdminID        *int64    `json:"admin_id"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID                 int64     `json:"id"`
+	UserID             int64     `json:"user_id"`
+	Type               string    `json:"type"` // 'buy', 'extend', 'upgrade_ip'
+	PlanID             *int64    `json:"plan_id"`
+	SubscriptionID     *int64    `json:"subscription_id"`
+	Price              float64   `json:"price"`
+	Months             int       `json:"months"`
+	IPLimit            int       `json:"ip_limit"`
+	DataGB             int       `json:"data_gb"`
+	CustomName         string    `json:"custom_name"`
+	ClientEmail        string    `json:"client_email"`
+	TelegramFileID     string    `json:"telegram_file_id"`
+	Status             string    `json:"status"` // 'pending', 'approved', 'rejected'
+	ProvisioningStatus string    `json:"provisioning_status"`
+	AdminID            *int64    `json:"admin_id"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 type RefundRequest struct {
@@ -173,7 +189,7 @@ type RefundRequest struct {
 	ApprovedAmount   *int64    `json:"approved_amount"`
 	Status           string    `json:"status"` // 'pending', 'approved', 'rejected'
 	AdminID          *int64    `json:"admin_id"`
+	OperationKey     string    `json:"operation_key"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }
-

@@ -99,12 +99,12 @@ func CreateSubscription(ctx context.Context, s *Subscription) error {
 	}
 
 	query := `
-		INSERT INTO subscriptions (user_id, plan_id, client_email, client_uuid, sub_id, status, plan_type, display_name, ip_limit, expire_time, is_active, start_date, end_date, traffic_limit_bytes)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		INSERT INTO subscriptions (user_id, plan_id, client_email, client_uuid, sub_id, status, plan_type, display_name, ip_limit, expire_time, is_active, start_date, end_date, traffic_limit_bytes, desired_ip_limit, desired_expire_time, desired_is_active, reconciliation_note)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING id, created_at, updated_at
 	`
 	return Pool.QueryRow(ctx, query,
-		s.UserID, s.PlanID, s.ClientEmail, s.ClientUUID, s.SubID, s.Status, s.PlanType, s.DisplayName, s.IPLimit, s.ExpireTime, s.IsActive, s.StartDate, endDate, s.TrafficLimitBytes,
+		s.UserID, s.PlanID, s.ClientEmail, s.ClientUUID, s.SubID, s.Status, s.PlanType, s.DisplayName, s.IPLimit, s.ExpireTime, s.IsActive, s.StartDate, endDate, s.TrafficLimitBytes, s.DesiredIPLimit, s.DesiredExpireTime, s.DesiredIsActive, s.ReconciliationNote,
 	).Scan(&s.ID, &s.CreatedAt, &s.UpdatedAt)
 }
 
@@ -113,7 +113,7 @@ func UpdateSubscriptionStatus(ctx context.Context, id int, status string) error 
 	defer cancel()
 
 	isActive := status == "active"
-	_, err := Pool.Exec(ctx, `UPDATE subscriptions SET status = $1, is_active = $2, updated_at = NOW() WHERE id = $3`, status, isActive, id)
+	_, err := Pool.Exec(ctx, `UPDATE subscriptions SET status = $1, is_active = $2, end_date = CASE WHEN $1 = 'cancelled' THEN COALESCE(end_date, NOW()) ELSE end_date END, updated_at = NOW() WHERE id = $3`, status, isActive, id)
 	return err
 }
 
@@ -131,9 +131,60 @@ func UpdateSubscription(ctx context.Context, s *Subscription) error {
 	_, err := Pool.Exec(ctx, `
 		UPDATE subscriptions
 		SET plan_id = $1, client_email = $2, client_uuid = $3, sub_id = $4, status = $5, plan_type = $6,
-			display_name = $7, ip_limit = $8, expire_time = $9, is_active = $10, end_date = $11, traffic_limit_bytes = $12, updated_at = NOW()
-		WHERE id = $13
-	`, s.PlanID, s.ClientEmail, s.ClientUUID, s.SubID, s.Status, s.PlanType, s.DisplayName, s.IPLimit, s.ExpireTime, s.IsActive, endDate, s.TrafficLimitBytes, s.ID)
+			display_name = $7, ip_limit = $8, expire_time = $9, is_active = $10, end_date = $11, traffic_limit_bytes = $12,
+			desired_ip_limit = $13, desired_expire_time = $14, desired_is_active = $15, reconciliation_note = $16, updated_at = NOW()
+		WHERE id = $17
+	`, s.PlanID, s.ClientEmail, s.ClientUUID, s.SubID, s.Status, s.PlanType, s.DisplayName, s.IPLimit, s.ExpireTime, s.IsActive, endDate, s.TrafficLimitBytes, s.DesiredIPLimit, s.DesiredExpireTime, s.DesiredIsActive, s.ReconciliationNote, s.ID)
+	return err
+}
+
+// CancelSubscriptionWithRefund preserves the commercial row and creates its
+// refund request in one transaction. The key makes repeated callbacks safe.
+func CancelSubscriptionWithRefund(ctx context.Context, subscriptionID int, userID int64, amount int64, operationKey string) (*RefundRequest, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var ownerID int64
+	if err := tx.QueryRow(ctx, `
+		UPDATE subscriptions
+		SET status = 'cancelled', is_active = FALSE, end_date = COALESCE(end_date, NOW()), updated_at = NOW()
+		WHERE id = $1 AND user_id = $2
+		RETURNING user_id
+	`, subscriptionID, userID).Scan(&ownerID); err != nil {
+		return nil, err
+	}
+
+	request := &RefundRequest{UserID: ownerID, CalculatedAmount: amount, Status: "pending", OperationKey: operationKey}
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO refund_requests (user_id, subscription_id, calculated_amount, status, operation_key)
+		VALUES ($1, $2, $3, $4, NULLIF($5, ''))
+		ON CONFLICT (operation_key) DO UPDATE SET updated_at = refund_requests.updated_at
+		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
+	`, request.UserID, int64(subscriptionID), amount, request.Status, operationKey).Scan(&request.ID, &request.UserID, &request.SubscriptionID, &request.CalculatedAmount, &request.ApprovedAmount, &request.Status, &request.AdminID, &request.OperationKey, &request.CreatedAt, &request.UpdatedAt); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return request, nil
+}
+
+func MarkSubscriptionReconciliationRequired(ctx context.Context, id int, desiredIPLimit *int, desiredExpireTime *int64, desiredIsActive *bool, note string) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	_, err := Pool.Exec(ctx, `
+		UPDATE subscriptions
+		SET status = 'reconciliation_required', desired_ip_limit = $1, desired_expire_time = $2,
+			desired_is_active = $3, reconciliation_note = $4, updated_at = NOW()
+		WHERE id = $5
+	`, desiredIPLimit, desiredExpireTime, desiredIsActive, note, id)
 	return err
 }
 
@@ -141,7 +192,7 @@ func DeleteSubscription(ctx context.Context, id int) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
-	_, err := Pool.Exec(ctx, `DELETE FROM subscriptions WHERE id = $1`, id)
+	_, err := Pool.Exec(ctx, `UPDATE subscriptions SET status = 'deleted', is_active = FALSE, end_date = COALESCE(end_date, NOW()), updated_at = NOW() WHERE id = $1`, id)
 	return err
 }
 
@@ -228,13 +279,13 @@ func GetExpiringSubscriptions(ctx context.Context, days int) ([]*Subscription, e
 }
 
 func subscriptionSelect() string {
-	return `SELECT id, user_id, plan_id, client_email, client_uuid, sub_id, status, plan_type, display_name, ip_limit, expire_time, is_active, start_date, end_date, traffic_limit_bytes, created_at, updated_at FROM subscriptions`
+	return `SELECT id, user_id, plan_id, client_email, client_uuid, sub_id, status, plan_type, display_name, ip_limit, expire_time, is_active, start_date, end_date, traffic_limit_bytes, desired_ip_limit, desired_expire_time, desired_is_active, reconciliation_note, created_at, updated_at FROM subscriptions`
 }
 
 func scanSubscriptionRows(rows pgx.Rows) (*Subscription, error) {
 	s := &Subscription{}
 	var endDate *time.Time
-	err := rows.Scan(&s.ID, &s.UserID, &s.PlanID, &s.ClientEmail, &s.ClientUUID, &s.SubID, &s.Status, &s.PlanType, &s.DisplayName, &s.IPLimit, &s.ExpireTime, &s.IsActive, &s.StartDate, &endDate, &s.TrafficLimitBytes, &s.CreatedAt, &s.UpdatedAt)
+	err := rows.Scan(&s.ID, &s.UserID, &s.PlanID, &s.ClientEmail, &s.ClientUUID, &s.SubID, &s.Status, &s.PlanType, &s.DisplayName, &s.IPLimit, &s.ExpireTime, &s.IsActive, &s.StartDate, &endDate, &s.TrafficLimitBytes, &s.DesiredIPLimit, &s.DesiredExpireTime, &s.DesiredIsActive, &s.ReconciliationNote, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -306,7 +357,7 @@ func GetActiveSubscriptionsByPlan(ctx context.Context, planType string, planID i
 func scanSubscriptionRow(row pgx.Row) (*Subscription, error) {
 	s := &Subscription{}
 	var endDate *time.Time
-	err := row.Scan(&s.ID, &s.UserID, &s.PlanID, &s.ClientEmail, &s.ClientUUID, &s.SubID, &s.Status, &s.PlanType, &s.DisplayName, &s.IPLimit, &s.ExpireTime, &s.IsActive, &s.StartDate, &endDate, &s.TrafficLimitBytes, &s.CreatedAt, &s.UpdatedAt)
+	err := row.Scan(&s.ID, &s.UserID, &s.PlanID, &s.ClientEmail, &s.ClientUUID, &s.SubID, &s.Status, &s.PlanType, &s.DisplayName, &s.IPLimit, &s.ExpireTime, &s.IsActive, &s.StartDate, &endDate, &s.TrafficLimitBytes, &s.DesiredIPLimit, &s.DesiredExpireTime, &s.DesiredIsActive, &s.ReconciliationNote, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -350,4 +401,3 @@ func GetActiveSubscriptions(ctx context.Context) ([]*Subscription, error) {
 	}
 	return subs, rows.Err()
 }
-

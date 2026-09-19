@@ -56,7 +56,7 @@ func HandleTestSubFlow(c telebot.Context) error {
 
 	for _, plan := range plans {
 		usedCount, _ := db.GetTestUsageToday(context.Background(), user.ID, plan.ID)
-		
+
 		unapprovedLimitStr, _ := db.GetSetting(context.Background(), "unapproved_test_limit_per_plan")
 		limit := DetermineTestLimit(user.IsApproved(), plan.MaxPerDay, unapprovedLimitStr)
 
@@ -107,7 +107,7 @@ func HandleSelectTestPlan(c telebot.Context) error {
 	}
 
 	usedCount, _ := db.GetTestUsageToday(context.Background(), user.ID, plan.ID)
-	
+
 	limitStr, _ := db.GetSetting(context.Background(), "unapproved_test_limit_per_plan")
 	limit := DetermineTestLimit(user.IsApproved(), plan.MaxPerDay, limitStr)
 
@@ -171,7 +171,7 @@ func generateTestSubscription(c telebot.Context, user *db.User, planID int64, em
 		return c.Send("طرح تست یافت نشد.")
 	}
 	usedCount, _ := db.GetTestUsageToday(context.Background(), user.ID, plan.ID)
-	
+
 	limitStr, _ := db.GetSetting(context.Background(), "unapproved_test_limit_per_plan")
 	limit := DetermineTestLimit(user.IsApproved(), plan.MaxPerDay, limitStr)
 
@@ -205,7 +205,7 @@ func createAndSendTest(c telebot.Context, user *db.User, plan *db.TestPlan, emai
 	}
 
 	err := bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: inboundIDs})
-	if err != nil {
+	if err != nil && !xui.IsUnknownOutcome(err) {
 		log.Printf("XUI AddClient failed: %v. Refreshing cache and retrying...", err)
 		if bot.XUIClient.Cache != nil {
 			bot.XUIClient.Cache.RefreshSync()
@@ -271,7 +271,7 @@ func createAndSendTest(c telebot.Context, user *db.User, plan *db.TestPlan, emai
 	}
 
 	if err := sendSubscriptionResult(c, subLink, detailsMsg); err != nil {
-		_ = c.Send(detailsMsg + "\n`" + subLink + "`", telebot.ModeMarkdown)
+		_ = c.Send(detailsMsg+"\n`"+subLink+"`", telebot.ModeMarkdown)
 	}
 	return nil
 }
@@ -308,4 +308,3 @@ func DetermineTestLimit(isApproved bool, planMaxPerDay int, unapprovedSettingStr
 	}
 	return limit
 }
-

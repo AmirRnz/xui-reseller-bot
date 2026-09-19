@@ -126,12 +126,12 @@ func TestConcurrencyStress(t *testing.T) {
 					errChan <- fmt.Errorf("routine %d: DeleteSubscription: %w", routineID, err)
 				}
 
-				// Verify Deleted
+				// Verify the row remains auditable after the non-destructive delete.
 				gotSubDeleted, err := GetSubscriptionByID(ctx, sub.ID)
 				if err != nil {
 					errChan <- fmt.Errorf("routine %d: Verify Deleted: %w", routineID, err)
-				} else if gotSubDeleted != nil {
-					errChan <- fmt.Errorf("routine %d: Verify Deleted: subscription still exists", routineID)
+				} else if gotSubDeleted == nil || gotSubDeleted.Status != SubscriptionStatusDeleted {
+					errChan <- fmt.Errorf("routine %d: Verify Deleted: subscription was not marked deleted", routineID)
 				}
 			}
 		}(i)

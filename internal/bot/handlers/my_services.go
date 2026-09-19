@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -27,7 +28,7 @@ func RegisterMyServices(b *telebot.Bot, auth telebot.MiddlewareFunc) {
 	b.Handle("\fsub_rename", HandleSubscriptionRenamePrompt, auth)
 	b.Handle("\fsub_delete_confirm", HandleDeleteSubscriptionConfirm, auth)
 	b.Handle("\fsub_delete", HandleDeleteSubscription, auth)
-	
+
 	// IP limit upgrading handlers
 	b.Handle("\fsub_limit", HandleSubscriptionLimitMenu, auth)
 	b.Handle("\fsub_limit_set", HandleSubscriptionLimitConfirmPrompt, auth)
@@ -71,74 +72,35 @@ func showServicesPage(c telebot.Context, page int) error {
 	subs = paidSubs
 
 	if bot.XUIClient != nil {
-		if user.ServiceName != nil && *user.ServiceName != "" {
-			allClients, err := bot.XUIClient.ListClients()
-			if err == nil {
-				existingClients := make(map[string]xui.XUIClientInfo)
-				existingSubsByEmail := make(map[string]*db.Subscription)
-
-				for _, sub := range subs {
-					existingSubsByEmail[sub.ClientEmail] = sub
-				}
-
-				for _, client := range allClients {
-					if client.Group != *user.ServiceName {
-						continue
+		allClients, listErr := bot.XUIClient.ListClients()
+		if listErr != nil {
+			log.Printf("x-ui service reconciliation read failed: %v", listErr)
+		} else {
+			// subscriptions.user_id is the only ownership relation. The remote
+			// group is metadata and must never import, filter, or transfer rows.
+			existingClients := make(map[string]xui.XUIClientInfo, len(allClients))
+			for _, client := range allClients {
+				existingClients[client.Email] = client
+			}
+			for _, sub := range subs {
+				if client, exists := existingClients[sub.ClientEmail]; exists {
+					changed := false
+					if devLimit, ok := parseDeviceLimitFromXUI(client); ok && devLimit != sub.IPLimit {
+						log.Printf("Syncing device limit for %s during page load: DB had %d, XUI has %d", sub.ClientEmail, sub.IPLimit, devLimit)
+						sub.IPLimit = devLimit
+						changed = true
 					}
-					
-					existingClients[client.Email] = client
-
-					if _, found := existingSubsByEmail[client.Email]; !found {
-						expTime := client.ExpiryTime
-						if expTime == 0 {
-							expTime = -1
-						}
-						
-						newSub := &db.Subscription{
-							UserID:            user.ID,
-							PlanID:            nil,
-							ClientEmail:       client.Email,
-							ClientUUID:        client.UUID,
-							SubID:             client.SubID,
-							Status:            "active",
-							PlanType:          db.PlanTypePaid,
-							DisplayName:       client.Email,
-							IPLimit:           client.LimitIP,
-							ExpireTime:        &expTime,
-							IsActive:          client.Enable,
-							StartDate:         time.Now().UTC(),
-							TrafficLimitBytes: client.TotalGB,
-						}
-						if expTime > 0 {
-							newSub.EndDate = time.UnixMilli(expTime)
-						}
-						_ = db.CreateSubscription(context.Background(), newSub)
-						subs = append(subs, newSub)
+					if syncActivationExpiry(sub, client) {
+						changed = true
 					}
-				}
-
-				var activeSubs []*db.Subscription
-				for _, sub := range subs {
-					if client, exists := existingClients[sub.ClientEmail]; exists {
-						changed := false
-						if devLimit, ok := parseDeviceLimitFromXUI(client); ok && devLimit != sub.IPLimit {
-							log.Printf("Syncing device limit for %s during page load: DB had %d, XUI has %d", sub.ClientEmail, sub.IPLimit, devLimit)
-							sub.IPLimit = devLimit
-							changed = true
-						}
-						if syncActivationExpiry(sub, client) {
-							changed = true
-						}
-						if changed {
-							_ = db.UpdateSubscription(context.Background(), sub)
-						}
-						activeSubs = append(activeSubs, sub)
-					} else {
-						log.Printf("Deleting orphan subscription %s from DB because it no longer exists on 3x-ui in group.", sub.ClientEmail)
-						_ = db.DeleteSubscription(context.Background(), sub.ID)
+					if changed {
+						_ = db.UpdateSubscription(context.Background(), sub)
 					}
+				} else {
+					// A missing infrastructure row is drift, never a reason to
+					// delete the commercial subscription while displaying it.
+					log.Printf("subscription drift: %s (subscription id %d) is absent from 3x-ui; preserving DB row", sub.ClientEmail, sub.ID)
 				}
-				subs = activeSubs
 			}
 		}
 	}
@@ -318,7 +280,7 @@ func showSubscriptionDetail(c telebot.Context, user *db.User, sub *db.Subscripti
 			))
 		}
 	}
-	
+
 	toggleText := "🔴 غیرفعال کردن"
 	if !sub.IsActive {
 		toggleText = "🟢 فعال کردن"
@@ -376,12 +338,22 @@ func HandleToggleSubscription(c telebot.Context) error {
 	}
 	sub.IsActive = !sub.IsActive
 	if err := updateXUIFromSubscription(sub); err != nil {
+		if xui.IsUnknownOutcome(err) {
+			desiredActive := sub.IsActive
+			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &sub.IPLimit, sub.ExpireTime, &desiredActive, "toggle has unknown 3x-ui outcome"); recErr != nil {
+				log.Printf("[CRITICAL] failed to mark toggle reconciliation for subscription %d: %v", sub.ID, recErr)
+			}
+		}
 		return c.Send("خطا در اعمال تغییرات در پنل. لطفا مجددا تلاش کنید.")
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
+		desiredActive := sub.IsActive
+		if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &sub.IPLimit, sub.ExpireTime, &desiredActive, "3x-ui toggle succeeded but database update failed"); recErr != nil {
+			log.Printf("[CRITICAL] failed to mark DB-after-remote toggle reconciliation for subscription %d: %v", sub.ID, recErr)
+		}
 		return c.Send("خطا در ذخیره‌سازی وضعیت.")
 	}
-	
+
 	state := "غیرفعال"
 	if sub.IsActive {
 		state = "فعال"
@@ -407,10 +379,10 @@ func HandleDeleteSubscriptionConfirm(c telebot.Context) error {
 	if !ok {
 		return nil
 	}
-	
+
 	var text strings.Builder
 	text.WriteString(fmt.Sprintf("⚠️ **تایید حذف سرویس %s**\n\nآیا از حذف این سرویس اطمینان دارید؟", sub.DisplayName))
-	
+
 	var refundAmount int64 = 0
 	if sub.PlanType == db.PlanTypePaid {
 		plan, _ := paidPlanForSub(sub)
@@ -421,12 +393,14 @@ func HandleDeleteSubscriptionConfirm(c telebot.Context) error {
 		}
 		refundAmount = CalculateRefund(plan, sub, factor, nowUTC())
 	}
-	
+
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" { currency = "IRR" }
-	
+	if currency == "" {
+		currency = "IRR"
+	}
+
 	if refundAmount > 0 {
-		text.WriteString(fmt.Sprintf("\n\nمبلغ عودتی تقریبی شما بابت %d ماه کامل باقیمانده: **%d %s**\nمبلغ پس از تایید مدیریت به کیف پول شما اضافه خواهد شد.", 
+		text.WriteString(fmt.Sprintf("\n\nمبلغ عودتی تقریبی شما بابت %d ماه کامل باقیمانده: **%d %s**\nمبلغ پس از تایید مدیریت به کیف پول شما اضافه خواهد شد.",
 			int(sub.EndDate.Sub(nowUTC()).Hours()/24/30), refundAmount, currency))
 	} else {
 		text.WriteString("\n\nبا حذف این سرویس هیچ مبلغی به کیف پول شما عودت داده نخواهد شد (زمان باقیمانده کافی نیست یا سرویس تست است).")
@@ -442,7 +416,7 @@ func HandleDeleteSubscriptionConfirm(c telebot.Context) error {
 		menu.Row(menu.Data("بله، حذف کن", "sub_delete")),
 		menu.Row(menu.Data("❌ انصراف", "view_sub", fmt.Sprintf("%d", sub.ID))),
 	)
-	
+
 	return maybeEditOrSend(c, text.String(), menu)
 }
 
@@ -458,12 +432,12 @@ func HandleDeleteSubscription(c telebot.Context) error {
 	subID, _ := parseInt64(fmt.Sprintf("%v", state.Data["sub_id"]))
 	refundAmountStr := fmt.Sprintf("%v", state.Data["refund_amount"])
 	refundAmount, _ := strconv.ParseInt(refundAmountStr, 10, 64)
-	
+
 	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
 	if err != nil || sub == nil || sub.UserID != user.ID {
 		return c.Send("اشتراک یافت نشد.")
 	}
-	
+
 	// Delete from panel
 	if bot.XUIClient != nil {
 		err := bot.XUIClient.DeleteClient(sub.ClientEmail)
@@ -471,27 +445,51 @@ func HandleDeleteSubscription(c telebot.Context) error {
 			return c.Send("خطا در حذف اشتراک از پنل 3x-ui. لطفا با پشتیبانی تماس بگیرید.")
 		}
 	}
-	
-	// Delete from DB
-	err = db.DeleteSubscription(context.Background(), sub.ID)
-	if err != nil {
-		return c.Send("خطا در حذف اشتراک از دیتابیس.")
-	}
-	
-	bot.FSM.ClearState(user.TelegramID)
-	
+
+	var req *db.RefundRequest
 	if refundAmount > 0 {
-		req := &db.RefundRequest{
-			UserID: user.ID,
-			CalculatedAmount: refundAmount,
-			Status: "pending",
+		req, err = db.CancelSubscriptionWithRefund(context.Background(), sub.ID, user.ID, refundAmount, fmt.Sprintf("subscription_cancel_refund:%d", sub.ID))
+		if err != nil {
+			log.Printf("[CRITICAL] subscription %d was removed remotely but cancellation/refund DB transaction failed: %v", sub.ID, err)
+			subID64 := int64(sub.ID)
+			if recErr := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
+				OperationKey:   fmt.Sprintf("subscription_cancel_reconciliation:%d", sub.ID),
+				Kind:           "subscription_cancellation_db_failure",
+				UserID:         &user.ID,
+				SubscriptionID: &subID64,
+				DesiredState:   map[string]any{"status": db.SubscriptionStatusCancelled, "refund_amount": refundAmount},
+				ObservedState:  map[string]any{"remote_deleted": true},
+				ErrorMessage:   err.Error(),
+			}); recErr != nil {
+				log.Printf("[CRITICAL] failed to persist cancellation reconciliation for subscription %d: %v", sub.ID, recErr)
+			}
+			return c.Send("حذف در پنل انجام شد اما ثبت لغو و استرداد در دیتابیس ناموفق بود؛ لطفا با پشتیبانی تماس بگیرید.")
 		}
-		// Try to link sub ID, but we just deleted it so it might be null or we can store its ID
-		subIDVal := int64(sub.ID)
-		req.SubscriptionID = &subIDVal
-		
-		db.CreateRefundRequest(context.Background(), req)
-		
+		if req == nil || req.ID == 0 {
+			log.Printf("[CRITICAL] cancellation refund request for subscription %d has no valid ID", sub.ID)
+			return c.Send("لغو سرویس ثبت شد اما درخواست استرداد شناسه معتبر ندارد؛ لطفا با پشتیبانی تماس بگیرید.")
+		}
+	} else if err := db.UpdateSubscriptionStatus(context.Background(), sub.ID, db.SubscriptionStatusCancelled); err != nil {
+		log.Printf("[CRITICAL] subscription %d was removed remotely but cancellation DB update failed: %v", sub.ID, err)
+		subID64 := int64(sub.ID)
+		if recErr := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
+			OperationKey:   fmt.Sprintf("subscription_cancel_reconciliation:%d", sub.ID),
+			Kind:           "subscription_cancellation_db_failure",
+			UserID:         &user.ID,
+			SubscriptionID: &subID64,
+			DesiredState:   map[string]any{"status": db.SubscriptionStatusCancelled},
+			ObservedState:  map[string]any{"remote_deleted": true},
+			ErrorMessage:   err.Error(),
+		}); recErr != nil {
+			log.Printf("[CRITICAL] failed to persist cancellation reconciliation for subscription %d: %v", sub.ID, recErr)
+		}
+		return c.Send("حذف در پنل انجام شد اما ثبت لغو در دیتابیس ناموفق بود؛ لطفا با پشتیبانی تماس بگیرید.")
+	}
+
+	bot.FSM.ClearState(user.TelegramID)
+
+	if req != nil && req.ID != 0 && req.Status == "pending" {
+
 		// Notify Admins
 		if config.Global != nil {
 			for _, adminID := range config.Global.Admin.AdminIDs {
@@ -503,18 +501,20 @@ func HandleDeleteSubscription(c telebot.Context) error {
 					),
 				)
 				currency, _ := db.GetSetting(context.Background(), "currency_name")
-				if currency == "" { currency = "IRR" }
+				if currency == "" {
+					currency = "IRR"
+				}
 				caption := fmt.Sprintf("📥 **درخواست استرداد وجه حذف سرویس #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک حذف شده: `%s`\nمبلغ درخواستی: %d %s",
 					req.ID, user.Username, user.TelegramID, sub.ClientEmail, refundAmount, currency)
 				_, _ = bot.Bot.Send(&telebot.User{ID: adminID}, caption, menu)
 			}
 		}
-		
+
 		_ = c.Send("سرویس با موفقیت حذف شد. درخواست استرداد وجه برای تایید به مدیریت ارسال گردید.")
 	} else {
 		_ = c.Send("سرویس با موفقیت حذف شد.")
 	}
-	
+
 	return HandleMyServicesFlow(c)
 }
 
@@ -640,7 +640,16 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 		currency = "IRR"
 	}
 
-	if err := db.DebitWalletBalance(context.Background(), user.ID, cost, "IP limit increase for sub ID: "+strconv.Itoa(int(sub.ID))); err != nil {
+	operationKey := fmt.Sprintf("wallet_upgrade_ip:%d:%d", sub.ID, newLimit)
+	if already, checkErr := db.HasWalletOperation(context.Background(), operationKey); checkErr != nil {
+		return c.Send("خطا در بررسی وضعیت عملیات مالی.")
+	} else if already {
+		return c.Send("این ارتقا قبلا پردازش شده یا در وضعیت تطبیق قرار دارد.")
+	}
+	if err := db.DebitWalletBalanceWithKey(context.Background(), user.ID, cost, "IP limit increase for sub ID: "+strconv.Itoa(int(sub.ID)), operationKey); err != nil {
+		if errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
+			return c.Send("این ارتقا قبلا پردازش شده یا در وضعیت تطبیق قرار دارد.")
+		}
 		return c.Send(fmt.Sprintf("موجودی کیف پول شما کافی نیست. هزینه این ارتقا %.0f %s می‌باشد.", cost, currency))
 	}
 
@@ -648,12 +657,22 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 	sub.IPLimit = newLimit
 	if err := updateXUIFromSubscription(sub); err != nil {
 		sub.IPLimit = oldLimit
-		_ = db.CreditWalletBalance(context.Background(), user.ID, cost, "refund failed IP upgrade")
+		if xui.IsUnknownOutcome(err) {
+			desiredActive := sub.IsActive
+			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &newLimit, sub.ExpireTime, &desiredActive, "wallet IP upgrade has unknown 3x-ui outcome"); recErr != nil {
+				log.Printf("[CRITICAL] failed to mark IP upgrade reconciliation for subscription %d: %v", sub.ID, recErr)
+			}
+			return c.Send("نتیجه ارتقای پنل نامشخص است؛ مبلغ بازگردانده نشد و سرویس برای تطبیق ثبت شد.")
+		}
+		_ = db.CreditWalletBalanceWithKey(context.Background(), user.ID, cost, "refund failed IP upgrade", operationKey+":refund")
 		return c.Send("خطا در بروزرسانی پنل. مبلغ ارتقا به کیف پول شما برگشت داده شد.")
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
-		_ = db.CreditWalletBalance(context.Background(), user.ID, cost, "refund failed IP upgrade save")
-		return c.Send("خطا در ذخیره سازی دیتابیس. مبلغ ارتقا به کیف پول شما برگشت داده شد.")
+		desiredActive := sub.IsActive
+		if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &newLimit, sub.ExpireTime, &desiredActive, "3x-ui IP upgrade succeeded but database update failed"); recErr != nil {
+			log.Printf("[CRITICAL] failed to mark DB-after-remote IP upgrade reconciliation for subscription %d: %v", sub.ID, recErr)
+		}
+		return c.Send("ارتقا در پنل انجام شد اما ثبت آن در دیتابیس ناموفق بود؛ مبلغ بازگردانده نشد و وضعیت برای تطبیق ثبت شد.")
 	}
 
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ تعداد کاربر همزمان به %d افزایش یافت.", newLimit)})
@@ -894,7 +913,16 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		currency = "IRR"
 	}
 
-	if err := db.DebitWalletBalance(context.Background(), user.ID, cost, "subscription extension: "+sub.ClientEmail); err != nil {
+	operationKey := fmt.Sprintf("wallet_extend:%d:%d", sub.ID, months)
+	if already, checkErr := db.HasWalletOperation(context.Background(), operationKey); checkErr != nil {
+		return c.Send("خطا در بررسی وضعیت عملیات مالی.")
+	} else if already {
+		return c.Send("این تمدید قبلا پردازش شده یا در وضعیت تطبیق قرار دارد.")
+	}
+	if err := db.DebitWalletBalanceWithKey(context.Background(), user.ID, cost, "subscription extension: "+sub.ClientEmail, operationKey); err != nil {
+		if errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
+			return c.Send("این تمدید قبلا پردازش شده یا در وضعیت تطبیق قرار دارد.")
+		}
 		return c.Send(fmt.Sprintf("موجودی کیف پول شما کافی نیست. هزینه تمدید %.0f %s می‌باشد.", cost, currency))
 	}
 
@@ -926,20 +954,30 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 	}
 
 	sub.IsActive = true
+	desiredExpireTime := sub.ExpireTime
+	desiredActive := sub.IsActive
 
 	if err := updateXUIFromSubscription(sub); err != nil {
 		sub.EndDate = oldEnd
 		sub.ExpireTime = oldExpireTime
 		sub.IsActive = oldIsActive
-		_ = db.CreditWalletBalance(context.Background(), user.ID, cost, "refund failed extension")
+		if xui.IsUnknownOutcome(err) {
+			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, nil, desiredExpireTime, &desiredActive, "wallet extension has unknown 3x-ui outcome"); recErr != nil {
+				log.Printf("[CRITICAL] failed to mark extension reconciliation for subscription %d: %v", sub.ID, recErr)
+			}
+			return c.Send("نتیجه تمدید در پنل نامشخص است؛ مبلغ بازگردانده نشد و وضعیت برای تطبیق ثبت شد.")
+		}
+		_ = db.CreditWalletBalanceWithKey(context.Background(), user.ID, cost, "refund failed extension", operationKey+":refund")
 		return c.Send("خطا در بروزرسانی پنل. مبلغ تمدید به کیف پول شما بازگردانده شد.")
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		sub.EndDate = oldEnd
 		sub.ExpireTime = oldExpireTime
 		sub.IsActive = oldIsActive
-		_ = db.CreditWalletBalance(context.Background(), user.ID, cost, "refund failed extension save")
-		return c.Send("خطا در ذخیره‌سازی دیتابیس. مبلغ تمدید به کیف پول شما بازگردانده شد.")
+		if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, nil, desiredExpireTime, &desiredActive, "3x-ui extension succeeded but database update failed"); recErr != nil {
+			log.Printf("[CRITICAL] failed to mark DB-after-remote extension reconciliation for subscription %d: %v", sub.ID, recErr)
+		}
+		return c.Send("تمدید در پنل انجام شد اما ثبت آن در دیتابیس ناموفق بود؛ مبلغ بازگردانده نشد و وضعیت برای تطبیق ثبت شد.")
 	}
 
 	_ = c.Send(fmt.Sprintf("✅ سرویس با موفقیت تمدید شد. انقضای جدید: %s\nمبلغ پرداخت شده: %.0f %s.",
@@ -1204,5 +1242,3 @@ func syncIPLimitFromXUI(sub *db.Subscription) {
 		}
 	}
 }
-
-

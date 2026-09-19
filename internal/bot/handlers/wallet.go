@@ -382,8 +382,30 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 
 	if activationErr != nil {
 		log.Printf("[CRITICAL] Activation failed for purchase request #%d: %v", reqID, activationErr)
-		_ = db.RollbackPurchaseRequest(context.Background(), reqID)
-		return c.Send("خطا در تایید درخواست خرید: " + activationErr.Error() + ". وضعیت درخواست به حالت در انتظار برگشت داده شد.")
+		provisioningStatus := db.PurchaseProvisioningFailed
+		if xui.IsUnknownOutcome(activationErr) {
+			provisioningStatus = db.PurchaseProvisioningRetryable
+			purchaseID := req.ID
+			if recErr := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
+				OperationKey:      fmt.Sprintf("purchase_request_reconciliation:%d", req.ID),
+				Kind:              "purchase_provisioning_unknown",
+				UserID:            &req.UserID,
+				PurchaseRequestID: &purchaseID,
+				DesiredState:      map[string]any{"type": req.Type, "email": req.ClientEmail, "subscription_id": req.SubscriptionID, "ip_limit": req.IPLimit, "months": req.Months, "data_gb": req.DataGB},
+				ObservedState:     map[string]any{"outcome": "unknown"},
+				ErrorMessage:      activationErr.Error(),
+			}); recErr != nil {
+				log.Printf("[CRITICAL] failed to persist purchase request reconciliation #%d: %v", req.ID, recErr)
+			}
+		}
+		if statusErr := db.SetPurchaseProvisioningStatus(context.Background(), reqID, provisioningStatus); statusErr != nil {
+			log.Printf("[CRITICAL] failed to persist provisioning status for purchase request #%d: %v", reqID, statusErr)
+		}
+		return c.Send("پرداخت شما تایید شده است اما فعال‌سازی سرویس کامل نشد؛ مبلغ حذف نشده و وضعیت برای تلاش مجدد/تطبیق ثبت شد.")
+	}
+	if err := db.SetPurchaseProvisioningStatus(context.Background(), reqID, db.PurchaseProvisioningSucceeded); err != nil {
+		log.Printf("[CRITICAL] purchase request #%d activated but provisioning status update failed: %v", reqID, err)
+		return c.Send("پرداخت تایید و سرویس فعال شد، اما ثبت وضعیت فعال‌سازی در دیتابیس نیازمند تطبیق است.")
 	}
 
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID)})
@@ -446,20 +468,17 @@ func HandleAdminApproveRefund(c telebot.Context) error {
 	}
 
 	adminUser := userFromContext(c)
-	req, err = db.ApproveRefundRequest(context.Background(), reqID, adminUser.TelegramID, req.CalculatedAmount)
+	req, err = db.ApproveRefundRequestAndCredit(context.Background(), reqID, adminUser.TelegramID, req.CalculatedAmount)
 	if err != nil || req == nil {
 		return c.Send("خطا در تایید استرداد.")
-	}
-
-	if err := db.CreditWalletBalance(context.Background(), req.UserID, float64(req.CalculatedAmount), fmt.Sprintf("Refund approved for request #%d", req.ID)); err != nil {
-		_ = db.RollbackRefundRequest(context.Background(), reqID)
-		return c.Send("خطا در شارژ کیف پول کاربر. وضعیت به در انتظار بازگشت داده شد.")
 	}
 
 	user, _ := db.GetUserByID(context.Background(), req.UserID)
 	if user != nil {
 		currency, _ := db.GetSetting(context.Background(), "currency_name")
-		if currency == "" { currency = "IRR" }
+		if currency == "" {
+			currency = "IRR"
+		}
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ مبلغ %d %s بابت لغو سرویس به کیف پول شما اضافه شد.", req.CalculatedAmount, currency))
 	}
 
@@ -512,7 +531,7 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 	client := prepareClientConfig(req.ClientEmail, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, req.IPLimit, plan.Flow, subID, clientUUID, plan.Name, user)
 
 	err := bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: inboundIDs})
-	if err != nil {
+	if err != nil && !xui.IsUnknownOutcome(err) {
 		log.Printf("XUI AddClient failed: %v. Refreshing cache and retrying...", err)
 		if bot.XUIClient.Cache != nil {
 			bot.XUIClient.Cache.RefreshSync()
@@ -625,17 +644,27 @@ func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, 
 	}
 
 	sub.IsActive = true
+	desiredExpireTime := sub.ExpireTime
+	desiredActive := sub.IsActive
 
 	if err := updateXUIFromSubscription(sub); err != nil {
 		sub.EndDate = oldEnd
 		sub.ExpireTime = oldExpireTime
 		sub.IsActive = oldIsActive
+		if xui.IsUnknownOutcome(err) {
+			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, nil, desiredExpireTime, &desiredActive, "direct extension has unknown 3x-ui outcome"); recErr != nil {
+				log.Printf("[CRITICAL] failed to mark direct extension reconciliation for subscription %d: %v", sub.ID, recErr)
+			}
+		}
 		return fmt.Errorf("خطا در بروزرسانی پنل: %w", err)
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		sub.EndDate = oldEnd
 		sub.ExpireTime = oldExpireTime
 		sub.IsActive = oldIsActive
+		if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, nil, desiredExpireTime, &desiredActive, "3x-ui extension succeeded but database update failed"); recErr != nil {
+			log.Printf("[CRITICAL] failed to mark direct extension DB-after-remote reconciliation for subscription %d: %v", sub.ID, recErr)
+		}
 		return fmt.Errorf("خطا در ذخیره‌سازی دیتابیس: %w", err)
 	}
 
@@ -656,10 +685,20 @@ func upgradeSubscriptionIPFromApprovedRequest(user *db.User, sub *db.Subscriptio
 
 	if err := updateXUIFromSubscription(sub); err != nil {
 		sub.IPLimit = oldLimit
+		if xui.IsUnknownOutcome(err) {
+			desiredActive := sub.IsActive
+			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &req.IPLimit, sub.ExpireTime, &desiredActive, "direct IP upgrade has unknown 3x-ui outcome"); recErr != nil {
+				log.Printf("[CRITICAL] failed to mark direct IP upgrade reconciliation for subscription %d: %v", sub.ID, recErr)
+			}
+		}
 		return fmt.Errorf("خطا در بروزرسانی پنل: %w", err)
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		sub.IPLimit = oldLimit
+		desiredActive := sub.IsActive
+		if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &req.IPLimit, sub.ExpireTime, &desiredActive, "3x-ui IP upgrade succeeded but database update failed"); recErr != nil {
+			log.Printf("[CRITICAL] failed to mark direct IP upgrade DB-after-remote reconciliation for subscription %d: %v", sub.ID, recErr)
+		}
 		return fmt.Errorf("خطا در ذخیره‌سازی دیتابیس: %w", err)
 	}
 
@@ -684,6 +723,10 @@ func ProcessManualCreditAmount(c telebot.Context, amountText string) error {
 		return c.Send("فرآیند افزایش موجودی دستی فعالی وجود ندارد.")
 	}
 	targetID, _ := parseInt64(fmt.Sprintf("%v", state.Data["target_user_id"]))
+	operationKey := fmt.Sprintf("%v", state.Data["operation_key"])
+	if operationKey == "" {
+		operationKey = fmt.Sprintf("manual_admin_credit:%d:%d", admin.TelegramID, targetID)
+	}
 	amount, err := parseFloat(amountText)
 	if err != nil || amount <= 0 {
 		return c.Send("مبلغ نامعتبر است. یک عدد مثبت وارد کنید:")
@@ -692,7 +735,7 @@ func ProcessManualCreditAmount(c telebot.Context, amountText string) error {
 	if err != nil || target == nil {
 		return c.Send("کاربر یافت نشد.")
 	}
-	if err := db.CreditWalletBalance(context.Background(), target.ID, amount, "manual admin credit"); err != nil {
+	if err := db.CreditWalletBalanceWithKey(context.Background(), target.ID, amount, "manual admin credit", operationKey); err != nil {
 		return c.Send("خطا در افزایش موجودی کاربر.")
 	}
 	bot.FSM.ClearState(admin.TelegramID)
@@ -704,6 +747,3 @@ func ProcessManualCreditAmount(c telebot.Context, amountText string) error {
 	}
 	return nil
 }
-
-
-

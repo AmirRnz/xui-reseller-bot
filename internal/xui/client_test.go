@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"xui-reseller-bot/internal/config"
 )
@@ -38,6 +40,138 @@ func TestGetSubscriptionLinksUsesPublicSubscriptionBaseURL(t *testing.T) {
 	}
 	if links[0] != "https://subs.example.com:9443/sub/sub123" {
 		t.Fatalf("unexpected subscription link: %s", links[0])
+	}
+}
+
+func TestAddClientTimeoutAfterRemoteCommitIsVerifiedWithoutRetry(t *testing.T) {
+	var mu sync.Mutex
+	committed := false
+	addCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/panel/api/clients/add":
+			mu.Lock()
+			committed = true
+			addCalls++
+			mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+		case "/panel/api/clients/get/ambiguous@example.com":
+			mu.Lock()
+			isCommitted := committed
+			mu.Unlock()
+			if !isCommitted {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"obj":     map[string]any{"email": "ambiguous@example.com", "subId": "sub-1", "expiryTime": -3600000, "enable": true, "limitIp": 1},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	client.httpClient.Timeout = 10 * time.Millisecond
+	result := client.AddClientResult(AddClientRequest{Client: ClientConfig{
+		Email: "ambiguous@example.com", SubID: "sub-1", ExpiryTime: -3600000, Enable: true, LimitIP: 1,
+	}})
+	if result.Outcome != WriteSucceeded || result.Err != nil {
+		t.Fatalf("expected verified success, got %#v", result)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if addCalls != 1 {
+		t.Fatalf("expected exactly one create call, got %d", addCalls)
+	}
+}
+
+func TestUpdateClientMergesFullRemoteState(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/panel/api/clients/get/preserve@example.com":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": map[string]any{
+				"id": 9, "email": "preserve@example.com", "subId": "remote-sub", "uuid": "remote-uuid", "password": "remote-password",
+				"auth": "remote-auth", "totalGB": 100, "expiryTime": 1000, "enable": true, "limitIp": 2, "limitHwid": 7,
+				"comment": "manual comment", "group": "manually changed", "flow": "xtls-rprx-vision", "reset": 3,
+				"resetDay": 4, "resetMax": 5, "trafficReset": "daily", "trafficResetDay": 2,
+			}})
+		case "/panel/api/clients/update/preserve@example.com":
+			var got ClientConfig
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatalf("decode update body: %v", err)
+			}
+			if got.LimitHWID != 7 || got.Comment != "manual comment" || got.Group != "manually changed" || got.TrafficReset != "daily" || got.ResetDay != 4 {
+				t.Fatalf("unrelated fields were overwritten: %+v", got)
+			}
+			if got.ExpiryTime != 2000 || got.LimitIP != 3 || got.Enable {
+				t.Fatalf("owned fields were not applied: %+v", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	if err := client.UpdateClient("preserve@example.com", ClientConfig{Email: "preserve@example.com", Enable: false, ExpiryTime: 2000, LimitIP: 3, TotalGB: 100, SubID: "remote-sub"}); err != nil {
+		t.Fatalf("UpdateClient failed: %v", err)
+	}
+}
+
+func TestUpdateClientTimeoutAfterRemoteCommitIsVerifiedWithoutRetry(t *testing.T) {
+	var mu sync.Mutex
+	remote := XUIClientInfo{Email: "update-ambiguous@example.com", SubID: "sub-update", ExpiryTime: 1000, Enable: true, LimitIP: 1}
+	updateCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/panel/api/clients/get/update-ambiguous@example.com":
+			mu.Lock()
+			current := remote
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": current})
+		case "/panel/api/clients/update/update-ambiguous@example.com":
+			var desired ClientConfig
+			if err := json.NewDecoder(r.Body).Decode(&desired); err != nil {
+				t.Fatalf("decode update body: %v", err)
+			}
+			mu.Lock()
+			remote.Enable = desired.Enable
+			remote.ExpiryTime = desired.ExpiryTime
+			remote.LimitIP = desired.LimitIP
+			updateCalls++
+			mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	client.httpClient.Timeout = 10 * time.Millisecond
+	result := client.UpdateClientResult("update-ambiguous@example.com", ClientConfig{
+		Email: "update-ambiguous@example.com", SubID: "sub-update", ExpiryTime: 2000, Enable: false, LimitIP: 3,
+	})
+	if result.Outcome != WriteSucceeded || result.Err != nil {
+		t.Fatalf("expected verified update success, got %#v", result)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if updateCalls != 1 {
+		t.Fatalf("expected exactly one update call, got %d", updateCalls)
 	}
 }
 
@@ -105,12 +239,12 @@ func TestBulkAttachDetach(t *testing.T) {
 		if r.URL.Path != "/panel/api/clients/bulkAttach" && r.URL.Path != "/panel/api/clients/bulkDetach" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
-		
+
 		var req BulkAttachRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("failed to decode request body: %v", err)
 		}
-		
+
 		if len(req.Emails) != 2 || req.Emails[0] != "alice" || req.Emails[1] != "bob" {
 			t.Fatalf("unexpected emails: %v", req.Emails)
 		}
@@ -193,4 +327,3 @@ func TestBulkCreate(t *testing.T) {
 		t.Fatalf("expected 2 created, got %d", resp.Created)
 	}
 }
-

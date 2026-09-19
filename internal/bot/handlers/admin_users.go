@@ -186,19 +186,19 @@ func HandleAdminUserApprove(c telebot.Context) error {
 	if err != nil || user == nil {
 		return c.Send("User not found.")
 	}
-	
+
 	if err := db.UpdateUserStatusByID(context.Background(), user.ID, db.UserStatusApproved); err != nil {
 		return c.Send("Failed to approve user.")
 	}
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ User #%d approved.", user.ID)})
 	user.Status = db.UserStatusApproved
-	
+
 	if bot.Bot != nil {
 		msg := "✅ درخواست دسترسی شما تایید شد.\n\nلطفا نام سرویس (شناسه نمایندگی) خود را وارد کنید.\nاین نام باید فقط شامل حروف انگلیسی، اعداد، خط تیره (-) و آندرلاین (_) باشد و بین ۳ تا ۳۲ کاراکتر باشد."
 		bot.FSM.SetState(user.TelegramID, "awaiting_service_name", nil)
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, msg)
 	}
-	
+
 	return showAdminViewUser(c, user)
 }
 
@@ -208,7 +208,7 @@ func HandleAdminUserCreditPrompt(c telebot.Context) error {
 	if admin == nil || err != nil {
 		return c.Send("Invalid user.")
 	}
-	bot.FSM.SetState(admin.TelegramID, "awaiting_manual_credit", map[string]interface{}{"target_user_id": fmt.Sprintf("%d", userID)})
+	bot.FSM.SetState(admin.TelegramID, "awaiting_manual_credit", map[string]interface{}{"target_user_id": fmt.Sprintf("%d", userID), "operation_key": "manual_admin_credit:" + makeSubID()})
 	return maybeEditOrSend(c, "Enter amount to credit this user.")
 }
 
@@ -217,7 +217,7 @@ func HandleBulkCreditPrompt(c telebot.Context) error {
 	if admin == nil {
 		return c.Send("Could not load admin account.")
 	}
-	bot.FSM.SetState(admin.TelegramID, "awaiting_bulk_credit_amount", nil)
+	bot.FSM.SetState(admin.TelegramID, "awaiting_bulk_credit_amount", map[string]interface{}{"operation_key": "bulk_admin_credit:" + makeSubID()})
 	return maybeEditOrSend(c, "Enter amount to credit all approved users.")
 }
 
@@ -230,7 +230,8 @@ func ProcessBulkCredit(c telebot.Context, amountStr string) error {
 	if err != nil || amount <= 0 {
 		return c.Send("Invalid amount. Enter a positive number.")
 	}
-	count, err := db.CreditAllApprovedUsers(context.Background(), amount, "admin bulk credit")
+	operationKey := fmt.Sprintf("%v", bot.FSM.GetState(admin.TelegramID).Data["operation_key"])
+	count, err := db.CreditAllApprovedUsersWithKey(context.Background(), amount, "admin bulk credit", operationKey)
 	if err != nil {
 		return c.Send("Failed to credit approved users.")
 	}
@@ -255,18 +256,18 @@ func HandleAdminUserClients(c telebot.Context) error {
 	if err != nil || user == nil {
 		return c.Send("User not found.")
 	}
-	
+
 	subs, err := db.GetSubscriptionsByUserID(context.Background(), user.ID)
 	if err != nil {
 		return c.Send("Failed to get clients.")
 	}
-	
+
 	menu := &telebot.ReplyMarkup{}
 	var rows []telebot.Row
-	
+
 	var text strings.Builder
 	text.WriteString(fmt.Sprintf("👥 **Clients for @%s**\n\n", user.Username))
-	
+
 	hasUnassigned := false
 	for _, sub := range subs {
 		if sub.PlanID == nil {
@@ -274,7 +275,7 @@ func HandleAdminUserClients(c telebot.Context) error {
 			break
 		}
 	}
-	
+
 	if hasUnassigned {
 		text.WriteString("⚠️ **Unassigned Clients (Need Plan)**\n")
 		for _, sub := range subs {
@@ -287,7 +288,7 @@ func HandleAdminUserClients(c telebot.Context) error {
 		}
 		text.WriteString("\n")
 	}
-	
+
 	text.WriteString("✅ **Assigned Clients**\n")
 	for _, sub := range subs {
 		if sub.PlanID != nil {
@@ -297,7 +298,7 @@ func HandleAdminUserClients(c telebot.Context) error {
 	if len(subs) == 0 {
 		text.WriteString("No clients found.\n")
 	}
-	
+
 	rows = append(rows, menu.Row(menu.Data("« Back to User", "admin_view_user", fmt.Sprintf("%d", user.ID))))
 	menu.Inline(rows...)
 	return maybeEditOrSend(c, text.String(), menu)
@@ -308,17 +309,17 @@ func HandleAdminAssignPlanPrompt(c telebot.Context) error {
 	if err != nil {
 		return c.Send("Invalid subscription.")
 	}
-	
+
 	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
 	if err != nil || sub == nil {
 		return c.Send("Subscription not found.")
 	}
-	
+
 	paidPlans, err := db.GetPaidPlans(context.Background(), false)
 	if err != nil {
 		return c.Send("Failed to load plans.")
 	}
-	
+
 	menu := &telebot.ReplyMarkup{}
 	var rows []telebot.Row
 	for _, plan := range paidPlans {
@@ -328,7 +329,7 @@ func HandleAdminAssignPlanPrompt(c telebot.Context) error {
 	}
 	rows = append(rows, menu.Row(menu.Data("« Cancel", "admin_user_clients", fmt.Sprintf("%d", sub.UserID))))
 	menu.Inline(rows...)
-	
+
 	return maybeEditOrSend(c, fmt.Sprintf("Please select a plan to assign to **%s**:", sub.ClientEmail), menu)
 }
 
@@ -339,33 +340,32 @@ func HandleAdminAssignPlanConfirm(c telebot.Context) error {
 	}
 	subID, _ := parseInt64(parts[0])
 	planID, _ := parseInt64(parts[1])
-	
+
 	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
 	if err != nil || sub == nil {
 		return c.Send("Subscription not found.")
 	}
-	
+
 	plan, err := db.GetPaidPlanByID(context.Background(), planID)
 	if err != nil || plan == nil {
 		return c.Send("Plan not found.")
 	}
-	
+
 	pID := int(plan.ID)
 	sub.PlanID = &pID
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		return c.Send("Failed to update subscription.")
 	}
-	
+
 	user, _ := db.GetUserByID(context.Background(), sub.UserID)
 	if user != nil {
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ اشتراک %s با موفقیت به طرح %s متصل شد. هم‌اکنون می‌توانید از امکانات تمدید و ارتقا استفاده کنید.", sub.ClientEmail, plan.Name))
 	}
-	
+
 	_ = c.Respond(&telebot.CallbackResponse{Text: "Plan assigned successfully."})
-	
+
 	if c.Callback() != nil {
 		c.Callback().Data = fmt.Sprintf("\fadmin_user_clients|%d", sub.UserID)
 	}
 	return HandleAdminUserClients(c)
 }
-

@@ -88,7 +88,11 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     start_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     end_date TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    desired_ip_limit INT,
+    desired_expire_time BIGINT,
+    desired_is_active BOOLEAN,
+    reconciliation_note TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS topup_requests (
@@ -111,6 +115,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     description TEXT NOT NULL DEFAULT '',
     reference_type TEXT NOT NULL DEFAULT '',
     reference_id BIGINT,
+    operation_key TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -244,7 +249,11 @@ ALTER TABLE IF EXISTS paid_plans
     ADD COLUMN IF NOT EXISTS usage_description TEXT NOT NULL DEFAULT '';
 
 ALTER TABLE IF EXISTS subscriptions
-    ADD COLUMN IF NOT EXISTS traffic_limit_bytes BIGINT NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS traffic_limit_bytes BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS desired_ip_limit INT,
+    ADD COLUMN IF NOT EXISTS desired_expire_time BIGINT,
+    ADD COLUMN IF NOT EXISTS desired_is_active BOOLEAN,
+    ADD COLUMN IF NOT EXISTS reconciliation_note TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS purchase_requests (
     id BIGSERIAL PRIMARY KEY,
@@ -260,6 +269,7 @@ CREATE TABLE IF NOT EXISTS purchase_requests (
     client_email TEXT NOT NULL DEFAULT '',
     telegram_file_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
+    provisioning_status TEXT NOT NULL DEFAULT 'pending',
     admin_id BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -273,6 +283,37 @@ CREATE TABLE IF NOT EXISTS refund_requests (
     approved_amount BIGINT,
     status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
     admin_id BIGINT,
+    operation_key TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE IF EXISTS purchase_requests
+    ADD COLUMN IF NOT EXISTS provisioning_status TEXT NOT NULL DEFAULT 'pending';
+
+ALTER TABLE IF EXISTS refund_requests
+    ADD COLUMN IF NOT EXISTS operation_key TEXT;
+
+ALTER TABLE IF EXISTS transactions
+    ADD COLUMN IF NOT EXISTS operation_key TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS transactions_operation_key_uq
+    ON transactions (operation_key);
+
+CREATE UNIQUE INDEX IF NOT EXISTS refund_requests_operation_key_uq
+    ON refund_requests (operation_key);
+
+CREATE TABLE IF NOT EXISTS reconciliation_records (
+    id BIGSERIAL PRIMARY KEY,
+    operation_key TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    user_id BIGINT REFERENCES bot_users(id) ON DELETE SET NULL,
+    subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL,
+    purchase_request_id BIGINT REFERENCES purchase_requests(id) ON DELETE SET NULL,
+    desired_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    observed_state JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error_message TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

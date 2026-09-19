@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -14,13 +15,16 @@ func CreatePurchaseRequest(ctx context.Context, r *PurchaseRequest) error {
 	if r.Status == "" {
 		r.Status = "pending"
 	}
+	if r.ProvisioningStatus == "" {
+		r.ProvisioningStatus = PurchaseProvisioningPending
+	}
 
 	return Pool.QueryRow(ctx, `
 		INSERT INTO purchase_requests (
-			user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 		RETURNING id, created_at, updated_at
-	`, r.UserID, r.Type, r.PlanID, r.SubscriptionID, r.Price, r.Months, r.IPLimit, r.DataGB, r.CustomName, r.ClientEmail, r.TelegramFileID, r.Status).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
+	`, r.UserID, r.Type, r.PlanID, r.SubscriptionID, r.Price, r.Months, r.IPLimit, r.DataGB, r.CustomName, r.ClientEmail, r.TelegramFileID, r.Status, r.ProvisioningStatus).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
 }
 
 func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, error) {
@@ -29,10 +33,10 @@ func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, er
 
 	r := &PurchaseRequest{}
 	err := Pool.QueryRow(ctx, `
-		SELECT id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, admin_id, created_at, updated_at
+		SELECT id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, admin_id, created_at, updated_at
 		FROM purchase_requests
 		WHERE id = $1
-	`, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+	`, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -55,10 +59,10 @@ func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purc
 	r := &PurchaseRequest{}
 	err = tx.QueryRow(ctx, `
 		UPDATE purchase_requests
-		SET status = 'approved', admin_id = $1, updated_at = NOW()
+		SET status = 'approved', provisioning_status = 'pending', admin_id = $1, updated_at = NOW()
 		WHERE id = $2 AND status = 'pending'
-		RETURNING id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, admin_id, created_at, updated_at
-	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+		RETURNING id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, admin_id, created_at, updated_at
+	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -68,9 +72,10 @@ func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purc
 
 	// Add to transactions table
 	_, err = tx.Exec(ctx, `
-		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id)
-		VALUES ($1, $2, 'debit', 'completed', $3, 'purchase_request', $4)
-	`, r.UserID, int64(r.Price), "direct purchase approved: "+r.Type+" - "+r.ClientEmail, r.ID)
+		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id, operation_key)
+		VALUES ($1, $2, 'debit', 'completed', $3, 'purchase_request', $4, $5)
+		ON CONFLICT (operation_key) DO NOTHING
+	`, r.UserID, int64(r.Price), "direct purchase approved: "+r.Type+" - "+r.ClientEmail, r.ID, fmt.Sprintf("purchase_approval:%d", r.ID))
 	if err != nil {
 		return nil, err
 	}
@@ -90,8 +95,8 @@ func RejectPurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purch
 		UPDATE purchase_requests
 		SET status = 'rejected', admin_id = $1, updated_at = NOW()
 		WHERE id = $2 AND status = 'pending'
-		RETURNING id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, admin_id, created_at, updated_at
-	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+		RETURNING id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, admin_id, created_at, updated_at
+	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -106,7 +111,7 @@ func GetPendingPurchaseRequests(ctx context.Context) ([]*PurchaseRequest, error)
 	defer cancel()
 
 	rows, err := Pool.Query(ctx, `
-		SELECT id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, admin_id, created_at, updated_at
+		SELECT id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, admin_id, created_at, updated_at
 		FROM purchase_requests
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
@@ -119,7 +124,7 @@ func GetPendingPurchaseRequests(ctx context.Context) ([]*PurchaseRequest, error)
 	var reqs []*PurchaseRequest
 	for rows.Next() {
 		r := &PurchaseRequest{}
-		if err := rows.Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.AdminID, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.AdminID, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		reqs = append(reqs, r)
@@ -137,17 +142,18 @@ func RollbackPurchaseRequest(ctx context.Context, id int64) error {
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx, `UPDATE purchase_requests SET status = 'pending', admin_id = NULL WHERE id = $1`, id)
+	_, err = tx.Exec(ctx, `UPDATE purchase_requests SET status = 'approved', provisioning_status = 'retryable', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		return err
 	}
-
-	_, err = tx.Exec(ctx, `DELETE FROM transactions WHERE reference_type = 'purchase_request' AND reference_id = $1`, id)
-	if err != nil {
-		return err
-	}
-
 	return tx.Commit(ctx)
+}
+
+func SetPurchaseProvisioningStatus(ctx context.Context, id int64, status string) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	_, err := Pool.Exec(ctx, `UPDATE purchase_requests SET provisioning_status = $1, updated_at = NOW() WHERE id = $2`, status, id)
+	return err
 }
 
 func HasPendingClaimRequest(ctx context.Context, subID string) (bool, error) {
@@ -174,10 +180,11 @@ func CreateRefundRequest(ctx context.Context, r *RefundRequest) error {
 
 	return Pool.QueryRow(ctx, `
 		INSERT INTO refund_requests (
-			user_id, subscription_id, calculated_amount, status
-		) VALUES ($1, $2, $3, $4)
+			user_id, subscription_id, calculated_amount, status, operation_key
+		) VALUES ($1, $2, $3, $4, NULLIF($5, ''))
+		ON CONFLICT (operation_key) DO UPDATE SET updated_at = refund_requests.updated_at
 		RETURNING id, created_at, updated_at
-	`, r.UserID, r.SubscriptionID, r.CalculatedAmount, r.Status).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
+	`, r.UserID, r.SubscriptionID, r.CalculatedAmount, r.Status, r.OperationKey).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
 }
 
 func GetRefundRequestByID(ctx context.Context, id int64) (*RefundRequest, error) {
@@ -186,10 +193,10 @@ func GetRefundRequestByID(ctx context.Context, id int64) (*RefundRequest, error)
 
 	r := &RefundRequest{}
 	err := Pool.QueryRow(ctx, `
-		SELECT id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, created_at, updated_at
+		SELECT id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
 		FROM refund_requests
 		WHERE id = $1
-	`, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+	`, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -200,20 +207,47 @@ func GetRefundRequestByID(ctx context.Context, id int64) (*RefundRequest, error)
 }
 
 func ApproveRefundRequest(ctx context.Context, id int64, adminID int64, approvedAmount int64) (*RefundRequest, error) {
+	return ApproveRefundRequestAndCredit(ctx, id, adminID, approvedAmount)
+}
+
+// ApproveRefundRequestAndCredit makes the approval state transition and wallet
+// credit one durable idempotent database operation.
+func ApproveRefundRequestAndCredit(ctx context.Context, id int64, adminID int64, approvedAmount int64) (*RefundRequest, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
 	r := &RefundRequest{}
-	err := Pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		UPDATE refund_requests
 		SET status = 'approved', admin_id = $1, approved_amount = $2, updated_at = NOW()
 		WHERE id = $3 AND status = 'pending'
-		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, created_at, updated_at
-	`, adminID, approvedAmount, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
+	`, adminID, approvedAmount, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
 		}
+		return nil, err
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE bot_users SET wallet_balance = wallet_balance + $1, updated_at = NOW() WHERE id = $2`, approvedAmount, r.UserID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id, operation_key)
+		VALUES ($1, $2, 'credit', 'completed', $3, 'refund_request', $4, $5)
+		ON CONFLICT (operation_key) DO NOTHING
+	`, r.UserID, approvedAmount, fmt.Sprintf("Refund approved for request #%d", r.ID), r.ID, fmt.Sprintf("refund_approval:%d", r.ID)); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -228,8 +262,8 @@ func RejectRefundRequest(ctx context.Context, id int64, adminID int64) (*RefundR
 		UPDATE refund_requests
 		SET status = 'rejected', admin_id = $1, updated_at = NOW()
 		WHERE id = $2 AND status = 'pending'
-		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, created_at, updated_at
-	`, adminID, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
+	`, adminID, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil

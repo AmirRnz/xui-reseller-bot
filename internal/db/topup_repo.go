@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 
 	"github.com/jackc/pgx/v5"
@@ -76,9 +77,10 @@ func ApproveTopupRequest(ctx context.Context, id int64, adminID int64, amount fl
 	}
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id)
-		VALUES ($1, $2, 'credit', 'completed', 'top-up approved', 'topup_request', $3)
-	`, r.UserID, amountInt, r.ID)
+		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id, operation_key)
+		VALUES ($1, $2, 'credit', 'completed', 'top-up approved', 'topup_request', $3, $4)
+		ON CONFLICT (operation_key) DO NOTHING
+	`, r.UserID, amountInt, r.ID, fmt.Sprintf("topup_approval:%d", r.ID))
 	if err != nil {
 		return nil, err
 	}
