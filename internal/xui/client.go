@@ -42,6 +42,29 @@ type WriteError struct {
 	Err     error
 }
 
+// ErrNotFound is returned when the panel has confirmed that a client does
+// not exist.  Callers must use IsNotFound instead of matching human-readable
+// error strings because panel versions/locales vary their messages.
+var ErrNotFound = errors.New("x-ui resource not found")
+
+type NotFoundError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *NotFoundError) Error() string {
+	if e.Message == "" {
+		return ErrNotFound.Error()
+	}
+	return e.Message
+}
+
+func (e *NotFoundError) Unwrap() error { return ErrNotFound }
+
+func IsNotFound(err error) bool {
+	return errors.Is(err, ErrNotFound)
+}
+
 func (e *WriteError) Error() string { return e.Err.Error() }
 func (e *WriteError) Unwrap() error { return e.Err }
 
@@ -147,8 +170,34 @@ func (c *Client) AddClientResult(req AddClientRequest) WriteResult {
 	// A timeout is ambiguous. Read the client back before deciding whether the
 	// create committed; never issue a second non-idempotent create blindly.
 	remote, verifyErr := c.GetClientByEmail(req.Client.Email)
-	if verifyErr == nil && remote != nil && clientMatchesAdd(*remote, req.Client) {
-		return WriteResult{Outcome: WriteSucceeded}
+	if verifyErr == nil && remote != nil {
+		if clientMatchesAdd(*remote, req.Client, req.InboundIDs) {
+			return WriteResult{Outcome: WriteSucceeded}
+		}
+
+		// A timed-out create may have committed the client but only attached
+		// part of a multi-inbound request.  Repair only the missing attachments;
+		// never issue a second non-idempotent create.  The final readback is
+		// required before reporting success.
+		if clientMatchesAddFields(*remote, req.Client) {
+			missing := missingInboundIDs(remote.InboundIDs, req.InboundIDs)
+			if len(missing) > 0 {
+				attachErr := c.AttachClient(req.Client.Email, missing)
+				if attachErr == nil || IsUnknownOutcome(attachErr) {
+					verified, readErr := c.GetClientByEmail(req.Client.Email)
+					if readErr == nil && verified != nil && clientMatchesAdd(*verified, req.Client, req.InboundIDs) {
+						return WriteResult{Outcome: WriteSucceeded}
+					}
+					if attachErr != nil && !IsUnknownOutcome(attachErr) {
+						verifyErr = attachErr
+					} else if readErr != nil {
+						verifyErr = readErr
+					} else {
+						verifyErr = fmt.Errorf("x-ui add client readback is missing inbound attachments")
+					}
+				}
+			}
+		}
 	}
 	unknownErr := fmt.Errorf("x-ui add client outcome is unknown for %s: %w", req.Client.Email, err)
 	if verifyErr != nil {
@@ -203,11 +252,58 @@ func wrapWriteError(err error) error {
 	return &WriteError{Outcome: outcome, Err: err}
 }
 
-func clientMatchesAdd(remote XUIClientInfo, desired ClientConfig) bool {
-	return remote.Email == desired.Email &&
-		(remote.SubID == "" || desired.SubID == "" || remote.SubID == desired.SubID) &&
-		(remote.ExpiryTime == desired.ExpiryTime || desired.ExpiryTime == 0) &&
-		remote.Enable == desired.Enable && remote.LimitIP == desired.LimitIP
+func clientMatchesAdd(remote XUIClientInfo, desired ClientConfig, inboundIDs []int) bool {
+	return clientMatchesAddFields(remote, desired) && allInboundIDsPresent(remote.InboundIDs, inboundIDs)
+}
+
+func clientMatchesAddFields(remote XUIClientInfo, desired ClientConfig) bool {
+	if remote.Email != desired.Email || remote.Enable != desired.Enable ||
+		remote.ExpiryTime != desired.ExpiryTime || remote.LimitIP != desired.LimitIP ||
+		remote.TotalGB != desired.TotalGB {
+		return false
+	}
+	if desired.SubID != "" && remote.SubID != desired.SubID {
+		return false
+	}
+	if desired.ID != "" && remote.UUID != desired.ID {
+		return false
+	}
+	return true
+}
+
+func allInboundIDsPresent(actual, desired []int) bool {
+	if len(desired) == 0 {
+		return true
+	}
+	actualSet := make(map[int]struct{}, len(actual))
+	for _, id := range actual {
+		actualSet[id] = struct{}{}
+	}
+	for _, id := range desired {
+		if _, ok := actualSet[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func missingInboundIDs(actual, desired []int) []int {
+	actualSet := make(map[int]struct{}, len(actual))
+	for _, id := range actual {
+		actualSet[id] = struct{}{}
+	}
+	missing := make([]int, 0)
+	seen := make(map[int]struct{}, len(desired))
+	for _, id := range desired {
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, ok := actualSet[id]; !ok {
+			missing = append(missing, id)
+		}
+	}
+	return missing
 }
 
 func clientMatchesUpdate(remote XUIClientInfo, desired ClientConfig) bool {

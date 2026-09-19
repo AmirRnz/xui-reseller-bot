@@ -286,6 +286,29 @@ func TestCancelSubscriptionWithRefundIsAuditable(t *testing.T) {
 	if err != nil || gotReq == nil || gotReq.SubscriptionID == nil || *gotReq.SubscriptionID != int64(sub.ID) {
 		t.Fatalf("refund is not linked to the preserved subscription: req=%#v err=%v", gotReq, err)
 	}
+	manageable, err := GetManageableSubscriptionsByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("query manageable subscriptions: %v", err)
+	}
+	for _, current := range manageable {
+		if current.ID == sub.ID {
+			t.Fatalf("cancelled subscription appeared in manageable services: %+v", current)
+		}
+	}
+	allSubs, err := GetSubscriptionsByUserID(ctx, userID)
+	if err != nil {
+		t.Fatalf("query audit subscriptions: %v", err)
+	}
+	found := false
+	for _, current := range allSubs {
+		if current.ID == sub.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("cancelled subscription disappeared from audit query")
+	}
 }
 
 func TestDeletePlanWithUsage(t *testing.T) {
@@ -573,9 +596,11 @@ func TestPurchaseRollbackAndClaim(t *testing.T) {
 func TestWalletOperationKeyIsConcurrentIdempotent(t *testing.T) {
 	ctx := setupTestDB(t)
 	operationKey := "test_wallet_operation:" + time.Now().UTC().Format("20060102150405.000000000")
+	laterOperationKey := operationKey + ":later"
 	defer func() {
 		if Pool != nil {
 			_, _ = Pool.Exec(ctx, "DELETE FROM transactions WHERE operation_key = $1", operationKey)
+			_, _ = Pool.Exec(ctx, "DELETE FROM transactions WHERE operation_key = $1", laterOperationKey)
 			_, _ = Pool.Exec(ctx, "DELETE FROM bot_users WHERE telegram_id = 999999997")
 		}
 	}()
@@ -631,5 +656,16 @@ func TestWalletOperationKeyIsConcurrentIdempotent(t *testing.T) {
 	}
 	if transactionCount != 1 {
 		t.Fatalf("expected one durable wallet operation, got %d", transactionCount)
+	}
+	// A later, distinct confirmation intent is allowed to perform the same
+	// economic action again; only replaying the original key is suppressed.
+	if err := AddWalletBalanceWithKey(ctx, userID, 100, "concurrent wallet test", laterOperationKey); err != nil {
+		t.Fatalf("new confirmation intent was incorrectly rejected: %v", err)
+	}
+	if err := Pool.QueryRow(ctx, "SELECT wallet_balance FROM bot_users WHERE id = $1", userID).Scan(&balance); err != nil {
+		t.Fatalf("failed to read balance after later intent: %v", err)
+	}
+	if balance != 200 {
+		t.Fatalf("expected distinct later intent to apply, got balance %d", balance)
 	}
 }

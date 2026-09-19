@@ -2,6 +2,7 @@ package xui
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -10,6 +11,22 @@ import (
 
 	"xui-reseller-bot/internal/config"
 )
+
+func TestGetClientByEmailReturnsTypedNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "client does not exist", http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	_, err = client.GetClientByEmail("missing@example.com")
+	if !IsNotFound(err) || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected typed not-found error, got %v", err)
+	}
+}
 
 func TestGetSubscriptionLinksUsesPublicSubscriptionBaseURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -88,6 +105,61 @@ func TestAddClientTimeoutAfterRemoteCommitIsVerifiedWithoutRetry(t *testing.T) {
 	defer mu.Unlock()
 	if addCalls != 1 {
 		t.Fatalf("expected exactly one create call, got %d", addCalls)
+	}
+}
+
+func TestAddClientTimeoutWithPartialInboundsDoesNotReportFalseSuccess(t *testing.T) {
+	var mu sync.Mutex
+	addCalls := 0
+	attachCalls := 0
+	remote := XUIClientInfo{
+		Email: "partial@example.com", SubID: "sub-partial", ExpiryTime: -3600000,
+		Enable: true, LimitIP: 1, TotalGB: 1073741824, InboundIDs: []int{1},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/panel/api/clients/add":
+			mu.Lock()
+			addCalls++
+			mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+		case "/panel/api/clients/get/partial@example.com":
+			mu.Lock()
+			current := remote
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": current})
+		case "/panel/api/clients/partial@example.com/attach":
+			mu.Lock()
+			attachCalls++
+			mu.Unlock()
+			// The panel acknowledged the repair request but did not attach the
+			// missing inbound. AddClientResult must require a second readback.
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	client.httpClient.Timeout = 10 * time.Millisecond
+	result := client.AddClientResult(AddClientRequest{Client: ClientConfig{
+		Email: "partial@example.com", SubID: "sub-partial", ExpiryTime: -3600000,
+		Enable: true, LimitIP: 1, TotalGB: 1073741824,
+	}, InboundIDs: []int{1, 2}})
+	if result.Outcome != WriteUnknown || !IsUnknownOutcome(result.Err) {
+		t.Fatalf("expected unknown outcome for incomplete inbound readback, got %#v", result)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if addCalls != 1 {
+		t.Fatalf("expected exactly one create call, got %d", addCalls)
+	}
+	if attachCalls != 1 {
+		t.Fatalf("expected one safe attachment repair, got %d", attachCalls)
 	}
 }
 

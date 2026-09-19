@@ -29,6 +29,31 @@ func GetSubscriptionsByUserID(ctx context.Context, userID int64) ([]*Subscriptio
 	return subs, rows.Err()
 }
 
+// GetManageableSubscriptionsByUserID returns services that are still current
+// enough to manage.  Cancelled/deleted rows remain queryable through the
+// audit-oriented functions above so refund foreign keys and history survive,
+// but terminal rows must not appear in the normal My Services screen.
+func GetManageableSubscriptionsByUserID(ctx context.Context, userID int64) ([]*Subscription, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	rows, err := Pool.Query(ctx, subscriptionSelect()+` WHERE user_id = $1 AND status NOT IN ('cancelled', 'deleted') ORDER BY created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var subs []*Subscription
+	for rows.Next() {
+		s, err := scanSubscriptionRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		subs = append(subs, s)
+	}
+	return subs, rows.Err()
+}
+
 func GetActiveSubscriptionsByUserID(ctx context.Context, userID int64) ([]*Subscription, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()

@@ -507,16 +507,19 @@ func ProcessBuyCustomName(c telebot.Context, customName string) error {
 	if currency == "" {
 		currency = "IRR"
 	}
+	operationToken := makeSubID()
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
-		"plan_id":     fmt.Sprintf("%d", plan.ID),
-		"months":      fmt.Sprintf("%d", months),
-		"ip_limit":    fmt.Sprintf("%d", ipLimit),
-		"price":       fmt.Sprintf("%.2f", price),
-		"custom_name": name,
-		"email":       email,
-		"data_gb":     fmt.Sprintf("%d", dataGB),
-		"type":        "buy",
+		"plan_id":         fmt.Sprintf("%d", plan.ID),
+		"months":          fmt.Sprintf("%d", months),
+		"ip_limit":        fmt.Sprintf("%d", ipLimit),
+		"price":           fmt.Sprintf("%.2f", price),
+		"custom_name":     name,
+		"email":           email,
+		"data_gb":         fmt.Sprintf("%d", dataGB),
+		"type":            "buy",
+		"operation_token": operationToken,
+		"operation_key":   fmt.Sprintf("wallet_purchase:%s", operationToken),
 	})
 
 	var dataLabel = "نامحدود"
@@ -534,8 +537,8 @@ func ProcessBuyCustomName(c telebot.Context, customName string) error {
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
 		menu.Row(
-			menu.Data("👛 پرداخت از کیف پول", "buy_confirm"),
-			menu.Data("💳 پرداخت مستقیم (کارت به کارت)", "buy_direct"),
+			menu.Data("👛 پرداخت از کیف پول", "buy_confirm", operationToken),
+			menu.Data("💳 پرداخت مستقیم (کارت به کارت)", "buy_direct", operationToken),
 		),
 		menu.Row(
 			menu.Data("❌ انصراف", "buy_cancel"),
@@ -599,16 +602,19 @@ func HandleBuyAutoName(c telebot.Context) error {
 	if currency == "" {
 		currency = "IRR"
 	}
+	operationToken := makeSubID()
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
-		"plan_id":     fmt.Sprintf("%d", plan.ID),
-		"months":      fmt.Sprintf("%d", months),
-		"ip_limit":    fmt.Sprintf("%d", ipLimit),
-		"price":       fmt.Sprintf("%.2f", price),
-		"custom_name": baseName,
-		"email":       email,
-		"data_gb":     fmt.Sprintf("%d", dataGB),
-		"type":        "buy",
+		"plan_id":         fmt.Sprintf("%d", plan.ID),
+		"months":          fmt.Sprintf("%d", months),
+		"ip_limit":        fmt.Sprintf("%d", ipLimit),
+		"price":           fmt.Sprintf("%.2f", price),
+		"custom_name":     baseName,
+		"email":           email,
+		"data_gb":         fmt.Sprintf("%d", dataGB),
+		"type":            "buy",
+		"operation_token": operationToken,
+		"operation_key":   fmt.Sprintf("wallet_purchase:%s", operationToken),
 	})
 
 	var dataLabel = "نامحدود"
@@ -626,8 +632,8 @@ func HandleBuyAutoName(c telebot.Context) error {
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
 		menu.Row(
-			menu.Data("👛 پرداخت از کیف پول", "buy_confirm"),
-			menu.Data("💳 پرداخت مستقیم (کارت به کارت)", "buy_direct"),
+			menu.Data("👛 پرداخت از کیف پول", "buy_confirm", operationToken),
+			menu.Data("💳 پرداخت مستقیم (کارت به کارت)", "buy_direct", operationToken),
 		),
 		menu.Row(
 			menu.Data("❌ انصراف", "buy_cancel"),
@@ -653,6 +659,11 @@ func HandleBuyConfirm(c telebot.Context) error {
 	if state == nil || state.Step != "awaiting_buy_confirm" {
 		return c.Send("هیچ خریدی در انتظار تایید نیست.")
 	}
+	callbackToken := strings.TrimSpace(callbackPayload(c))
+	stateToken := strings.TrimSpace(fmt.Sprintf("%v", state.Data["operation_token"]))
+	if stateToken != "" && callbackToken != stateToken {
+		return c.Send("این تاییدیه منقضی شده است؛ لطفا خلاصه خرید فعلی را دوباره باز کنید.")
+	}
 
 	planID, _ := parseInt64(fmt.Sprintf("%v", state.Data["plan_id"]))
 	months, _ := strconv.Atoi(fmt.Sprintf("%v", state.Data["months"]))
@@ -662,6 +673,11 @@ func HandleBuyConfirm(c telebot.Context) error {
 	var dataGB int
 	if val, ok := state.Data["data_gb"]; ok && val != "" {
 		dataGB, _ = strconv.Atoi(fmt.Sprintf("%v", val))
+	}
+	operationKey := fmt.Sprintf("%v", state.Data["operation_key"])
+	if operationKey == "" {
+		// Legacy FSM state: assign one opaque intent ID for this confirmation.
+		operationKey = fmt.Sprintf("wallet_purchase:%s", makeSubID())
 	}
 
 	if !bot.FSM.CompareAndClearState(user.TelegramID, "awaiting_buy_confirm") {
@@ -677,15 +693,14 @@ func HandleBuyConfirm(c telebot.Context) error {
 	}
 
 	price := calculatePaidPrice(plan, months, ipLimit, dataGB)
-	debitKey := fmt.Sprintf("wallet_purchase:%d:%s", user.ID, email)
-	if err := db.DebitWalletBalanceWithKey(context.Background(), user.ID, price, "subscription purchase: "+email, debitKey); err != nil {
+	if err := db.DebitWalletBalanceWithKey(context.Background(), user.ID, price, "subscription purchase: "+email, operationKey); err != nil {
 		return c.Send("موجودی کیف پول شما کافی نیست. لطفا ابتدا کیف پول خود را شارژ کنید یا از گزینه پرداخت مستقیم استفاده کنید.")
 	}
 
 	if err := createPaidSubscription(c, user, plan, email, name, months, ipLimit, price, dataGB); err != nil {
 		if xui.IsUnknownOutcome(err) {
 			record := &db.ReconciliationRecord{
-				OperationKey:  fmt.Sprintf("purchase_provisioning:%d:%s", user.ID, email),
+				OperationKey:  operationKey + ":reconciliation",
 				Kind:          "purchase_provisioning_unknown",
 				DesiredState:  map[string]any{"email": email, "months": months, "ip_limit": ipLimit, "data_gb": dataGB},
 				ObservedState: map[string]any{"outcome": "unknown"},
@@ -696,7 +711,7 @@ func HandleBuyConfirm(c telebot.Context) error {
 			}
 			return c.Send("نتیجه ایجاد سرویس در پنل نامشخص است؛ برای جلوگیری از ایجاد سرویس تکراری، مبلغ فعلا در کیف پول محفوظ ماند و درخواست برای بررسی ثبت شد.")
 		}
-		_ = db.CreditWalletBalanceWithKey(context.Background(), user.ID, price, "refund for failed purchase: "+email, fmt.Sprintf("wallet_purchase_refund:%d:%s", user.ID, email))
+		_ = db.CreditWalletBalanceWithKey(context.Background(), user.ID, price, "refund for failed purchase: "+email, operationKey+":refund")
 		return c.Send("خطا در ایجاد اشتراک در پنل. مبلغ کسر شده به کیف پول شما عودت داده شد. " + err.Error())
 	}
 	return nil
@@ -711,6 +726,11 @@ func HandleBuyDirectPayment(c telebot.Context) error {
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil || state.Step != "awaiting_buy_confirm" {
 		return c.Send("هیچ خریدی در انتظار تایید یافت نشد.")
+	}
+	callbackToken := strings.TrimSpace(callbackPayload(c))
+	stateToken := strings.TrimSpace(fmt.Sprintf("%v", state.Data["operation_token"]))
+	if stateToken != "" && callbackToken != stateToken {
+		return c.Send("این تاییدیه منقضی شده است؛ لطفا خلاصه خرید فعلی را دوباره باز کنید.")
 	}
 
 	priceStr := fmt.Sprintf("%v", state.Data["price"])

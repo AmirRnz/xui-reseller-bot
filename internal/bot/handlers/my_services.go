@@ -18,6 +18,75 @@ import (
 
 const servicesPageSize = 6
 
+type deleteResolution string
+
+const (
+	deleteConfirmed              deleteResolution = "confirmed"
+	deleteStillPresent           deleteResolution = "still_present"
+	deleteReconciliationRequired deleteResolution = "reconciliation_required"
+	deleteDefinitiveFailure      deleteResolution = "definitive_failure"
+)
+
+var errDeleteClientStillPresent = errors.New("x-ui client is still present after delete")
+
+// resolveDeleteOutcome centralizes the safety boundary around an ambiguous
+// remote delete.  It is deliberately callback-based so the decision can be
+// tested without a live panel: only a typed NotFound readback confirms that a
+// timed-out delete committed; an unavailable readback remains reconcilable.
+func resolveDeleteOutcome(deleteErr error, verify func() (*xui.XUIClientInfo, error)) (deleteResolution, error) {
+	switch {
+	case deleteErr == nil, xui.IsNotFound(deleteErr):
+		return deleteConfirmed, nil
+	case !xui.IsUnknownOutcome(deleteErr):
+		return deleteDefinitiveFailure, deleteErr
+	}
+
+	if verify == nil {
+		return deleteReconciliationRequired, errors.New("delete verification was not available")
+	}
+	remote, verifyErr := verify()
+	switch {
+	case xui.IsNotFound(verifyErr):
+		return deleteConfirmed, nil
+	case verifyErr != nil:
+		return deleteReconciliationRequired, verifyErr
+	case remote == nil:
+		return deleteReconciliationRequired, errors.New("delete verification returned no client state")
+	default:
+		return deleteStillPresent, errDeleteClientStillPresent
+	}
+}
+
+// orchestrateDeleteOutcome applies the side-effect boundary for a delete. A
+// confirmed remote absence is the only outcome that may continue with local
+// cancellation; an ambiguous result is durable-reconciliation work and a
+// definitive failure leaves both callbacks untouched. Keeping the callbacks
+// injectable makes these invariants testable without constructing a Telegram
+// context or a live database.
+func orchestrateDeleteOutcome(
+	deleteErr error,
+	verify func() (*xui.XUIClientInfo, error),
+	onConfirmed func() error,
+	onReconciliation func(deleteErr, verifyErr error) error,
+) (deleteResolution, error) {
+	resolution, resolutionErr := resolveDeleteOutcome(deleteErr, verify)
+	switch resolution {
+	case deleteConfirmed:
+		if onConfirmed != nil {
+			if err := onConfirmed(); err != nil {
+				return resolution, err
+			}
+		}
+	case deleteReconciliationRequired:
+		if onReconciliation != nil {
+			if err := onReconciliation(deleteErr, resolutionErr); err != nil {
+				return resolution, err
+			}
+		}
+	}
+	return resolution, resolutionErr
+}
+
 func RegisterMyServices(b *telebot.Bot, auth telebot.MiddlewareFunc) {
 	b.Handle("\fmenu_my_services", HandleMyServicesFlow, auth)
 	b.Handle("\fsvc_page", HandleMyServicesPage, auth)
@@ -59,7 +128,7 @@ func showServicesPage(c telebot.Context, page int) error {
 	if user == nil {
 		return c.Send("خطا در بارگذاری حساب کاربری.")
 	}
-	subs, err := db.GetSubscriptionsByUserID(context.Background(), user.ID)
+	subs, err := db.GetManageableSubscriptionsByUserID(context.Background(), user.ID)
 	if err != nil {
 		return c.Send("خطا در بارگذاری اشتراک‌ها.")
 	}
@@ -440,8 +509,28 @@ func HandleDeleteSubscription(c telebot.Context) error {
 
 	// Delete from panel
 	if bot.XUIClient != nil {
-		err := bot.XUIClient.DeleteClient(sub.ClientEmail)
-		if err != nil && !strings.Contains(strings.ToLower(err.Error()), "not found") {
+		deleteErr := bot.XUIClient.DeleteClient(sub.ClientEmail)
+		resolution, _ := orchestrateDeleteOutcome(
+			deleteErr,
+			func() (*xui.XUIClientInfo, error) {
+				return bot.XUIClient.GetClientByEmail(sub.ClientEmail)
+			},
+			nil,
+			func(deleteErr, verifyErr error) error {
+				persistDeleteReconciliation(sub, user, refundAmount, deleteErr, verifyErr)
+				return nil
+			},
+		)
+		switch resolution {
+		case deleteConfirmed:
+			// A confirmed missing client is already in the desired remote state.
+		case deleteStillPresent:
+			// The client is still present, so this attempt definitely did not
+			// apply. Keep all financial/commercial state unchanged.
+			return c.Send("حذف اشتراک از پنل تایید نشد؛ اشتراک در دیتابیس و وضعیت مالی شما بدون تغییر باقی ماند.")
+		case deleteReconciliationRequired:
+			return c.Send("نتیجه حذف اشتراک از پنل نامشخص است؛ هیچ تغییر مالی انجام نشد و عملیات برای تطبیق ثبت شد.")
+		default:
 			return c.Send("خطا در حذف اشتراک از پنل 3x-ui. لطفا با پشتیبانی تماس بگیرید.")
 		}
 	}
@@ -518,6 +607,35 @@ func HandleDeleteSubscription(c telebot.Context) error {
 	return HandleMyServicesFlow(c)
 }
 
+func persistDeleteReconciliation(sub *db.Subscription, user *db.User, refundAmount int64, deleteErr, verifyErr error) {
+	if sub == nil || user == nil {
+		return
+	}
+	subID := int64(sub.ID)
+	observed := map[string]any{"delete_outcome": "unknown"}
+	if deleteErr != nil {
+		observed["delete_error"] = deleteErr.Error()
+	}
+	if verifyErr != nil {
+		observed["verification_error"] = verifyErr.Error()
+	}
+	if err := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
+		OperationKey:   fmt.Sprintf("subscription_delete_reconciliation:%d", sub.ID),
+		Kind:           "subscription_delete_unknown",
+		UserID:         &user.ID,
+		SubscriptionID: &subID,
+		DesiredState: map[string]any{
+			"remote":        "absent",
+			"status":        db.SubscriptionStatusCancelled,
+			"refund_amount": refundAmount,
+		},
+		ObservedState: observed,
+		ErrorMessage:  deleteErr.Error(),
+	}); err != nil {
+		log.Printf("[CRITICAL] failed to persist delete reconciliation for subscription %d: %v", sub.ID, err)
+	}
+}
+
 // ─── Increase IP limit ────────────────────────────────────────────────────────
 
 func HandleSubscriptionLimitMenu(c telebot.Context) error {
@@ -590,12 +708,14 @@ func HandleSubscriptionLimitConfirmPrompt(c telebot.Context) error {
 	if currency == "" {
 		currency = "IRR"
 	}
+	operationID := makeSubID()
+	confirmPayload := fmt.Sprintf("%d:%d:%s", newLimit, sub.ID, operationID)
 
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
 		menu.Row(
-			menu.Data("👛 پرداخت از کیف پول", "sub_limit_confirm", callbackPayload(c)),
-			menu.Data("💳 پرداخت مستقیم (کارت به کارت)", "sub_limit_direct", callbackPayload(c)),
+			menu.Data("👛 پرداخت از کیف پول", "sub_limit_confirm", confirmPayload),
+			menu.Data("💳 پرداخت مستقیم (کارت به کارت)", "sub_limit_direct", confirmPayload),
 		),
 		menu.Row(
 			menu.Data("❌ انصراف", "view_sub", fmt.Sprintf("%d", sub.ID)),
@@ -610,8 +730,8 @@ func HandleSubscriptionLimitConfirmPrompt(c telebot.Context) error {
 
 func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 	parts := strings.Split(callbackPayload(c), ":")
-	if len(parts) != 2 {
-		return c.Send("درخواست ارتقای کاربر نامعتبر است.")
+	if len(parts) != 3 || strings.TrimSpace(parts[2]) == "" {
+		return c.Send("این تاییدیه ارتقا منقضی شده است؛ لطفا فرآیند را دوباره شروع کنید.")
 	}
 	newLimit, _ := strconv.Atoi(parts[0])
 	subID, _ := parseInt64(parts[1])
@@ -640,7 +760,7 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 		currency = "IRR"
 	}
 
-	operationKey := fmt.Sprintf("wallet_upgrade_ip:%d:%d", sub.ID, newLimit)
+	operationKey := fmt.Sprintf("wallet_upgrade_ip:%s", parts[2])
 	if already, checkErr := db.HasWalletOperation(context.Background(), operationKey); checkErr != nil {
 		return c.Send("خطا در بررسی وضعیت عملیات مالی.")
 	} else if already {
@@ -682,8 +802,8 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 
 func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 	parts := strings.Split(callbackPayload(c), ":")
-	if len(parts) != 2 {
-		return c.Send("درخواست نامعتبر است.")
+	if len(parts) != 3 || strings.TrimSpace(parts[2]) == "" {
+		return c.Send("این تاییدیه ارتقا منقضی شده است؛ لطفا فرآیند را دوباره شروع کنید.")
 	}
 	newLimit, _ := strconv.Atoi(parts[0])
 	_, _ = parseInt64(parts[1])
@@ -860,7 +980,7 @@ func showExtendConfirmation(c telebot.Context, user *db.User, subID int, months 
 		currency = "IRR"
 	}
 
-	payload := fmt.Sprintf("%d:%d", months, sub.ID)
+	payload := fmt.Sprintf("%d:%d:%s", months, sub.ID, makeSubID())
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
 		menu.Row(
@@ -884,8 +1004,8 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		return c.Send("کاربر یافت نشد.")
 	}
 	parts := strings.Split(callbackPayload(c), ":")
-	if len(parts) != 2 {
-		return c.Send("درخواست نامعتبر است.")
+	if len(parts) != 3 || strings.TrimSpace(parts[2]) == "" {
+		return c.Send("این تاییدیه تمدید منقضی شده است؛ لطفا فرآیند را دوباره شروع کنید.")
 	}
 	months, _ := strconv.Atoi(parts[0])
 	subID, _ := parseInt64(parts[1])
@@ -913,7 +1033,7 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		currency = "IRR"
 	}
 
-	operationKey := fmt.Sprintf("wallet_extend:%d:%d", sub.ID, months)
+	operationKey := fmt.Sprintf("wallet_extend:%s", parts[2])
 	if already, checkErr := db.HasWalletOperation(context.Background(), operationKey); checkErr != nil {
 		return c.Send("خطا در بررسی وضعیت عملیات مالی.")
 	} else if already {
@@ -991,8 +1111,8 @@ func HandleExtendSubscriptionDirect(c telebot.Context) error {
 		return c.Send("کاربر یافت نشد.")
 	}
 	parts := strings.Split(callbackPayload(c), ":")
-	if len(parts) != 2 {
-		return c.Send("درخواست نامعتبر است.")
+	if len(parts) != 3 || strings.TrimSpace(parts[2]) == "" {
+		return c.Send("این تاییدیه تمدید منقضی شده است؛ لطفا فرآیند را دوباره شروع کنید.")
 	}
 	months, _ := strconv.Atoi(parts[0])
 	subID, _ := parseInt64(parts[1])
@@ -1066,7 +1186,7 @@ func loadOwnedSubscription(c telebot.Context) (*db.Subscription, *db.User, bool)
 
 func loadOwnedSubscriptionFromPair(c telebot.Context) (*db.Subscription, *db.User, bool) {
 	parts := strings.Split(callbackPayload(c), ":")
-	if len(parts) != 2 {
+	if len(parts) < 2 || len(parts) > 3 {
 		_ = c.Send("درخواست اشتراک نامعتبر است.")
 		return nil, nil, false
 	}
