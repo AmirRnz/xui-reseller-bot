@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -697,7 +698,20 @@ func HandleBuyConfirm(c telebot.Context) error {
 		return c.Send("موجودی کیف پول شما کافی نیست. لطفا ابتدا کیف پول خود را شارژ کنید یا از گزینه پرداخت مستقیم استفاده کنید.")
 	}
 
-	if err := createPaidSubscription(c, user, plan, email, name, months, ipLimit, price, dataGB); err != nil {
+	if err := createPaidSubscription(c, user, plan, email, name, months, ipLimit, price, dataGB, operationKey); err != nil {
+		var compErr *paidSubscriptionCompensationError
+		if errors.As(err, &compErr) {
+			switch compErr.Result.Outcome {
+			case CompensationRefunded:
+				return c.Send("خطا در ثبت نهایی اشتراک در دیتابیس رخ داد. سرویس ایجاد شده در پنل خنثی شد و مبلغ پرداختی به کیف پول شما عودت داده شد.")
+			case CompensationReconciliationRequired:
+				return c.Send("خطا در ثبت نهایی اشتراک رخ داد و وضعیت حذف سرویس از پنل نامشخص است؛ جهت حفظ حقوق شما، مبلغ در کیف پول محفوظ ماند و درخواست برای بررسی پشتیبانی ثبت شد.")
+			case CompensationClientStillPresent:
+				return c.Send("سرویس در پنل فعال شد اما ثبت آن در سیستم با خطا مواجه گردید. سرویس در سرور فعال باقی مانده و هزینه کسر شده برای بررسی و تطبیق توسط پشتیبانی ثبت شد.")
+			default:
+				return c.Send("خطا در پردازش اشتراک. وضعیت جهت بررسی ثبت شد.")
+			}
+		}
 		if xui.IsUnknownOutcome(err) {
 			record := &db.ReconciliationRecord{
 				OperationKey:  operationKey + ":reconciliation",
@@ -711,8 +725,11 @@ func HandleBuyConfirm(c telebot.Context) error {
 			}
 			return c.Send("نتیجه ایجاد سرویس در پنل نامشخص است؛ برای جلوگیری از ایجاد سرویس تکراری، مبلغ فعلا در کیف پول محفوظ ماند و درخواست برای بررسی ثبت شد.")
 		}
-		_ = db.CreditWalletBalanceWithKey(context.Background(), user.ID, price, "refund for failed purchase: "+email, operationKey+":refund")
-		return c.Send("خطا در ایجاد اشتراک در پنل. مبلغ کسر شده به کیف پول شما عودت داده شد. " + err.Error())
+		refunded, refErr := safeRefundWallet(context.Background(), user.ID, price, "refund for failed purchase: "+email, operationKey, operationKey+":refund", nil, map[string]any{"email": email, "plan_id": plan.ID})
+		if refunded {
+			return c.Send("خطا در ایجاد اشتراک در پنل. مبلغ کسر شده به کیف پول شما عودت داده شد. " + err.Error())
+		}
+		return c.Send(fmt.Sprintf("خطا در ایجاد اشتراک در پنل رخ داد (%v)، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد (%v). مبلغ جهت بررسی و بازگشت دستی توسط پشتیبانی با شناسه %s ثبت شد.", err, refErr, operationKey+":refund"))
 	}
 	return nil
 }
@@ -774,7 +791,7 @@ func HandleBuyCancel(c telebot.Context) error {
 	return maybeEditOrSend(c, "❌ فرآیند خرید لغو شد.")
 }
 
-func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan, email, displayName string, months int, ipLimit int, price float64, dataGB int) error {
+func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan, email, displayName string, months int, ipLimit int, price float64, dataGB int, operationKey string) error {
 	if bot.XUIClient == nil {
 		return fmt.Errorf("x-ui client is not initialized")
 	}
@@ -825,19 +842,35 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 		TrafficLimitBytes: totalBytes,
 	}
 	if err := db.CreateSubscription(context.Background(), sub); err != nil {
-		log.Printf("[CRITICAL] Database save failed for subscription %s: %v. Rolling back panel client.", email, err)
-		go func() {
-			var deleteErr error
-			for i := 0; i < 5; i++ {
-				if deleteErr = bot.XUIClient.DeleteClient(email); deleteErr == nil {
-					log.Printf("Rollback successful: Deleted client %s from panel", email)
-					return
-				}
-				time.Sleep(time.Duration(1<<i) * time.Second)
+		log.Printf("[CRITICAL] Database save failed for subscription %s: %v. Initiating safe compensation...", email, err)
+		deleteFn := func(e string) error {
+			if bot.XUIClient == nil {
+				return ErrXUIClientUnavailable
 			}
-			log.Printf("[ALERT] CRITICAL: Failed to delete client %s from panel after 5 retries: %v. Client is orphaned on panel!", email, deleteErr)
-		}()
-		return err
+			return bot.XUIClient.DeleteClient(e)
+		}
+		verifyFn := func(e string) (*xui.XUIClientInfo, error) {
+			if bot.XUIClient == nil {
+				return nil, ErrXUIClientUnavailable
+			}
+			return bot.XUIClient.GetClientByEmail(e)
+		}
+		compResult := compensateRemoteCreateDbFailure(
+			context.Background(),
+			user,
+			plan,
+			client,
+			inboundIDs,
+			displayName,
+			price,
+			operationKey,
+			err,
+			deleteFn,
+			verifyFn,
+			safeRefundWallet,
+			db.CreateReconciliationRecord,
+		)
+		return &paidSubscriptionCompensationError{Result: compResult}
 	}
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")

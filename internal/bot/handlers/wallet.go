@@ -566,19 +566,64 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 		TrafficLimitBytes: totalBytes,
 	}
 	if err := db.CreateSubscription(context.Background(), sub); err != nil {
-		log.Printf("[CRITICAL] Database save failed for subscription %s: %v. Rolling back panel client.", req.ClientEmail, err)
-		go func() {
-			var deleteErr error
-			for i := 0; i < 5; i++ {
-				if deleteErr = bot.XUIClient.DeleteClient(req.ClientEmail); deleteErr == nil {
-					log.Printf("Rollback successful: Deleted client %s from panel", req.ClientEmail)
-					return
-				}
-				time.Sleep(time.Duration(1<<i) * time.Second)
-			}
-			log.Printf("[ALERT] CRITICAL: Failed to delete client %s from panel after 5 retries: %v. Client is orphaned on panel!", req.ClientEmail, deleteErr)
-		}()
-		return err
+		log.Printf("[CRITICAL] Database save failed for subscription %s: %v. Initiating safe compensation...", req.ClientEmail, err)
+		deleteErr := bot.XUIClient.DeleteClient(req.ClientEmail)
+		resolution, resErr := resolveDeleteOutcome(deleteErr, func() (*xui.XUIClientInfo, error) {
+			return bot.XUIClient.GetClientByEmail(req.ClientEmail)
+		})
+		reqID64 := req.ID
+		desired := map[string]any{
+			"email":               req.ClientEmail,
+			"client_id":           clientUUID,
+			"client_uuid":         clientUUID,
+			"sub_id":              subID,
+			"inbound_ids":         inboundIDs,
+			"expiry_time":         expireMilli,
+			"ip_limit":            req.IPLimit,
+			"total_gb":            client.TotalGB,
+			"plan_id":             plan.ID,
+			"user_id":             user.ID,
+			"purchase_request_id": req.ID,
+			"db_error":            err.Error(),
+		}
+		observed := map[string]any{"remote_created": true}
+		if deleteErr != nil {
+			observed["delete_error"] = deleteErr.Error()
+		}
+		if resErr != nil {
+			observed["resolution_error"] = resErr.Error()
+		}
+
+		if resolution == deleteConfirmed {
+			observed["remote_deleted"] = true
+			_ = db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
+				OperationKey:      fmt.Sprintf("purchase_request_comp:%d", req.ID),
+				Kind:              "purchase_request_db_failed_compensated",
+				UserID:            &user.ID,
+				PurchaseRequestID: &reqID64,
+				DesiredState:      desired,
+				ObservedState:     observed,
+				Status:            "compensated",
+				ErrorMessage:      fmt.Sprintf("DB save failed: %v; remote client deleted", err),
+			})
+			return fmt.Errorf("failed to save subscription in database (remote client cancelled): %w", err)
+		}
+
+		observed["remote_deleted"] = false
+		if resolution == deleteStillPresent {
+			observed["client_present"] = true
+		}
+		_ = db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
+			OperationKey:      fmt.Sprintf("purchase_request_comp:%d", req.ID),
+			Kind:              "purchase_request_db_failed_reconciliation",
+			UserID:            &user.ID,
+			PurchaseRequestID: &reqID64,
+			DesiredState:      desired,
+			ObservedState:     observed,
+			Status:            "reconciliation_required",
+			ErrorMessage:      fmt.Sprintf("DB save failed: %v; remote delete outcome: %s", err, resolution),
+		})
+		return &xui.WriteError{Outcome: xui.WriteUnknown, Err: fmt.Errorf("DB save failed (%v) and remote client deletion is %s", err, resolution)}
 	}
 
 	links, err := bot.XUIClient.GetSubscriptionLinks(subID)

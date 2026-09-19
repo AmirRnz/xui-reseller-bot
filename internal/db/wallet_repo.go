@@ -132,6 +132,10 @@ func DebitWalletBalanceWithKey(ctx context.Context, userID int64, amount float64
 		return errors.New("amount must be positive")
 	}
 
+	if Pool == nil {
+		return errors.New("database pool is not initialized")
+	}
+
 	tx, err := Pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -191,6 +195,10 @@ func CreditWalletBalanceWithKey(ctx context.Context, userID int64, amount float6
 	amountInt := moneyToInt(amount)
 	if amountInt <= 0 {
 		return errors.New("amount must be positive")
+	}
+
+	if Pool == nil {
+		return errors.New("database pool is not initialized")
 	}
 
 	tx, err := Pool.Begin(ctx)

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 )
 
 // ReconciliationRecord is a durable marker for a cross-system operation whose
@@ -34,6 +35,9 @@ func CreateReconciliationRecord(ctx context.Context, record *ReconciliationRecor
 	}
 	if record.Status == "" {
 		record.Status = "pending"
+	}
+	if Pool == nil {
+		return errors.New("database pool is not initialized")
 	}
 	err = Pool.QueryRow(ctx, `
 		INSERT INTO reconciliation_records

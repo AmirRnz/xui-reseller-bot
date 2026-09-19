@@ -70,6 +70,11 @@ func Load(path string) error {
 	if cfg.Bot.WebhookPort == 0 {
 		cfg.Bot.WebhookPort = 88
 	}
+	if envURL := os.Getenv("TEST_DATABASE_URL"); envURL != "" {
+		cfg.Database.URL = envURL
+	} else if envURL := os.Getenv("DATABASE_URL"); envURL != "" {
+		cfg.Database.URL = envURL
+	}
 	if err := fillDatabaseURLParts(&cfg.Database); err != nil {
 		return err
 	}
