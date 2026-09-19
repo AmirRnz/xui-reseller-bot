@@ -782,15 +782,20 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 			desiredActive := sub.IsActive
 			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &newLimit, sub.ExpireTime, &desiredActive, "wallet IP upgrade has unknown 3x-ui outcome"); recErr != nil {
 				log.Printf("[CRITICAL] failed to mark IP upgrade reconciliation for subscription %d: %v", sub.ID, recErr)
+				return c.Send(fmt.Sprintf("نتیجه ارتقای پنل نامشخص است؛ مبلغ بازگردانده نشد اما ثبت خودکار تطبیق با خطا مواجه شد (%v). هیچ درخواستی به‌طور خودکار ثبت نشده است؛ لطفا با پشتیبانی تماس بگیرید.", recErr))
 			}
 			return c.Send("نتیجه ارتقای پنل نامشخص است؛ مبلغ بازگردانده نشد و سرویس برای تطبیق ثبت شد.")
 		}
 		subID64 := int64(sub.ID)
-		refunded, refErr := safeRefundWallet(context.Background(), user.ID, cost, "refund failed IP upgrade", operationKey, operationKey+":refund", &subID64, map[string]any{"subscription_id": sub.ID, "target_limit": newLimit})
-		if refunded {
+		refundRes := safeRefundWallet(context.Background(), user.ID, cost, "refund failed IP upgrade", operationKey, operationKey+":refund", &subID64, map[string]any{"subscription_id": sub.ID, "target_limit": newLimit})
+		if refundRes.Refunded {
 			return c.Send("خطا در بروزرسانی پنل. مبلغ ارتقا به کیف پول شما برگشت داده شد.")
 		}
-		return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد (%v). عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", refErr, operationKey+":refund"))
+		if refundRes.ReconciliationPersisted {
+			return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد (%v). عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", refundRes.RefundErr, operationKey+":refund"))
+		}
+		log.Printf("[CRITICAL] failed to refund wallet and failed to persist reconciliation for user %d, opKey %s: refundErr=%v, reconErr=%v", user.ID, operationKey+":refund", refundRes.RefundErr, refundRes.ReconciliationErr)
+		return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد و بازگشت خودکار وجه نیز با خطا مواجه شد. ثبت خودکار گزارش خطا نیز با خطا مواجه گردید؛ هیچ درخواستی به‌طور خودکار در سیستم ثبت نشده است. لطفا فورا با ارسال شناسه زیر به پشتیبانی اطلاع دهید:\n%s", operationKey+":refund"))
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		desiredActive := sub.IsActive
@@ -1089,15 +1094,20 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		if xui.IsUnknownOutcome(err) {
 			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, nil, desiredExpireTime, &desiredActive, "wallet extension has unknown 3x-ui outcome"); recErr != nil {
 				log.Printf("[CRITICAL] failed to mark extension reconciliation for subscription %d: %v", sub.ID, recErr)
+				return c.Send(fmt.Sprintf("نتیجه تمدید در پنل نامشخص است؛ مبلغ بازگردانده نشد اما ثبت خودکار تطبیق با خطا مواجه شد (%v). هیچ درخواستی به‌طور خودکار ثبت نشده است؛ لطفا با پشتیبانی تماس بگیرید.", recErr))
 			}
 			return c.Send("نتیجه تمدید در پنل نامشخص است؛ مبلغ بازگردانده نشد و وضعیت برای تطبیق ثبت شد.")
 		}
 		subID64 := int64(sub.ID)
-		refunded, refErr := safeRefundWallet(context.Background(), user.ID, cost, "refund failed extension", operationKey, operationKey+":refund", &subID64, map[string]any{"subscription_id": sub.ID, "months": months})
-		if refunded {
+		refundRes := safeRefundWallet(context.Background(), user.ID, cost, "refund failed extension", operationKey, operationKey+":refund", &subID64, map[string]any{"subscription_id": sub.ID, "months": months})
+		if refundRes.Refunded {
 			return c.Send("خطا در بروزرسانی پنل. مبلغ تمدید به کیف پول شما بازگردانده شد.")
 		}
-		return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول با خطا مواجه شد (%v). عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", refErr, operationKey+":refund"))
+		if refundRes.ReconciliationPersisted {
+			return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول با خطا مواجه شد (%v). عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", refundRes.RefundErr, operationKey+":refund"))
+		}
+		log.Printf("[CRITICAL] failed to refund wallet and failed to persist reconciliation for user %d, opKey %s: refundErr=%v, reconErr=%v", user.ID, operationKey+":refund", refundRes.RefundErr, refundRes.ReconciliationErr)
+		return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد و بازگشت خودکار وجه نیز با خطا مواجه شد. ثبت خودکار گزارش خطا نیز با خطا مواجه گردید؛ هیچ درخواستی به‌طور خودکار در سیستم ثبت نشده است. لطفا فورا با ارسال شناسه زیر به پشتیبانی اطلاع دهید:\n%s", operationKey+":refund"))
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		sub.EndDate = oldEnd

@@ -701,16 +701,10 @@ func HandleBuyConfirm(c telebot.Context) error {
 	if err := createPaidSubscription(c, user, plan, email, name, months, ipLimit, price, dataGB, operationKey); err != nil {
 		var compErr *paidSubscriptionCompensationError
 		if errors.As(err, &compErr) {
-			switch compErr.Result.Outcome {
-			case CompensationRefunded:
-				return c.Send("خطا در ثبت نهایی اشتراک در دیتابیس رخ داد. سرویس ایجاد شده در پنل خنثی شد و مبلغ پرداختی به کیف پول شما عودت داده شد.")
-			case CompensationReconciliationRequired:
-				return c.Send("خطا در ثبت نهایی اشتراک رخ داد و وضعیت حذف سرویس از پنل نامشخص است؛ جهت حفظ حقوق شما، مبلغ در کیف پول محفوظ ماند و درخواست برای بررسی پشتیبانی ثبت شد.")
-			case CompensationClientStillPresent:
-				return c.Send("سرویس در پنل فعال شد اما ثبت آن در سیستم با خطا مواجه گردید. سرویس در سرور فعال باقی مانده و هزینه کسر شده برای بررسی و تطبیق توسط پشتیبانی ثبت شد.")
-			default:
-				return c.Send("خطا در پردازش اشتراک. وضعیت جهت بررسی ثبت شد.")
+			if compErr.Result.ReconErr != nil {
+				log.Printf("[CRITICAL] Compensation reconciliation persistence failed for user %d, opKey %s: %v", user.ID, operationKey, compErr.Result.ReconErr)
 			}
+			return c.Send(formatCompensationUserMessage(compErr.Result, operationKey))
 		}
 		if xui.IsUnknownOutcome(err) {
 			record := &db.ReconciliationRecord{
@@ -720,16 +714,22 @@ func HandleBuyConfirm(c telebot.Context) error {
 				ObservedState: map[string]any{"outcome": "unknown"},
 				ErrorMessage:  err.Error(),
 			}
-			if recErr := db.CreateReconciliationRecord(context.Background(), record); recErr != nil {
+			recErr := db.CreateReconciliationRecord(context.Background(), record)
+			if recErr != nil {
 				log.Printf("[CRITICAL] failed to persist purchase reconciliation for %s: %v", email, recErr)
+				return c.Send(fmt.Sprintf("نتیجه ایجاد سرویس در پنل نامشخص است؛ به دلیل عدم قطعیت از بازگشت وجه خودداری شد. متاسفانه ثبت خودکار درخواست تطبیق نیز با خطا مواجه شد (%v) و هیچ درخواستی به‌طور خودکار در سیستم ثبت نشده است. لطفا فورا با پشتیبانی تماس گرفته و شناسه زیر را برای پیگیری ارسال فرمایید:\n%s", recErr, operationKey))
 			}
 			return c.Send("نتیجه ایجاد سرویس در پنل نامشخص است؛ برای جلوگیری از ایجاد سرویس تکراری، مبلغ فعلا در کیف پول محفوظ ماند و درخواست برای بررسی ثبت شد.")
 		}
-		refunded, refErr := safeRefundWallet(context.Background(), user.ID, price, "refund for failed purchase: "+email, operationKey, operationKey+":refund", nil, map[string]any{"email": email, "plan_id": plan.ID})
-		if refunded {
+		refundRes := safeRefundWallet(context.Background(), user.ID, price, "refund for failed purchase: "+email, operationKey, operationKey+":refund", nil, map[string]any{"email": email, "plan_id": plan.ID})
+		if refundRes.Refunded {
 			return c.Send("خطا در ایجاد اشتراک در پنل. مبلغ کسر شده به کیف پول شما عودت داده شد. " + err.Error())
 		}
-		return c.Send(fmt.Sprintf("خطا در ایجاد اشتراک در پنل رخ داد (%v)، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد (%v). مبلغ جهت بررسی و بازگشت دستی توسط پشتیبانی با شناسه %s ثبت شد.", err, refErr, operationKey+":refund"))
+		if refundRes.ReconciliationPersisted {
+			return c.Send(fmt.Sprintf("خطا در ایجاد اشتراک در پنل رخ داد (%v)، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد (%v). مبلغ جهت بررسی و بازگشت دستی توسط پشتیبانی با شناسه %s ثبت شد.", err, refundRes.RefundErr, operationKey+":refund"))
+		}
+		log.Printf("[CRITICAL] failed to refund wallet and failed to persist reconciliation for user %d, opKey %s: refundErr=%v, reconErr=%v", user.ID, operationKey+":refund", refundRes.RefundErr, refundRes.ReconciliationErr)
+		return c.Send(fmt.Sprintf("خطا در ایجاد اشتراک در پنل رخ داد (%v) و بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد. ثبت خودکار گزارش خطا نیز با خطا مواجه گردید؛ هیچ درخواستی به‌طور خودکار در سیستم ثبت نشده است. لطفا فورا با ارسال شناسه زیر به پشتیبانی اطلاع دهید:\n%s", err, operationKey+":refund"))
 	}
 	return nil
 }

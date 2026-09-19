@@ -80,11 +80,19 @@ func restoreSubscriptionWalletState(sub *db.Subscription, state subscriptionWall
 	sub.ExpireTime = &expiry
 }
 
+type SafeRefundResult struct {
+	Refunded                bool
+	AlreadyRefunded         bool
+	RefundErr               error
+	ReconciliationPersisted bool
+	ReconciliationErr       error
+}
+
 // safeRefundWallet credits the user's wallet with an idempotent operation key.
-// If the credit succeeds or was already applied, it returns (true, nil).
-// If the DB credit fails with any other error, it records a durable pending_refund
-// reconciliation marker and returns (false, err).
-func safeRefundWallet(
+// If the credit succeeds or was already applied, it returns Refunded=true.
+// If the DB credit fails, it records a durable pending_refund reconciliation marker
+// and returns the outcome with explicit persistence observability.
+func safeRefundWalletWithDeps(
 	ctx context.Context,
 	userID int64,
 	amount float64,
@@ -93,10 +101,28 @@ func safeRefundWallet(
 	refundOpKey string,
 	subID *int64,
 	extra map[string]any,
-) (bool, error) {
-	err := db.CreditWalletBalanceWithKey(ctx, userID, amount, description, refundOpKey)
-	if err == nil || errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
-		return true, nil
+	creditFn func(ctx context.Context, userID int64, amount float64, description, operationKey string) error,
+	persistReconFn func(ctx context.Context, record *db.ReconciliationRecord) error,
+) SafeRefundResult {
+	if creditFn == nil {
+		creditFn = db.CreditWalletBalanceWithKey
+	}
+	if persistReconFn == nil {
+		persistReconFn = db.CreateReconciliationRecord
+	}
+
+	err := creditFn(ctx, userID, amount, description, refundOpKey)
+	if err == nil {
+		return SafeRefundResult{
+			Refunded:        true,
+			AlreadyRefunded: false,
+		}
+	}
+	if errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
+		return SafeRefundResult{
+			Refunded:        true,
+			AlreadyRefunded: true,
+		}
 	}
 
 	desired := map[string]any{
@@ -121,11 +147,35 @@ func safeRefundWallet(
 		Status:         "pending_refund",
 		ErrorMessage:   err.Error(),
 	}
-	if recErr := db.CreateReconciliationRecord(ctx, record); recErr != nil {
+	recErr := persistReconFn(ctx, record)
+	if recErr != nil {
 		log.Printf("[CRITICAL] failed to persist pending refund reconciliation for user %d, key %s: %v", userID, refundOpKey, recErr)
+		return SafeRefundResult{
+			Refunded:                false,
+			RefundErr:               err,
+			ReconciliationPersisted: false,
+			ReconciliationErr:       recErr,
+		}
 	}
 
-	return false, err
+	return SafeRefundResult{
+		Refunded:                false,
+		RefundErr:               err,
+		ReconciliationPersisted: true,
+	}
+}
+
+func safeRefundWallet(
+	ctx context.Context,
+	userID int64,
+	amount float64,
+	description string,
+	originalOpKey string,
+	refundOpKey string,
+	subID *int64,
+	extra map[string]any,
+) SafeRefundResult {
+	return safeRefundWalletWithDeps(ctx, userID, amount, description, originalOpKey, refundOpKey, subID, extra, nil, nil)
 }
 
 type RemoteCreateCompensationOutcome string
@@ -157,6 +207,25 @@ func (e *paidSubscriptionCompensationError) Error() string {
 	return fmt.Sprintf("subscription DB save failed (%v); compensation outcome: %s", e.Result.DBErr, e.Result.Outcome)
 }
 
+func formatCompensationUserMessage(res RemoteCreateCompensationResult, operationKey string) string {
+	switch res.Outcome {
+	case CompensationRefunded:
+		return "خطا در ثبت نهایی اشتراک در دیتابیس رخ داد. سرویس ایجاد شده در پنل خنثی شد و مبلغ پرداختی به کیف پول شما عودت داده شد."
+	case CompensationReconciliationRequired:
+		if res.ReconErr != nil {
+			return fmt.Sprintf("خطا در ثبت نهایی اشتراک رخ داد و وضعیت حذف سرویس از پنل نامشخص است؛ همچنین ثبت خودکار درخواست در سیستم نیز با خطا مواجه شد (%v). هیچ درخواستی به‌طور خودکار ثبت نشده است. لطفا فورا با پشتیبانی تماس گرفته و شناسه پیگیری زیر را ارسال کنید:\n%s", res.ReconErr, operationKey)
+		}
+		return "خطا در ثبت نهایی اشتراک رخ داد و وضعیت حذف سرویس از پنل نامشخص است؛ جهت حفظ حقوق شما، مبلغ در کیف پول محفوظ ماند و درخواست برای بررسی پشتیبانی ثبت شد."
+	case CompensationClientStillPresent:
+		if res.ReconErr != nil {
+			return fmt.Sprintf("سرویس در پنل فعال شد اما ثبت آن در سیستم با خطا مواجه گردید؛ همچنین ثبت خودکار وضعیت برای پشتیبانی نیز با خطا مواجه شد (%v). هیچ درخواستی به‌طور خودکار ثبت نشده است. لطفا فورا با پشتیبانی تماس گرفته و شناسه پیگیری زیر را ارسال کنید:\n%s", res.ReconErr, operationKey)
+		}
+		return "سرویس در پنل فعال شد اما ثبت آن در سیستم با خطا مواجه گردید. سرویس در سرور فعال باقی مانده و هزینه کسر شده برای بررسی و تطبیق توسط پشتیبانی ثبت شد."
+	default:
+		return "خطا در پردازش اشتراک. وضعیت جهت بررسی ثبت شد."
+	}
+}
+
 func compensateRemoteCreateDbFailure(
 	ctx context.Context,
 	user *db.User,
@@ -169,7 +238,7 @@ func compensateRemoteCreateDbFailure(
 	dbErr error,
 	deleteFn func(email string) error,
 	verifyFn func(email string) (*xui.XUIClientInfo, error),
-	refundFn func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) (bool, error),
+	refundFn func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult,
 	persistReconFn func(ctx context.Context, rec *db.ReconciliationRecord) error,
 ) RemoteCreateCompensationResult {
 	if deleteFn == nil {
@@ -194,8 +263,8 @@ func compensateRemoteCreateDbFailure(
 
 	switch resolution {
 	case deleteConfirmed:
-		refunded, refundErr := refundFn(ctx, user.ID, price, "refund for failed purchase subscription persistence: "+client.Email, operationKey, operationKey+":refund", nil, map[string]any{"email": client.Email, "plan_id": plan.ID})
-		if refunded {
+		refundRes := refundFn(ctx, user.ID, price, "refund for failed purchase subscription persistence: "+client.Email, operationKey, operationKey+":refund", nil, map[string]any{"email": client.Email, "plan_id": plan.ID})
+		if refundRes.Refunded {
 			return RemoteCreateCompensationResult{
 				Outcome:   CompensationRefunded,
 				Refunded:  true,
@@ -208,7 +277,8 @@ func compensateRemoteCreateDbFailure(
 			Refunded:  false,
 			DBErr:     dbErr,
 			DeleteErr: deleteErr,
-			RefundErr: refundErr,
+			RefundErr: refundRes.RefundErr,
+			ReconErr:  refundRes.ReconciliationErr,
 		}
 
 	case deleteReconciliationRequired:

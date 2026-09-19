@@ -3,9 +3,13 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
 
 	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/config"
 	"xui-reseller-bot/internal/db"
 	"xui-reseller-bot/internal/xui"
 
@@ -88,12 +92,12 @@ func TestRemoteCreateSuccessDbFailureCompensation(t *testing.T) {
 				verifyCalls++
 				return nil, nil
 			},
-			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) (bool, error) {
+			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult {
 				refundCalls++
 				if refKey != "op_a:refund" {
 					t.Fatalf("unexpected refund key: %s", refKey)
 				}
-				return true, nil
+				return SafeRefundResult{Refunded: true}
 			},
 			func(ctx context.Context, rec *db.ReconciliationRecord) error {
 				reconCalls++
@@ -136,9 +140,9 @@ func TestRemoteCreateSuccessDbFailureCompensation(t *testing.T) {
 				verifyCalls++
 				return nil, errors.New("verify endpoint unavailable")
 			},
-			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) (bool, error) {
+			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult {
 				refundCalls++
-				return true, nil
+				return SafeRefundResult{Refunded: true}
 			},
 			func(ctx context.Context, rec *db.ReconciliationRecord) error {
 				reconCalls++
@@ -184,12 +188,12 @@ func TestRemoteCreateSuccessDbFailureCompensation(t *testing.T) {
 				verifyCalls++
 				return nil, xui.ErrNotFound // confirmed absent on readback
 			},
-			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) (bool, error) {
+			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult {
 				refundCalls++
 				if refKey != "op_c:refund" {
 					t.Fatalf("unexpected refund key: %s", refKey)
 				}
-				return true, nil
+				return SafeRefundResult{Refunded: true}
 			},
 			func(ctx context.Context, rec *db.ReconciliationRecord) error {
 				reconCalls++
@@ -229,9 +233,9 @@ func TestRemoteCreateSuccessDbFailureCompensation(t *testing.T) {
 				verifyCalls++
 				return &xui.XUIClientInfo{Email: email}, nil // client still present
 			},
-			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) (bool, error) {
+			func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult {
 				refundCalls++
-				return true, nil
+				return SafeRefundResult{Refunded: true}
 			},
 			func(ctx context.Context, rec *db.ReconciliationRecord) error {
 				reconCalls++
@@ -261,17 +265,180 @@ func TestRemoteCreateSuccessDbFailureCompensation(t *testing.T) {
 	})
 }
 
-func TestSafeRefundWalletOutcome(t *testing.T) {
-	// When DB pool is not initialized, CreditWalletBalanceWithKey will fail.
-	// safeRefundWallet must return false and NOT claim the money was refunded.
+func TestSafeRefundWalletOutcomes(t *testing.T) {
 	ctx := context.Background()
-	refunded, err := safeRefundWallet(ctx, 100, 500, "test refund", "orig_key", "ref_key", nil, nil)
-	if refunded {
-		t.Fatal("safeRefundWallet must not report success when database write fails")
-	}
-	if err == nil {
-		t.Fatal("safeRefundWallet must return the database failure error")
-	}
+
+	// a. refund succeeds
+	t.Run("refund succeeds", func(t *testing.T) {
+		res := safeRefundWalletWithDeps(ctx, 100, 500, "refund", "orig_key", "ref_key", nil, nil,
+			func(ctx context.Context, userID int64, amount float64, description, operationKey string) error {
+				return nil
+			},
+			func(ctx context.Context, record *db.ReconciliationRecord) error {
+				t.Fatal("reconciliation must not be called when refund succeeds")
+				return nil
+			},
+		)
+		if !res.Refunded || res.AlreadyRefunded || res.RefundErr != nil {
+			t.Fatalf("expected refund success, got: %+v", res)
+		}
+		if res.ReconciliationPersisted || res.ReconciliationErr != nil {
+			t.Fatalf("unexpected reconciliation state on refund success: %+v", res)
+		}
+	})
+
+	// b. refund already applied (idempotent success)
+	t.Run("refund already applied", func(t *testing.T) {
+		res := safeRefundWalletWithDeps(ctx, 100, 500, "refund", "orig_key", "ref_key", nil, nil,
+			func(ctx context.Context, userID int64, amount float64, description, operationKey string) error {
+				return db.ErrWalletOperationAlreadyApplied
+			},
+			func(ctx context.Context, record *db.ReconciliationRecord) error {
+				t.Fatal("reconciliation must not be called when refund was already applied")
+				return nil
+			},
+		)
+		if !res.Refunded || !res.AlreadyRefunded || res.RefundErr != nil {
+			t.Fatalf("expected already refunded success, got: %+v", res)
+		}
+		if res.ReconciliationPersisted || res.ReconciliationErr != nil {
+			t.Fatalf("unexpected reconciliation state: %+v", res)
+		}
+	})
+
+	// c. refund fails but reconciliation persists
+	t.Run("refund fails but reconciliation persists", func(t *testing.T) {
+		creditErr := errors.New("db credit failure")
+		var savedRec *db.ReconciliationRecord
+		res := safeRefundWalletWithDeps(ctx, 100, 500, "refund", "orig_key", "ref_key", nil, nil,
+			func(ctx context.Context, userID int64, amount float64, description, operationKey string) error {
+				return creditErr
+			},
+			func(ctx context.Context, record *db.ReconciliationRecord) error {
+				savedRec = record
+				return nil
+			},
+		)
+		if res.Refunded || res.AlreadyRefunded {
+			t.Fatalf("refund must not report success, got: %+v", res)
+		}
+		if !errors.Is(res.RefundErr, creditErr) {
+			t.Fatalf("expected creditErr, got: %v", res.RefundErr)
+		}
+		if !res.ReconciliationPersisted || res.ReconciliationErr != nil {
+			t.Fatalf("expected reconciliation to be persisted without error, got: %+v", res)
+		}
+		if savedRec == nil || savedRec.OperationKey != "ref_key" || savedRec.Kind != "pending_refund" {
+			t.Fatalf("reconciliation record was not correctly populated: %+v", savedRec)
+		}
+	})
+
+	// d. refund fails and reconciliation persistence also fails
+	t.Run("refund fails and reconciliation persistence also fails", func(t *testing.T) {
+		creditErr := errors.New("db credit failure")
+		reconErr := errors.New("db reconciliation insert failure")
+		res := safeRefundWalletWithDeps(ctx, 100, 500, "refund", "orig_key", "ref_key", nil, nil,
+			func(ctx context.Context, userID int64, amount float64, description, operationKey string) error {
+				return creditErr
+			},
+			func(ctx context.Context, record *db.ReconciliationRecord) error {
+				return reconErr
+			},
+		)
+		if res.Refunded || res.AlreadyRefunded {
+			t.Fatalf("refund must not report success, got: %+v", res)
+		}
+		if !errors.Is(res.RefundErr, creditErr) {
+			t.Fatalf("expected creditErr, got: %v", res.RefundErr)
+		}
+		// Assert the result explicitly indicates that nothing durable was registered
+		if res.ReconciliationPersisted {
+			t.Fatalf("reconciliation must NOT report persisted when it failed, got: %+v", res)
+		}
+		if !errors.Is(res.ReconciliationErr, reconErr) {
+			t.Fatalf("expected reconErr, got: %v", res.ReconciliationErr)
+		}
+	})
+}
+
+func TestRemoteCreateCompensationReconPersistenceFailure(t *testing.T) {
+	user := &db.User{ID: 123, TelegramID: 456}
+	plan := &db.PaidPlan{ID: 1, Name: "Test Plan"}
+	client := xui.ClientConfig{Email: "user@example.com", ID: "uuid-1", SubID: "sub-1"}
+	inbounds := []int{1}
+	dbErr := errors.New("db insert failure")
+	reconInsertErr := errors.New("db reconciliation connection down")
+
+	// Case 1: delete outcome unknown, recon persistence fails
+	t.Run("delete unknown with recon persistence failure", func(t *testing.T) {
+		res := compensateRemoteCreateDbFailure(
+			context.Background(), user, plan, client, inbounds, "display", 500, "op_recon_fail", dbErr,
+			func(email string) error {
+				return &xui.WriteError{Outcome: xui.WriteUnknown, Err: errors.New("delete timeout")}
+			},
+			func(email string) (*xui.XUIClientInfo, error) {
+				return nil, errors.New("verify unavailable")
+			},
+			nil,
+			func(ctx context.Context, rec *db.ReconciliationRecord) error {
+				return reconInsertErr
+			},
+		)
+
+		if res.Outcome != CompensationReconciliationRequired {
+			t.Fatalf("expected CompensationReconciliationRequired, got %s", res.Outcome)
+		}
+		if res.Refunded {
+			t.Fatal("must not refund")
+		}
+		if !errors.Is(res.ReconErr, reconInsertErr) {
+			t.Fatalf("expected ReconErr to be returned, got: %v", res.ReconErr)
+		}
+
+		// Assert calling decision logic produces critical manual-support message rather than false registration
+		msg := formatCompensationUserMessage(res, "op_recon_fail")
+		if strings.Contains(msg, "درخواست برای بررسی پشتیبانی ثبت شد") {
+			t.Fatalf("must not claim request was successfully registered when ReconErr != nil, got: %s", msg)
+		}
+		if !strings.Contains(msg, "هیچ درخواستی به‌طور خودکار ثبت نشده است") && !strings.Contains(msg, "خطا مواجه شد") {
+			t.Fatalf("expected manual-support/failure message, got: %s", msg)
+		}
+	})
+
+	// Case 2: client still present, recon persistence fails
+	t.Run("client present with recon persistence failure", func(t *testing.T) {
+		res := compensateRemoteCreateDbFailure(
+			context.Background(), user, plan, client, inbounds, "display", 500, "op_present_recon_fail", dbErr,
+			func(email string) error {
+				return &xui.WriteError{Outcome: xui.WriteUnknown, Err: errors.New("delete timeout")}
+			},
+			func(email string) (*xui.XUIClientInfo, error) {
+				return &xui.XUIClientInfo{Email: email}, nil // client still present
+			},
+			nil,
+			func(ctx context.Context, rec *db.ReconciliationRecord) error {
+				return reconInsertErr
+			},
+		)
+
+		if res.Outcome != CompensationClientStillPresent {
+			t.Fatalf("expected CompensationClientStillPresent, got %s", res.Outcome)
+		}
+		if res.Refunded {
+			t.Fatal("must not refund")
+		}
+		if !errors.Is(res.ReconErr, reconInsertErr) {
+			t.Fatalf("expected ReconErr to be returned, got: %v", res.ReconErr)
+		}
+
+		msg := formatCompensationUserMessage(res, "op_present_recon_fail")
+		if strings.Contains(msg, "توسط پشتیبانی ثبت شد") {
+			t.Fatalf("must not claim status was registered when ReconErr != nil, got: %s", msg)
+		}
+		if !strings.Contains(msg, "هیچ درخواستی به‌طور خودکار ثبت نشده است") && !strings.Contains(msg, "خطا مواجه شد") {
+			t.Fatalf("expected manual-support/failure message, got: %s", msg)
+		}
+	})
 }
 
 type mockDeleteContext struct {
@@ -281,7 +448,7 @@ type mockDeleteContext struct {
 }
 
 func (m *mockDeleteContext) Get(key string) any {
-	if key == "db_user" {
+	if key == "db_user" || key == "user" {
 		return m.user
 	}
 	return nil
@@ -301,66 +468,130 @@ func (m *mockDeleteContext) Send(what any, opts ...any) error {
 	return nil
 }
 
+func setupResellerTestDB(t *testing.T) context.Context {
+	ctx := context.Background()
+	testURL := os.Getenv("TEST_DATABASE_URL")
+	if testURL == "" {
+		t.Skip("Skipping test: TEST_DATABASE_URL is not set (isolated test database required to protect production)")
+	}
+
+	cfg := &config.DatabaseConfig{URL: testURL}
+	if config.Global == nil {
+		config.Global = &config.Config{Database: *cfg}
+	} else {
+		config.Global.Database = *cfg
+	}
+
+	if err := db.Connect(ctx, cfg); err != nil {
+		t.Skipf("Skipping test: database connection failed: %v", err)
+	}
+
+	if err := db.Migrate(ctx); err != nil {
+		t.Skipf("Skipping test: migration failed: %v", err)
+	}
+
+	return ctx
+}
+
 func TestNilXUIClientBlocksCancellationAndRefund(t *testing.T) {
+	ctx := setupResellerTestDB(t)
+
+	prevClient := bot.XUIClient
 	bot.XUIClient = nil
-	user := &db.User{ID: 999, TelegramID: 999999}
-	subID := 12345
+	defer func() {
+		bot.XUIClient = prevClient
+	}()
+
+	testTgID := int64(99990001)
+	initialBalance := int64(100000)
+	var userID int64
+	err := db.Pool.QueryRow(ctx, `
+		INSERT INTO bot_users (telegram_id, username, first_name, status, wallet_balance)
+		VALUES ($1, 'nil_xui_user', 'NilXUI', 'approved', $2)
+		ON CONFLICT (telegram_id) DO UPDATE SET wallet_balance = $2, status = 'approved'
+		RETURNING id
+	`, testTgID, initialBalance).Scan(&userID)
+	if err != nil {
+		t.Fatalf("failed to insert test user: %v", err)
+	}
+	defer func() {
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM refund_requests WHERE user_id = $1`, userID)
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM transactions WHERE user_id = $1`, userID)
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM subscriptions WHERE user_id = $1`, userID)
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM bot_users WHERE id = $1`, userID)
+	}()
+
+	var subID int
+	err = db.Pool.QueryRow(ctx, `
+		INSERT INTO subscriptions (user_id, client_email, client_uuid, sub_id, status, plan_type, display_name, ip_limit, is_active, start_date, end_date)
+		VALUES ($1, 'nil_xui_test@example.com', 'uuid-12345', 'sub-12345', 'active', 'paid', 'Test Sub', 1, true, NOW(), NOW() + INTERVAL '30 days')
+		RETURNING id
+	`, userID).Scan(&subID)
+	if err != nil {
+		t.Fatalf("failed to insert test subscription: %v", err)
+	}
+
+	user := &db.User{
+		ID:            userID,
+		TelegramID:    testTgID,
+		Username:      "nil_xui_user",
+		Status:        "approved",
+		WalletBalance: initialBalance,
+	}
+
 	bot.FSM.SetState(user.TelegramID, "awaiting_delete_sub_confirm", map[string]interface{}{
-		"sub_id":        "12345",
+		"sub_id":        fmt.Sprintf("%d", subID),
 		"refund_amount": "50000",
 	})
 	defer bot.FSM.ClearState(user.TelegramID)
 
 	mockCtx := &mockDeleteContext{user: user}
 
-	// If DB is connected, insert sub and test; otherwise test that HandleDeleteSubscription
-	// returns without cancelling or refunding when XUI is nil.
-	if db.Pool != nil {
-		ctx := context.Background()
-		_, _ = db.Pool.Exec(ctx, `DELETE FROM subscriptions WHERE id = $1`, subID)
-		_, _ = db.Pool.Exec(ctx, `DELETE FROM refund_requests WHERE subscription_id = $1`, subID)
-		_, _ = db.Pool.Exec(ctx, `
-			INSERT INTO subscriptions (id, user_id, client_email, client_uuid, sub_id, status, plan_type, display_name, ip_limit, is_active, start_date)
-			VALUES ($1, $2, 'nil_xui_test@example.com', 'uuid-12345', 'sub-12345', 'active', 'paid', 'Test Sub', 1, true, NOW())
-		`, subID, user.ID)
-		defer func() {
-			_, _ = db.Pool.Exec(ctx, `DELETE FROM subscriptions WHERE id = $1`, subID)
-			_, _ = db.Pool.Exec(ctx, `DELETE FROM refund_requests WHERE subscription_id = $1`, subID)
-		}()
+	err = HandleDeleteSubscription(mockCtx)
+	if err != nil {
+		t.Fatalf("HandleDeleteSubscription returned unexpected error: %v", err)
+	}
 
-		err := HandleDeleteSubscription(mockCtx)
-		if err != nil {
-			t.Fatalf("HandleDeleteSubscription returned unexpected error: %v", err)
-		}
+	// Verify user received failure message
+	if mockCtx.sentText == "" {
+		t.Fatal("expected failure message sent to user, got empty string")
+	}
 
-		// Verify user received failure message
-		if mockCtx.sentText == "" {
-			t.Fatal("expected failure message sent to user, got empty string")
-		}
+	// Invariant 1: Local subscription MUST NOT be cancelled (remains active)
+	sub, err := db.GetSubscriptionByID(ctx, subID)
+	if err != nil || sub == nil {
+		t.Fatalf("subscription must exist: %v", err)
+	}
+	if sub.Status != "active" {
+		t.Fatalf("subscription status must remain active, got %s", sub.Status)
+	}
 
-		// Invariant 1: Local subscription MUST NOT be cancelled
-		sub, err := db.GetSubscriptionByID(ctx, subID)
-		if err != nil || sub == nil {
-			t.Fatalf("subscription must exist: %v", err)
-		}
-		if sub.Status != "active" {
-			t.Fatalf("subscription status must remain active, got %s", sub.Status)
-		}
+	// Invariant 2: No refund request must be created
+	var refundCount int
+	err = db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM refund_requests WHERE subscription_id = $1`, subID).Scan(&refundCount)
+	if err != nil {
+		t.Fatalf("failed to query refund_requests: %v", err)
+	}
+	if refundCount != 0 {
+		t.Fatalf("expected 0 refund requests, got %d", refundCount)
+	}
 
-		// Invariant 2: No refund request must be created
-		var refundCount int
-		err = db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM refund_requests WHERE subscription_id = $1`, subID).Scan(&refundCount)
-		if err != nil {
-			t.Fatalf("failed to query refund_requests: %v", err)
-		}
-		if refundCount != 0 {
-			t.Fatalf("expected 0 refund requests, got %d", refundCount)
-		}
-	} else {
-		// When DB is not connected, HandleDeleteSubscription still must not panic or proceed
-		err := HandleDeleteSubscription(mockCtx)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
+	// Invariant 3: No wallet transactions created and wallet balance untouched
+	var txCount int
+	err = db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE user_id = $1`, userID).Scan(&txCount)
+	if err != nil {
+		t.Fatalf("failed to query transactions: %v", err)
+	}
+	if txCount != 0 {
+		t.Fatalf("expected 0 transactions for user, got %d", txCount)
+	}
+
+	var currentBalance int64
+	err = db.Pool.QueryRow(ctx, `SELECT wallet_balance FROM bot_users WHERE id = $1`, userID).Scan(&currentBalance)
+	if err != nil {
+		t.Fatalf("failed to query current wallet_balance: %v", err)
+	}
+	if currentBalance != initialBalance {
+		t.Fatalf("expected wallet balance unchanged (%d), got %d", initialBalance, currentBalance)
 	}
 }

@@ -14,21 +14,20 @@ import (
 func setupTestDB(t *testing.T) context.Context {
 	ctx := context.Background()
 
-	// Locate config.yaml. In tests, the working directory is internal/db,
-	// so the config file is two levels up: ../../config.yaml.
-	configFile := "../../config.yaml"
-	if _, err := os.Stat(configFile); err != nil {
-		t.Skipf("Skipping test: config file not found at %s: %v", configFile, err)
+	testURL := os.Getenv("TEST_DATABASE_URL")
+	if testURL == "" {
+		t.Skip("Skipping test: TEST_DATABASE_URL is not set (isolated test database required to protect production)")
 	}
 
-	err := config.Load(configFile)
-	if err != nil {
-		t.Skipf("Skipping test: failed to load config: %v", err)
+	cfg := &config.DatabaseConfig{URL: testURL}
+	if config.Global == nil {
+		config.Global = &config.Config{Database: *cfg}
+	} else {
+		config.Global.Database = *cfg
 	}
 
-	// Connect
-	t.Logf("Connecting to database: Host=%s, Port=%d, User=%s, DBName=%s", config.Global.Database.Host, config.Global.Database.Port, config.Global.Database.User, config.Global.Database.DBName)
-	err = Connect(ctx, &config.Global.Database)
+	t.Logf("Connecting to test database via TEST_DATABASE_URL")
+	err := Connect(ctx, cfg)
 	if err != nil {
 		t.Skipf("Skipping test: database connection failed: %v", err)
 	}
