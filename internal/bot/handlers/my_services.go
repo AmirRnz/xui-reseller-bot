@@ -508,31 +508,32 @@ func HandleDeleteSubscription(c telebot.Context) error {
 	}
 
 	// Delete from panel
-	if bot.XUIClient != nil {
-		deleteErr := bot.XUIClient.DeleteClient(sub.ClientEmail)
-		resolution, _ := orchestrateDeleteOutcome(
-			deleteErr,
-			func() (*xui.XUIClientInfo, error) {
-				return bot.XUIClient.GetClientByEmail(sub.ClientEmail)
-			},
-			nil,
-			func(deleteErr, verifyErr error) error {
-				persistDeleteReconciliation(sub, user, refundAmount, deleteErr, verifyErr)
-				return nil
-			},
-		)
-		switch resolution {
-		case deleteConfirmed:
-			// A confirmed missing client is already in the desired remote state.
-		case deleteStillPresent:
-			// The client is still present, so this attempt definitely did not
-			// apply. Keep all financial/commercial state unchanged.
-			return c.Send("حذف اشتراک از پنل تایید نشد؛ اشتراک در دیتابیس و وضعیت مالی شما بدون تغییر باقی ماند.")
-		case deleteReconciliationRequired:
-			return c.Send("نتیجه حذف اشتراک از پنل نامشخص است؛ هیچ تغییر مالی انجام نشد و عملیات برای تطبیق ثبت شد.")
-		default:
-			return c.Send("خطا در حذف اشتراک از پنل 3x-ui. لطفا با پشتیبانی تماس بگیرید.")
-		}
+	if bot.XUIClient == nil {
+		return c.Send("خطا: ارتباط با پنل برقرار نیست؛ حذف سرویس و استرداد وجه بدون تایید حذف در پنل امکان‌پذیر نیست.")
+	}
+	deleteErr := bot.XUIClient.DeleteClient(sub.ClientEmail)
+	resolution, _ := orchestrateDeleteOutcome(
+		deleteErr,
+		func() (*xui.XUIClientInfo, error) {
+			return bot.XUIClient.GetClientByEmail(sub.ClientEmail)
+		},
+		nil,
+		func(deleteErr, verifyErr error) error {
+			persistDeleteReconciliation(sub, user, refundAmount, deleteErr, verifyErr)
+			return nil
+		},
+	)
+	switch resolution {
+	case deleteConfirmed:
+		// A confirmed missing client is already in the desired remote state.
+	case deleteStillPresent:
+		// The client is still present, so this attempt definitely did not
+		// apply. Keep all financial/commercial state unchanged.
+		return c.Send("حذف اشتراک از پنل تایید نشد؛ اشتراک در دیتابیس و وضعیت مالی شما بدون تغییر باقی ماند.")
+	case deleteReconciliationRequired:
+		return c.Send("نتیجه حذف اشتراک از پنل نامشخص است؛ هیچ تغییر مالی انجام نشد و عملیات برای تطبیق ثبت شد.")
+	default:
+		return c.Send("خطا در حذف اشتراک از پنل 3x-ui. لطفا با پشتیبانی تماس بگیرید.")
 	}
 
 	var req *db.RefundRequest
@@ -784,8 +785,12 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 			}
 			return c.Send("نتیجه ارتقای پنل نامشخص است؛ مبلغ بازگردانده نشد و سرویس برای تطبیق ثبت شد.")
 		}
-		_ = db.CreditWalletBalanceWithKey(context.Background(), user.ID, cost, "refund failed IP upgrade", operationKey+":refund")
-		return c.Send("خطا در بروزرسانی پنل. مبلغ ارتقا به کیف پول شما برگشت داده شد.")
+		subID64 := int64(sub.ID)
+		refunded, refErr := safeRefundWallet(context.Background(), user.ID, cost, "refund failed IP upgrade", operationKey, operationKey+":refund", &subID64, map[string]any{"subscription_id": sub.ID, "target_limit": newLimit})
+		if refunded {
+			return c.Send("خطا در بروزرسانی پنل. مبلغ ارتقا به کیف پول شما برگشت داده شد.")
+		}
+		return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد (%v). عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", refErr, operationKey+":refund"))
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		desiredActive := sub.IsActive
@@ -1087,8 +1092,12 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 			}
 			return c.Send("نتیجه تمدید در پنل نامشخص است؛ مبلغ بازگردانده نشد و وضعیت برای تطبیق ثبت شد.")
 		}
-		_ = db.CreditWalletBalanceWithKey(context.Background(), user.ID, cost, "refund failed extension", operationKey+":refund")
-		return c.Send("خطا در بروزرسانی پنل. مبلغ تمدید به کیف پول شما بازگردانده شد.")
+		subID64 := int64(sub.ID)
+		refunded, refErr := safeRefundWallet(context.Background(), user.ID, cost, "refund failed extension", operationKey, operationKey+":refund", &subID64, map[string]any{"subscription_id": sub.ID, "months": months})
+		if refunded {
+			return c.Send("خطا در بروزرسانی پنل. مبلغ تمدید به کیف پول شما بازگردانده شد.")
+		}
+		return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول با خطا مواجه شد (%v). عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", refErr, operationKey+":refund"))
 	}
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
 		sub.EndDate = oldEnd
@@ -1217,7 +1226,7 @@ func paidPlanForSub(sub *db.Subscription) (*db.PaidPlan, error) {
 
 func updateXUIFromSubscription(sub *db.Subscription) error {
 	if bot.XUIClient == nil {
-		return nil
+		return ErrXUIClientUnavailable
 	}
 	client := clientConfigFromSubscription(sub, sub.ClientEmail)
 	client.Enable = sub.IsActive
@@ -1226,7 +1235,7 @@ func updateXUIFromSubscription(sub *db.Subscription) error {
 
 func updateXUIRename(oldEmail string, sub *db.Subscription) error {
 	if bot.XUIClient == nil {
-		return nil
+		return ErrXUIClientUnavailable
 	}
 	client := clientConfigFromSubscription(sub, sub.ClientEmail)
 	client.Enable = sub.IsActive
