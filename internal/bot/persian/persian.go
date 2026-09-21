@@ -18,7 +18,7 @@ const (
 	BtnAdmin        = "⚙️ پنل مدیریت"
 	BtnRefresh      = "🔄 بروزرسانی"
 	BtnExtend       = "🔄 تمدید اشتراک"
-	BtnUpgradeIP    = "👥 افزایش کاربر همزمان"
+	BtnUpgradeIP    = "📶 افزایش سقف آی‌پی همزمان"
 	BtnGetLink      = "🔗 دریافت لینک اتصال"
 	BtnToggleStatus = "⏯ قطع / وصل سرویس"
 	BtnRename       = "✏️ تغییر نام سرویس"
@@ -82,9 +82,9 @@ func FormatTraffic(bytes int64) string {
 // FormatIPLimit formats concurrent IP connection limits with explicit Persian phrasing.
 func FormatIPLimit(limit int) string {
 	if limit <= 0 {
-		limit = 1
+		return "نامحدود"
 	}
-	return fmt.Sprintf("%d کاربر همزمان (آی‌پی)", limit)
+	return fmt.Sprintf("حداکثر %d آی‌پی همزمان", limit)
 }
 
 // FormatDuration formats duration in days.

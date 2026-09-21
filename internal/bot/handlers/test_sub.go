@@ -220,7 +220,8 @@ func createAndSendTest(c telebot.Context, user *db.User, plan *db.TestPlan, emai
 		}
 	}
 	if err != nil {
-		return c.Send("خطا در ایجاد اشتراک تست در پنل: " + err.Error())
+		log.Printf("[ERROR] Failed to add test client %s to XUI: %v", email, err)
+		return c.Send("خطا در ایجاد اشتراک تست در پنل. لطفا دقایقی دیگر مجددا تلاش کنید.")
 	}
 
 	planID := int(plan.ID)

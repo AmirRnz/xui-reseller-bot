@@ -79,6 +79,10 @@ func GetSubscriptionByID(ctx context.Context, id int) (*Subscription, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
+	if Pool == nil {
+		return nil, errors.New("database pool is not initialized")
+	}
+
 	row := Pool.QueryRow(ctx, subscriptionSelect()+` WHERE id = $1`, id)
 	s, err := scanSubscriptionRow(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -91,6 +95,10 @@ func GetSubscriptionByEmail(ctx context.Context, email string) (*Subscription, e
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
+	if Pool == nil {
+		return nil, errors.New("database pool is not initialized")
+	}
+
 	row := Pool.QueryRow(ctx, subscriptionSelect()+` WHERE client_email = $1`, email)
 	s, err := scanSubscriptionRow(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -102,6 +110,10 @@ func GetSubscriptionByEmail(ctx context.Context, email string) (*Subscription, e
 func CreateSubscription(ctx context.Context, s *Subscription) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
+
+	if Pool == nil {
+		return errors.New("database pool is not initialized")
+	}
 
 	if s.Status == "" {
 		s.Status = "active"

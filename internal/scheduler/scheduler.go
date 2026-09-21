@@ -33,8 +33,11 @@ func run(ctx context.Context) {
 			return
 		case <-time.After(time.Until(nextRun)):
 			log.Println("Running daily scheduler tasks...")
-			processExpiringSubscriptions(ctx)
-			_ = db.SetSetting(ctx, "last_scheduler_run", time.Now().UTC().Format("2006-01-02"))
+			if err := processExpiringSubscriptions(ctx); err != nil {
+				log.Printf("Scheduler: processExpiringSubscriptions failed: %v", err)
+			} else {
+				_ = db.SetSetting(ctx, "last_scheduler_run", time.Now().UTC().Format("2006-01-02"))
+			}
 		}
 	}
 }
@@ -44,8 +47,11 @@ func checkAndRunScheduler(ctx context.Context) {
 	lastRun, err := db.GetSetting(ctx, "last_scheduler_run")
 	if err != nil || lastRun != todayStr {
 		log.Println("Scheduler: Check has not run today yet. Running now...")
-		processExpiringSubscriptions(ctx)
-		_ = db.SetSetting(ctx, "last_scheduler_run", todayStr)
+		if err := processExpiringSubscriptions(ctx); err != nil {
+			log.Printf("Scheduler: initial check failed: %v", err)
+		} else {
+			_ = db.SetSetting(ctx, "last_scheduler_run", todayStr)
+		}
 	} else {
 		log.Println("Scheduler: Check already ran today.")
 	}
@@ -56,26 +62,30 @@ func nextMidnightUTC() time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
 }
 
-func processExpiringSubscriptions(ctx context.Context) {
+func processExpiringSubscriptions(ctx context.Context) error {
+	var overallErr error
 	for _, days := range notificationDays(ctx) {
 		subs, err := db.GetExpiringSubscriptions(ctx, days)
 		if err != nil {
 			log.Printf("Scheduler: Error getting expiring subscriptions: %v", err)
+			overallErr = err
 			continue
 		}
 
 		for _, sub := range subs {
 			select {
 			case <-ctx.Done():
-				return
+				return ctx.Err()
 			default:
 			}
 
 			if err := outbox.EnqueueExpiryNotification(ctx, int64(sub.ID), sub.UserID, days, sub.ClientEmail, sub.EndDate.Format("2006-01-02")); err != nil {
 				log.Printf("Scheduler: failed to enqueue notification for sub %d: %v", sub.ID, err)
+				overallErr = err
 			}
 		}
 	}
+	return overallErr
 }
 
 func notificationDays(ctx context.Context) []int {

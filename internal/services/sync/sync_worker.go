@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -112,6 +113,19 @@ func (w *SyncWorker) RunSync(ctx context.Context) {
 		if xui.IsNotFound(err) {
 			log.Printf("[DRIFT: %s] Subscription %d (%s) absent on 3x-ui panel", DriftRemoteMissing, sub.id, sub.email)
 			_ = db.MarkSubscriptionReconciliationRequired(ctx, sub.id, nil, nil, nil, "remote client missing on panel")
+			subIDVal := int64(sub.id)
+			record := &db.ReconciliationRecord{
+				OperationKey:   fmt.Sprintf("drift:missing:%d", sub.id),
+				Kind:           "subscription_remote_missing",
+				UserID:         &sub.userID,
+				SubscriptionID: &subIDVal,
+				DesiredState:   map[string]any{"subscription_id": sub.id, "email": sub.email},
+				ObservedState:  map[string]any{"status": "not_found"},
+				ErrorMessage:   "remote client absent on panel during sync",
+			}
+			if recErr := db.CreateReconciliationRecord(ctx, record); recErr != nil {
+				log.Printf("[SYNC] Failed to create reconciliation record for missing sub %d: %v", sub.id, recErr)
+			}
 			continue
 		}
 		if err != nil {
@@ -133,6 +147,19 @@ func (w *SyncWorker) RunSync(ctx context.Context) {
 			if updateErr == nil {
 				log.Printf("[SYNC] First-connection activation detected for %s (sub %d). EndDate set to %s",
 					sub.email, sub.id, newEndDate.Format("2006-01-02 15:04:05"))
+			} else {
+				log.Printf("[SYNC] Failed to update DB on activation for sub %d: %v", sub.id, updateErr)
+				subIDVal := int64(sub.id)
+				record := &db.ReconciliationRecord{
+					OperationKey:   fmt.Sprintf("drift:db_failed:%d", sub.id),
+					Kind:           "subscription_update_db_failed",
+					UserID:         &sub.userID,
+					SubscriptionID: &subIDVal,
+					DesiredState:   map[string]any{"subscription_id": sub.id, "email": sub.email, "expire_time": newExp, "end_date": newEndDate.Format(time.RFC3339), "is_active": remote.Enable},
+					ObservedState:  map[string]any{"db_error": updateErr.Error()},
+					ErrorMessage:   updateErr.Error(),
+				}
+				_ = db.CreateReconciliationRecord(ctx, record)
 			}
 		} else {
 			_, _ = db.Pool.Exec(ctx, `UPDATE subscriptions SET updated_at = NOW() WHERE id = $1`, sub.id)

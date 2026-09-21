@@ -139,6 +139,8 @@ func HandleText(c telebot.Context) error {
 			return ProcessAdminPlanAccess(c, text)
 		case "awaiting_service_name":
 			return ProcessServiceName(c, text)
+		case "awaiting_admin_reconcile_close_reason":
+			return ProcessAdminReconcileCloseReason(c, text)
 		}
 	}
 

@@ -255,3 +255,52 @@ func GetManualReviewReconciliationRecords(ctx context.Context, limit int) ([]*Re
 	}
 	return records, rows.Err()
 }
+
+func GetReconciliationRecordByID(ctx context.Context, id int64) (*ReconciliationRecord, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return nil, errors.New("database pool is not initialized")
+	}
+
+	r := &ReconciliationRecord{}
+	var desiredBytes, observedBytes []byte
+	err := Pool.QueryRow(ctx, `
+		SELECT id, operation_key, kind, user_id, subscription_id, purchase_request_id,
+		       desired_state, observed_state, status, error_message, attempt_count,
+		       next_attempt_at, locked_at, locked_by, resolved_at, resolution,
+		       manual_review_reason, created_at, updated_at
+		FROM reconciliation_records
+		WHERE id = $1
+	`, id).Scan(
+		&r.ID, &r.OperationKey, &r.Kind, &r.UserID, &r.SubscriptionID, &r.PurchaseRequestID,
+		&desiredBytes, &observedBytes, &r.Status, &r.ErrorMessage, &r.AttemptCount,
+		&r.NextAttemptAt, &r.LockedAt, &r.LockedBy, &r.ResolvedAt, &r.Resolution,
+		&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	_ = json.Unmarshal(desiredBytes, &r.DesiredState)
+	_ = json.Unmarshal(observedBytes, &r.ObservedState)
+	return r, nil
+}
+
+func ResetReconciliationForRetry(ctx context.Context, id int64) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return errors.New("database pool is not initialized")
+	}
+	_, err := Pool.Exec(ctx, `
+		UPDATE reconciliation_records
+		SET status = 'pending', next_attempt_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		WHERE id = $1
+	`, id)
+	return err
+}

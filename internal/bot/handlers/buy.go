@@ -38,6 +38,10 @@ func HandleBuySubFlow(c telebot.Context) error {
 		return c.Send("خطا در بارگذاری اطلاعات حساب کاربری.")
 	}
 
+	if bot.XUIClient == nil {
+		return maybeEditOrSend(c, "⚠️ ارتباط با سرور سرویس‌دهنده موقتاً قطع است. لطفاً دقایقی دیگر مجدداً تلاش فرمایید.")
+	}
+
 	plans, err := db.GetPaidPlansForUser(context.Background(), user.ID, false)
 	if err != nil {
 		return c.Send("خطا در بارگذاری طرح‌های خرید.")
@@ -515,7 +519,10 @@ func ProcessBuyCustomName(c telebot.Context, customName string) error {
 		DataGB:       dataGB,
 		OperationKey: opKey,
 	})
-	_ = pricing.SaveQuote(context.Background(), quote)
+	if err := pricing.SaveQuote(context.Background(), quote); err != nil {
+		log.Printf("[ERROR] failed to persist quote for user %d: %v", user.ID, err)
+		return c.Send("خطا در ایجاد پیش‌فاکتور خرید. لطفا مجددا تلاش کنید.")
+	}
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
 		"plan_id":         fmt.Sprintf("%d", plan.ID),
@@ -612,7 +619,10 @@ func HandleBuyAutoName(c telebot.Context) error {
 		DataGB:       dataGB,
 		OperationKey: opKey,
 	})
-	_ = pricing.SaveQuote(context.Background(), quote)
+	if err := pricing.SaveQuote(context.Background(), quote); err != nil {
+		log.Printf("[ERROR] failed to persist quote for user %d: %v", user.ID, err)
+		return c.Send("خطا در ایجاد پیش‌فاکتور خرید. لطفا مجددا تلاش کنید.")
+	}
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
 		"plan_id":         fmt.Sprintf("%d", plan.ID),
@@ -699,37 +709,38 @@ func HandleBuyConfirm(c telebot.Context) error {
 		return c.Send("این نام اشتراک در همین حین توسط شخص دیگری گرفته شد. لطفا فرآیند خرید را مجددا شروع کنید.")
 	}
 
-	var quoteID *int64
+	var quote *pricing.PurchaseQuote
+	var quoteErr error
 	if qIDStr, ok := state.Data["quote_id"]; ok && qIDStr != "" {
 		if qID, err := strconv.ParseInt(fmt.Sprintf("%v", qIDStr), 10, 64); err == nil && qID > 0 {
-			quoteID = &qID
+			quote, quoteErr = pricing.GetQuoteByID(context.Background(), qID)
 		}
 	}
-	var priceToman int64
-	if ptStr, ok := state.Data["price_toman"]; ok && ptStr != "" {
-		priceToman, _ = strconv.ParseInt(fmt.Sprintf("%v", ptStr), 10, 64)
-	}
-	if priceToman <= 0 {
-		quote := pricing.CalculateQuote(pricing.QuoteParams{
-			UserID:       user.ID,
-			Plan:         plan,
-			Months:       months,
-			IPLimit:      ipLimit,
-			DataGB:       dataGB,
-			OperationKey: operationKey,
-		})
-		if quote != nil {
-			priceToman = quote.FinalPriceToman
-			if quoteID == nil {
-				_ = pricing.SaveQuote(context.Background(), quote)
-				if quote.ID > 0 {
-					quoteID = &quote.ID
-				}
-			}
+	if quote == nil && quoteErr == nil {
+		if quoteKey := fmt.Sprintf("%v", state.Data["quote_key"]); quoteKey != "" {
+			quote, quoteErr = pricing.GetQuoteByKey(context.Background(), quoteKey)
 		}
+	}
+	if quoteErr != nil || quote == nil {
+		log.Printf("[ERROR] valid quote not found in db for user %d (err: %v)", user.ID, quoteErr)
+		return c.Send("پیش‌فاکتور معتبر یافت نشد. لطفا فرآیند خرید را مجددا شروع کنید.")
+	}
+	if quote.UserID != user.ID {
+		log.Printf("[SECURITY] quote %d belongs to user %d, but user %d attempted to confirm", quote.ID, quote.UserID, user.ID)
+		return c.Send("پیش‌فاکتور متعلق به شما نیست.")
+	}
+
+	priceToman := quote.FinalPriceToman
+	quoteID := &quote.ID
+
+	if bot.XUIClient == nil {
+		return c.Send("⚠️ ارتباط با سرور سرویس‌دهنده موقتاً قطع است. لطفاً دقایقی دیگر مجدداً تلاش فرمایید.")
 	}
 
 	if err := db.DebitWalletBalanceWithKey(context.Background(), user.ID, float64(priceToman), "subscription purchase: "+email, operationKey); err != nil {
+		if errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
+			return c.Send("این خرید قبلا پردازش شده یا در وضعیت تطبیق قرار دارد.")
+		}
 		return c.Send("موجودی کیف پول شما کافی نیست. لطفا ابتدا کیف پول خود را شارژ کنید یا از گزینه پرداخت مستقیم استفاده کنید.")
 	}
 
@@ -742,10 +753,29 @@ func HandleBuyConfirm(c telebot.Context) error {
 			return c.Send(formatCompensationUserMessage(compErr.Result, operationKey))
 		}
 		if xui.IsUnknownOutcome(err) {
+			userID := user.ID
+			var unknownCreate *paidSubscriptionCreateUnknownError
+			desired := map[string]any{
+				"email": email, "display_name": name, "months": months,
+				"ip_limit": ipLimit, "data_gb": dataGB, "plan_id": plan.ID,
+				"operation_key": operationKey,
+			}
+			if errors.As(err, &unknownCreate) {
+				desired["client"] = unknownCreate.Request.Client
+				desired["inbound_ids"] = unknownCreate.Request.InboundIDs
+				desired["client_id"] = unknownCreate.Request.Client.ID
+				desired["client_uuid"] = unknownCreate.Request.Client.ID
+				desired["sub_id"] = unknownCreate.Request.Client.SubID
+				desired["enable"] = unknownCreate.Request.Client.Enable
+				desired["expiry_time"] = unknownCreate.Request.Client.ExpiryTime
+				desired["limit_ip"] = unknownCreate.Request.Client.LimitIP
+				desired["total_gb"] = unknownCreate.Request.Client.TotalGB
+			}
 			record := &db.ReconciliationRecord{
-				OperationKey:  operationKey + ":reconciliation",
+				OperationKey:  operationKey + ":provisioning",
 				Kind:          "purchase_provisioning_unknown",
-				DesiredState:  map[string]any{"email": email, "months": months, "ip_limit": ipLimit, "data_gb": dataGB},
+				UserID:        &userID,
+				DesiredState:  desired,
 				ObservedState: map[string]any{"outcome": "unknown"},
 				ErrorMessage:  err.Error(),
 			}
@@ -845,7 +875,8 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 	clientUUID := makeClientUUID()
 	client := prepareClientConfig(email, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, ipLimit, plan.Flow, subID, clientUUID, plan.Name, user)
 
-	err := bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: inboundIDs})
+	request := xui.AddClientRequest{Client: client, InboundIDs: inboundIDs}
+	err := bot.XUIClient.AddClient(request)
 	if err != nil && !xui.IsUnknownOutcome(err) {
 		log.Printf("XUI AddClient failed: %v. Refreshing cache and retrying...", err)
 		if bot.XUIClient.Cache != nil {
@@ -855,11 +886,15 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 				if len(newInboundIDs) == 0 {
 					return fmt.Errorf("این طرح پس از بروزرسانی هیچ کانکشن معتبری ندارد")
 				}
-				err = bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: newInboundIDs})
+				request.InboundIDs = newInboundIDs
+				err = bot.XUIClient.AddClient(request)
 			}
 		}
 	}
 	if err != nil {
+		if xui.IsUnknownOutcome(err) {
+			return &paidSubscriptionCreateUnknownError{cause: err, Request: request}
+		}
 		return err
 	}
 
@@ -942,4 +977,23 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 		_ = c.Send(detailsMsg+"\n`"+subLink+"`", telebot.ModeMarkdown)
 	}
 	return showMainMenu(c, user)
+}
+
+type paidSubscriptionCreateUnknownError struct {
+	cause   error
+	Request xui.AddClientRequest
+}
+
+func (e *paidSubscriptionCreateUnknownError) Error() string {
+	if e == nil || e.cause == nil {
+		return "x-ui paid subscription create outcome is unknown"
+	}
+	return e.cause.Error()
+}
+
+func (e *paidSubscriptionCreateUnknownError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }

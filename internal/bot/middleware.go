@@ -21,7 +21,7 @@ func AuthMiddleware() telebot.MiddlewareFunc {
 
 			if err != nil {
 				log.Printf("AuthMiddleware: DB error: %v", err)
-				return c.Send("An internal error occurred.")
+				return c.Send("خطای داخلی رخ داد. لطفا مجددا تلاش کنید.")
 			}
 
 			if user == nil {
@@ -35,12 +35,12 @@ func AuthMiddleware() telebot.MiddlewareFunc {
 				}
 				if err := db.CreateUser(context.Background(), user); err != nil {
 					log.Printf("AuthMiddleware: Failed to create user: %v", err)
-					return c.Send("خطایی در ثبت نام شما رخ داد.") // "An error occurred in registering you."
+					return c.Send("خطایی در ثبت نام شما رخ داد.")
 				}
 			}
 
 			if user.Status == "banned" {
-				return c.Send("You are banned from using this bot.")
+				return c.Send("حساب کاربری شما مسدود شده است.")
 			}
 
 			c.Set("user", user)
@@ -65,7 +65,7 @@ func AdminMiddleware(adminCfg *config.AdminConfig) telebot.MiddlewareFunc {
 			}
 
 			if !isAdmin {
-				return c.Send("You do not have permission to use this command.")
+				return c.Send("شما دسترسی لازم برای استفاده از این بخش را ندارید.")
 			}
 
 			return next(c)

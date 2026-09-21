@@ -855,15 +855,18 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 		if id > 0 {
 			orig, err := db.GetTestPlanByID(ctx, id)
 			if err != nil {
-				return c.Send("خطا در دریافت اطلاعات طرح قبلی: " + err.Error())
+				log.Printf("[ERROR] Failed to retrieve test plan %d: %v", id, err)
+				return c.Send("خطا در بازیابی اطلاعات طرح.")
 			}
 
 			if err := db.UpdateTestPlan(ctx, plan); err != nil {
-				return c.Send("خطا در به‌روزرسانی طرح تست: " + err.Error())
+				log.Printf("[ERROR] Failed to update test plan %d: %v", id, err)
+				return c.Send("خطا در به‌روزرسانی طرح تست.")
 			}
 
 			if err := db.SetPlanUserAccess(ctx, db.PlanTypeTest, id, allowedUserIDs); err != nil {
-				return c.Send("طرح به‌روزرسانی شد، اما ذخیره دسترسی اختصاصی ناموفق بود: " + err.Error())
+				log.Printf("[ERROR] Failed to save test plan %d user access: %v", id, err)
+				return c.Send("طرح به‌روزرسانی شد، اما ذخیره دسترسی اختصاصی ناموفق بود.")
 			}
 
 			if orig != nil && draftGetBool(draft, "sync_subs") {
@@ -876,11 +879,13 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 			_ = c.Send(fmt.Sprintf("✅ طرح تست شماره %d با موفقیت به‌روزرسانی شد: %s", id, name))
 		} else {
 			if err := db.CreateTestPlan(ctx, plan); err != nil {
-				return c.Send("خطا در ایجاد طرح تست: " + err.Error())
+				log.Printf("[ERROR] Failed to create test plan: %v", err)
+				return c.Send("خطا در ایجاد طرح تست.")
 			}
 
 			if err := db.SetPlanUserAccess(ctx, db.PlanTypeTest, plan.ID, allowedUserIDs); err != nil {
-				return c.Send("طرح ایجاد شد، اما ذخیره دسترسی اختصاصی ناموفق بود: " + err.Error())
+				log.Printf("[ERROR] Failed to save new test plan user access: %v", err)
+				return c.Send("طرح ایجاد شد، اما ذخیره دسترسی اختصاصی ناموفق بود.")
 			}
 
 			notifyApprovedUsers("🧪 طرح تست جدید در دسترس قرار گرفت: " + plan.Name)
@@ -925,15 +930,18 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 		if id > 0 {
 			orig, err := db.GetPaidPlanByID(ctx, id)
 			if err != nil {
-				return c.Send("خطا در دریافت اطلاعات طرح قبلی: " + err.Error())
+				log.Printf("[ERROR] Failed to retrieve paid plan %d: %v", id, err)
+				return c.Send("خطا در بازیابی اطلاعات طرح.")
 			}
 
 			if err := db.UpdatePaidPlan(ctx, plan); err != nil {
-				return c.Send("خطا در به‌روزرسانی طرح خرید: " + err.Error())
+				log.Printf("[ERROR] Failed to update paid plan %d: %v", id, err)
+				return c.Send("خطا در به‌روزرسانی طرح خرید.")
 			}
 
 			if err := db.SetPlanUserAccess(ctx, db.PlanTypePaid, id, allowedUserIDs); err != nil {
-				return c.Send("طرح به‌روزرسانی شد، اما ذخیره دسترسی اختصاصی ناموفق بود: " + err.Error())
+				log.Printf("[ERROR] Failed to save paid plan %d user access: %v", id, err)
+				return c.Send("طرح به‌روزرسانی شد، اما ذخیره دسترسی اختصاصی ناموفق بود.")
 			}
 
 			if orig != nil && draftGetBool(draft, "sync_subs") {
@@ -946,11 +954,13 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 			_ = c.Send(fmt.Sprintf("✅ طرح خرید شماره %d با موفقیت به‌روزرسانی شد: %s", id, name))
 		} else {
 			if err := db.CreatePaidPlan(ctx, plan); err != nil {
-				return c.Send("خطا در ایجاد طرح خرید: " + err.Error())
+				log.Printf("[ERROR] Failed to create paid plan: %v", err)
+				return c.Send("خطا در ایجاد طرح خرید.")
 			}
 
 			if err := db.SetPlanUserAccess(ctx, db.PlanTypePaid, plan.ID, allowedUserIDs); err != nil {
-				return c.Send("طرح ایجاد شد، اما ذخیره دسترسی اختصاصی ناموفق بود: " + err.Error())
+				log.Printf("[ERROR] Failed to save new paid plan user access: %v", err)
+				return c.Send("طرح ایجاد شد، اما ذخیره دسترسی اختصاصی ناموفق بود.")
 			}
 
 			notifyApprovedUsers("💼 طرح خرید جدید در دسترس قرار گرفت: " + plan.Name)
@@ -1359,7 +1369,8 @@ func HandleAdminPlanDelete(c telebot.Context) error {
 		return c.Send("طرح نامعتبر است.")
 	}
 	if err := db.DeletePlan(context.Background(), planType, planID); err != nil {
-		return c.Send("خطا در حذف طرح: " + err.Error())
+		log.Printf("[ERROR] Failed to delete plan %s %d: %v", planType, planID, err)
+		return c.Send("خطا در حذف طرح.")
 	}
 	_ = c.Respond(&telebot.CallbackResponse{Text: "🗑 طرح حذف شد."})
 	return HandleAdminPlans(c)

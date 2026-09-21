@@ -717,7 +717,7 @@ func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, 
 		if sub.EndDate.Before(nowUTC()) {
 			sub.EndDate = nowUTC()
 		}
-		sub.EndDate = sub.EndDate.AddDate(0, req.Months, 0)
+		sub.EndDate = sub.EndDate.Add(time.Duration(req.Months) * 30 * 24 * time.Hour)
 		newExpiryMilli = sub.EndDate.UnixMilli()
 		sub.ExpireTime = &newExpiryMilli
 		newExpiryLabel = sub.EndDate.Format("2006-01-02")

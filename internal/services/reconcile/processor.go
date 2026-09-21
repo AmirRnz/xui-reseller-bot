@@ -8,17 +8,41 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"strconv"
 	"time"
 
 	"xui-reseller-bot/internal/db"
 	"xui-reseller-bot/internal/xui"
 )
 
+type RemotePresenceState int
+
+const (
+	RemotePresenceUnknown RemotePresenceState = iota
+	RemoteConfirmedPresent
+	RemoteConfirmedAbsent
+)
+
+// ClassifyRemoteClient classifies remote existence according to strict roadmap invariants:
+// - xui.IsNotFound(err) => confirmed absent
+// - err != nil => unknown/ambiguous
+// - err == nil && client == nil => unknown/anomalous
+// - err == nil && client != nil => confirmed present
+func ClassifyRemoteClient(client *xui.XUIClientInfo, err error) RemotePresenceState {
+	if xui.IsNotFound(err) {
+		return RemoteConfirmedAbsent
+	}
+	if err != nil || client == nil {
+		return RemotePresenceUnknown
+	}
+	return RemoteConfirmedPresent
+}
+
 type XUIClient interface {
 	GetClientByEmail(email string) (*xui.XUIClientInfo, error)
 	DeleteClient(email string) error
 	AddClient(req xui.AddClientRequest) error
+	AddClientResult(req xui.AddClientRequest) xui.WriteResult
+	UpdateClientResult(email string, client xui.ClientConfig) xui.WriteResult
 }
 
 type Processor struct {
@@ -82,15 +106,15 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 	var resolution string
 
 	switch rec.Kind {
-	case "pending_refund":
+	case KindPendingRefund:
 		resolution, err = p.handlePendingRefund(ctx, rec)
-	case "purchase_provisioning_unknown", "purchase_remote_created_db_failed":
+	case KindPurchaseProvisioningUnknown, KindPurchaseRemoteCreatedDbFailed:
 		resolution, err = p.handlePurchaseReconciliation(ctx, rec)
-	case "subscription_update_db_failed":
+	case KindSubscriptionUpdateDbFailed:
 		resolution, err = p.handleUpdateReconciliation(ctx, rec)
-	case "subscription_delete_unknown", "subscription_cancellation_db_failure":
+	case KindSubscriptionDeleteUnknown, KindSubscriptionCancellationDbFailed:
 		resolution, err = p.handleDeleteReconciliation(ctx, rec)
-	case "direct_payment_provisioning_retry":
+	case KindDirectPaymentProvisioningRetry:
 		resolution, err = p.handleDirectPaymentProvisioning(ctx, rec)
 	default:
 		if rec.Status == "pending_refund" {
@@ -119,39 +143,15 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 	}
 }
 
-func (p *Processor) handlePendingRefund(ctx context.Context, rec *db.ReconciliationRecord) (string, error) {
-	if rec.UserID == nil {
-		return "", errors.New("user_id is missing in pending_refund record")
-	}
-	desired := rec.DesiredState
-	amountVal, ok := desired["amount"]
-	if !ok {
-		return "", errors.New("amount missing in desired_state")
-	}
-
-	var amount float64
-	switch v := amountVal.(type) {
-	case float64:
-		amount = v
-	case int64:
-		amount = float64(v)
-	case int:
-		amount = float64(v)
-	case string:
-		amount, _ = strconv.ParseFloat(v, 64)
-	}
-
+func (p *Processor) executeRefund(ctx context.Context, userID int64, amount int64, desc, refundOpKey string) error {
 	if amount <= 0 {
-		return "", errors.New("invalid refund amount in desired_state")
+		return nil
 	}
-
-	refundOpKey := fmt.Sprintf("%v", desired["refund_operation_key"])
+	if userID <= 0 {
+		return errors.New("user_id must be greater than 0 for refund")
+	}
 	if refundOpKey == "" {
-		refundOpKey = rec.OperationKey + ":refund"
-	}
-	desc := fmt.Sprintf("%v", desired["description"])
-	if desc == "" {
-		desc = "reconciliation wallet refund"
+		return errors.New("operation_key is required for refund")
 	}
 
 	creditFn := p.CreditFn
@@ -159,64 +159,101 @@ func (p *Processor) handlePendingRefund(ctx context.Context, rec *db.Reconciliat
 		creditFn = db.CreditWalletBalanceWithKey
 	}
 
-	err := creditFn(ctx, *rec.UserID, amount, desc, refundOpKey)
+	err := creditFn(ctx, userID, float64(amount), desc, refundOpKey)
 	if err == nil || errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
-		return fmt.Sprintf("wallet refunded %.0f Toman (key: %s)", amount, refundOpKey), nil
+		return nil
 	}
-	return "", err
+	return fmt.Errorf("refund failed for user %d (opKey=%s): %w", userID, refundOpKey, err)
+}
+
+func (p *Processor) handlePendingRefund(ctx context.Context, rec *db.ReconciliationRecord) (string, error) {
+	payload, err := DecodePendingRefund(rec.DesiredState, rec.UserID, rec.OperationKey)
+	if err != nil {
+		_ = db.MarkReconciliationManualReview(ctx, rec.ID, fmt.Sprintf("invalid pending_refund payload: %v", err))
+		return "manual review: invalid payload", nil
+	}
+
+	if err := p.executeRefund(ctx, payload.UserID, payload.Amount, payload.Description, payload.OperationKey); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("wallet refunded %d Toman (key: %s)", payload.Amount, payload.OperationKey), nil
+}
+
+func verifyClientIdentity(remote *xui.XUIClientInfo, expectedEmail, expectedUUID, expectedSubID string) error {
+	if remote == nil {
+		return errors.New("remote client is nil")
+	}
+	if remote.Email != expectedEmail {
+		return fmt.Errorf("email mismatch: remote=%q expected=%q", remote.Email, expectedEmail)
+	}
+	if expectedUUID != "" {
+		remoteUUID := remote.UUID
+		if remoteUUID == "" {
+			remoteUUID = remote.Password
+		}
+		if remoteUUID != "" && remoteUUID != expectedUUID {
+			return fmt.Errorf("UUID mismatch: remote=%q expected=%q", remoteUUID, expectedUUID)
+		}
+	}
+	if expectedSubID != "" && remote.SubID != "" && remote.SubID != expectedSubID {
+		return fmt.Errorf("SubID mismatch: remote=%q expected=%q", remote.SubID, expectedSubID)
+	}
+	return nil
 }
 
 func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.ReconciliationRecord) (string, error) {
-	desired := rec.DesiredState
-	email := fmt.Sprintf("%v", desired["email"])
-	if email == "" {
-		return "", errors.New("email is missing in purchase reconciliation desired_state")
+	payload, err := DecodePurchaseProvisioning(rec.DesiredState, rec.UserID, rec.OperationKey)
+	if err != nil {
+		_ = db.MarkReconciliationManualReview(ctx, rec.ID, fmt.Sprintf("invalid purchase provisioning payload: %v", err))
+		return "manual review: invalid payload", nil
 	}
 
 	if p.XUI == nil {
 		return "", errors.New("xui client is not available")
 	}
 
-	remote, err := p.XUI.GetClientByEmail(email)
-	switch {
-	case err == nil && remote != nil:
-		// Remote client confirmed on panel!
-		existing, checkErr := db.GetSubscriptionByEmail(ctx, email)
+	remote, err := p.XUI.GetClientByEmail(payload.Email)
+	presence := ClassifyRemoteClient(remote, err)
+
+	switch presence {
+	case RemoteConfirmedPresent:
+		// Client confirmed present remotely!
+		// 1. Verify identity before adopting!
+		if idErr := verifyClientIdentity(remote, payload.Email, payload.ExpectedUUID, payload.ExpectedSubID); idErr != nil {
+			_ = db.MarkReconciliationManualReview(ctx, rec.ID, fmt.Sprintf("identity verification failed for remote client %s: %v", payload.Email, idErr))
+			return "manual review: remote client identity mismatch", nil
+		}
+
+		// 2. Check existing subscription in DB
+		existing, checkErr := db.GetSubscriptionByEmail(ctx, payload.Email)
 		if checkErr != nil {
 			return "", fmt.Errorf("failed to check existing db subscription: %w", checkErr)
 		}
 		if existing != nil {
-			return fmt.Sprintf("remote client %s and subscription %d both exist", email, existing.ID), nil
+			return fmt.Sprintf("remote client %s and subscription %d both exist", payload.Email, existing.ID), nil
 		}
 
-		userIDVal := rec.UserID
-		if userIDVal == nil {
-			return "", errors.New("user_id missing for subscription adoption")
-		}
-
-		var planID *int
-		if pID, ok := desired["plan_id"]; ok && pID != nil {
-			if idInt, err := strconv.Atoi(fmt.Sprintf("%v", pID)); err == nil {
-				planID = &idInt
-			}
-		}
-
-		displayName := fmt.Sprintf("%v", desired["display_name"])
+		// 3. Adopt client into local DB
+		displayName := payload.DisplayName
 		if displayName == "" {
-			displayName = email
+			displayName = payload.Email
 		}
 		ipLimit := remote.LimitIP
 		if ipLimit <= 0 {
-			ipLimit = 1
+			ipLimit = payload.IPLimit
+			if ipLimit <= 0 {
+				ipLimit = 1
+			}
 		}
 
 		sub := &db.Subscription{
-			UserID:            *userIDVal,
-			PlanID:            planID,
+			UserID:            payload.UserID,
+			PlanID:            payload.PlanID,
+			QuoteID:           payload.QuoteID,
 			ClientEmail:       remote.Email,
 			ClientUUID:        remote.UUID,
 			SubID:             remote.SubID,
-			Status:            "active",
+			Status:            db.SubscriptionStatusActive,
 			PlanType:          db.PlanTypePaid,
 			DisplayName:       displayName,
 			IPLimit:           ipLimit,
@@ -230,156 +267,190 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 		}
 
 		if err := db.CreateSubscription(ctx, sub); err != nil {
-			return "", fmt.Errorf("failed to adopt subscription %s: %w", email, err)
+			return "", fmt.Errorf("failed to adopt subscription %s: %w", payload.Email, err)
 		}
-		return fmt.Sprintf("remote client %s confirmed, adopted into subscription %d", email, sub.ID), nil
+		return fmt.Sprintf("remote client %s confirmed, safely adopted into subscription %d", payload.Email, sub.ID), nil
 
-	case xui.IsNotFound(err):
-		priceVal, ok := desired["price"]
-		if !ok {
-			return "", errors.New("price missing in desired_state for refund")
-		}
-		var price float64
-		switch v := priceVal.(type) {
-		case float64:
-			price = v
-		case int64:
-			price = float64(v)
-		case string:
-			price, _ = strconv.ParseFloat(v, 64)
-		}
-
-		if price <= 0 || rec.UserID == nil {
+	case RemoteConfirmedAbsent:
+		// Remote client is confirmed absent! Safe to refund.
+		if payload.Price <= 0 {
 			return "remote client absent, no refund needed", nil
 		}
 
-		refundOpKey := fmt.Sprintf("%v", desired["refund_operation_key"])
-		if refundOpKey == "" {
-			refundOpKey = rec.OperationKey + ":refund"
+		refundErr := p.executeRefund(ctx, payload.UserID, payload.Price, "refund for failed purchase: "+payload.Email, payload.RefundOperationKey)
+		if refundErr != nil {
+			return "", refundErr // Must remain retryable!
 		}
+		return fmt.Sprintf("remote client absent, refunded %d Toman (key: %s)", payload.Price, payload.RefundOperationKey), nil
 
-		creditFn := p.CreditFn
-		if creditFn == nil {
-			creditFn = db.CreditWalletBalanceWithKey
+	default: // RemotePresenceUnknown
+		// Timeout or network error or nil client! Ambiguous! NEVER delete or refund.
+		return "", fmt.Errorf("inconclusive remote existence check for %s: %w", payload.Email, err)
+	}
+}
+
+func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.ReconciliationRecord) (string, error) {
+	payload, err := DecodeSubscriptionDelete(rec.DesiredState, rec.SubscriptionID, rec.UserID, rec.OperationKey)
+	if err != nil {
+		_ = db.MarkReconciliationManualReview(ctx, rec.ID, fmt.Sprintf("invalid subscription delete payload: %v", err))
+		return "manual review: invalid payload", nil
+	}
+
+	if p.XUI == nil {
+		return "", errors.New("xui client is not available")
+	}
+
+	remote, err := p.XUI.GetClientByEmail(payload.ClientEmail)
+	presence := ClassifyRemoteClient(remote, err)
+
+	switch presence {
+	case RemoteConfirmedAbsent:
+		// Confirmed absent remotely!
+		if payload.SubscriptionID != nil {
+			_ = db.DeleteSubscription(ctx, int(*payload.SubscriptionID))
 		}
-
-		err := creditFn(ctx, *rec.UserID, price, "refund for failed purchase: "+email, refundOpKey)
-		if err == nil || errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
-			return fmt.Sprintf("remote client absent, refunded %.0f Toman (key: %s)", price, refundOpKey), nil
+		if payload.RefundAmount > 0 && payload.UserID != nil {
+			refundErr := p.executeRefund(ctx, *payload.UserID, payload.RefundAmount, "refund for cancelled subscription", payload.RefundOperationKey)
+			if refundErr != nil {
+				return "", refundErr // Keep retryable! Never resolve with failed refund!
+			}
 		}
-		return "", err
+		return fmt.Sprintf("remote client %s confirmed deleted, local record cleaned", payload.ClientEmail), nil
 
-	default:
-		return "", fmt.Errorf("inconclusive remote existence check for %s: %w", email, err)
+	case RemoteConfirmedPresent:
+		// Remote client still exists. Attempt delete once.
+		delErr := p.XUI.DeleteClient(payload.ClientEmail)
+		if delErr == nil || xui.IsNotFound(delErr) {
+			if payload.SubscriptionID != nil {
+				_ = db.DeleteSubscription(ctx, int(*payload.SubscriptionID))
+			}
+			if payload.RefundAmount > 0 && payload.UserID != nil {
+				refundErr := p.executeRefund(ctx, *payload.UserID, payload.RefundAmount, "refund for cancelled subscription", payload.RefundOperationKey)
+				if refundErr != nil {
+					return "", refundErr // Keep retryable!
+				}
+			}
+			return fmt.Sprintf("remote client %s deleted on retry", payload.ClientEmail), nil
+		}
+		return "", fmt.Errorf("remote client %s still present after retry delete: %w", payload.ClientEmail, delErr)
+
+	default: // RemotePresenceUnknown
+		// Timeout or network error! Ambiguous! NEVER assume deleted.
+		return "", fmt.Errorf("inconclusive delete check for %s: %w", payload.ClientEmail, err)
 	}
 }
 
 func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.ReconciliationRecord) (string, error) {
-	if rec.SubscriptionID == nil {
-		return "", errors.New("subscription_id missing for update reconciliation")
+	payload, err := DecodeSubscriptionUpdate(rec.DesiredState, rec.SubscriptionID)
+	if err != nil {
+		_ = db.MarkReconciliationManualReview(ctx, rec.ID, fmt.Sprintf("invalid subscription update payload: %v", err))
+		return "manual review: invalid payload", nil
 	}
 
-	sub, err := db.GetSubscriptionByID(ctx, int(*rec.SubscriptionID))
+	sub, err := db.GetSubscriptionByID(ctx, int(payload.SubscriptionID))
 	if err != nil || sub == nil {
-		return "", fmt.Errorf("subscription not found: %w", err)
+		return "", fmt.Errorf("subscription %d not found in db: %w", payload.SubscriptionID, err)
 	}
 
 	if p.XUI == nil {
 		return "", errors.New("xui client is not available")
 	}
 
-	remote, err := p.XUI.GetClientByEmail(sub.ClientEmail)
-	if err != nil {
-		return "", fmt.Errorf("failed to get remote client %s: %w", sub.ClientEmail, err)
+	remote, err := p.XUI.GetClientByEmail(payload.ClientEmail)
+	presence := ClassifyRemoteClient(remote, err)
+	if presence != RemoteConfirmedPresent {
+		return "", fmt.Errorf("remote client %s not present or check inconclusive: %w", payload.ClientEmail, err)
 	}
 
-	sub.IPLimit = remote.LimitIP
-	sub.IsActive = remote.Enable
-	sub.ExpireTime = &remote.ExpiryTime
-	if remote.ExpiryTime > 0 {
-		sub.EndDate = time.UnixMilli(remote.ExpiryTime)
+	// Compare: Desired vs Observed Remote vs Current DB
+	desiredIP := sub.IPLimit
+	if payload.DesiredIPLimit != nil {
+		desiredIP = *payload.DesiredIPLimit
 	}
-	sub.Status = db.SubscriptionStatusActive
-	sub.DesiredIPLimit = nil
-	sub.DesiredExpireTime = nil
-	sub.DesiredIsActive = nil
-	sub.ReconciliationNote = ""
-
-	if err := db.UpdateSubscription(ctx, sub); err != nil {
-		return "", fmt.Errorf("failed to sync db subscription %d: %w", sub.ID, err)
+	desiredExpiry := int64(0)
+	if sub.ExpireTime != nil {
+		desiredExpiry = *sub.ExpireTime
 	}
-	return fmt.Sprintf("synced subscription %d with remote panel state", sub.ID), nil
-}
-
-func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.ReconciliationRecord) (string, error) {
-	desired := rec.DesiredState
-	email := fmt.Sprintf("%v", desired["email"])
-	if email == "" {
-		return "", errors.New("email missing for delete reconciliation")
+	if payload.DesiredExpireTime != nil {
+		desiredExpiry = *payload.DesiredExpireTime
+	}
+	desiredActive := sub.IsActive
+	if payload.DesiredIsActive != nil {
+		desiredActive = *payload.DesiredIsActive
 	}
 
-	if p.XUI == nil {
-		return "", errors.New("xui client is not available")
-	}
+	remoteMatchesDesired := (payload.DesiredIPLimit == nil || remote.LimitIP == desiredIP) &&
+		(payload.DesiredExpireTime == nil || remote.ExpiryTime == desiredExpiry) &&
+		(payload.DesiredIsActive == nil || remote.Enable == desiredActive)
 
-	remote, err := p.XUI.GetClientByEmail(email)
-	if xui.IsNotFound(err) || remote == nil {
-		if rec.SubscriptionID != nil {
-			_ = db.DeleteSubscription(ctx, int(*rec.SubscriptionID))
+	if remoteMatchesDesired {
+		// Remote already has desired state! Commit to DB and resolve.
+		sub.IPLimit = desiredIP
+		sub.IsActive = desiredActive
+		sub.ExpireTime = &desiredExpiry
+		if desiredExpiry > 0 {
+			sub.EndDate = time.UnixMilli(desiredExpiry)
 		}
-		p.tryRefundFromDesired(ctx, rec)
-		return fmt.Sprintf("remote client %s confirmed deleted, local record cleaned", email), nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("inconclusive delete check for %s: %w", email, err)
-	}
+		sub.Status = db.SubscriptionStatusActive
+		sub.DesiredIPLimit = nil
+		sub.DesiredExpireTime = nil
+		sub.DesiredIsActive = nil
+		sub.ReconciliationNote = ""
 
-	delErr := p.XUI.DeleteClient(email)
-	if delErr == nil || xui.IsNotFound(delErr) {
-		if rec.SubscriptionID != nil {
-			_ = db.DeleteSubscription(ctx, int(*rec.SubscriptionID))
+		if err := db.UpdateSubscription(ctx, sub); err != nil {
+			return "", fmt.Errorf("failed to commit db subscription %d: %w", sub.ID, err)
 		}
-		p.tryRefundFromDesired(ctx, rec)
-		return fmt.Sprintf("remote client %s deleted on retry", email), nil
+		return fmt.Sprintf("remote client %s already has desired state, synced db", payload.ClientEmail), nil
 	}
 
-	return "", fmt.Errorf("remote client %s still present after retry delete: %w", email, delErr)
-}
+	// Check if remote is at previous state and safe to retry
+	remoteMatchesPrevious := (payload.DesiredIPLimit == nil || remote.LimitIP == payload.PreviousIPLimit) &&
+		(payload.DesiredExpireTime == nil || remote.ExpiryTime == payload.PreviousExpireTime) &&
+		(payload.DesiredIsActive == nil || remote.Enable == payload.PreviousIsActive)
 
-func (p *Processor) tryRefundFromDesired(ctx context.Context, rec *db.ReconciliationRecord) {
-	if rec.UserID == nil || rec.DesiredState == nil {
-		return
+	if remoteMatchesPrevious {
+		// Remote is at previous state. Retry mutation using full client merge preserving non-bot fields.
+		clientConfig := xui.ClientConfig{
+			ID:         remote.UUID,
+			Email:      remote.Email,
+			SubID:      remote.SubID,
+			Enable:     desiredActive,
+			ExpiryTime: desiredExpiry,
+			LimitIP:    desiredIP,
+			TotalGB:    remote.TotalGB,
+			Flow:       remote.Flow,
+		}
+		res := p.XUI.UpdateClientResult(payload.ClientEmail, clientConfig)
+		if res.Outcome == xui.WriteSucceeded {
+			// Verify readback
+			verifyRemote, verifyErr := p.XUI.GetClientByEmail(payload.ClientEmail)
+			if verifyErr == nil && verifyRemote != nil &&
+				(payload.DesiredIPLimit == nil || verifyRemote.LimitIP == desiredIP) &&
+				(payload.DesiredExpireTime == nil || verifyRemote.ExpiryTime == desiredExpiry) &&
+				(payload.DesiredIsActive == nil || verifyRemote.Enable == desiredActive) {
+				sub.IPLimit = desiredIP
+				sub.IsActive = desiredActive
+				sub.ExpireTime = &desiredExpiry
+				if desiredExpiry > 0 {
+					sub.EndDate = time.UnixMilli(desiredExpiry)
+				}
+				sub.Status = db.SubscriptionStatusActive
+				sub.DesiredIPLimit = nil
+				sub.DesiredExpireTime = nil
+				sub.DesiredIsActive = nil
+				sub.ReconciliationNote = ""
+				if err := db.UpdateSubscription(ctx, sub); err != nil {
+					return "", fmt.Errorf("failed to commit db subscription %d after retry: %w", sub.ID, err)
+				}
+				return fmt.Sprintf("retried remote update for %s and verified readback", payload.ClientEmail), nil
+			}
+		}
+		return "", fmt.Errorf("remote update retry failed or inconclusive for %s: %v", payload.ClientEmail, res.Err)
 	}
-	amountVal, ok := rec.DesiredState["amount"]
-	if !ok {
-		amountVal, ok = rec.DesiredState["refund_amount"]
-	}
-	if !ok {
-		return
-	}
-	var amount float64
-	switch v := amountVal.(type) {
-	case float64:
-		amount = v
-	case int64:
-		amount = float64(v)
-	case int:
-		amount = float64(v)
-	case string:
-		amount, _ = strconv.ParseFloat(v, 64)
-	}
-	if amount <= 0 {
-		return
-	}
-	refundOpKey := fmt.Sprintf("%v", rec.DesiredState["refund_operation_key"])
-	if refundOpKey == "" {
-		refundOpKey = rec.OperationKey + ":refund"
-	}
-	creditFn := p.CreditFn
-	if creditFn == nil {
-		creditFn = db.CreditWalletBalanceWithKey
-	}
-	_ = creditFn(ctx, *rec.UserID, amount, "refund for cancelled subscription", refundOpKey)
+
+	// Remote state is in an unexpected divergent state! Move to manual review.
+	_ = db.MarkReconciliationManualReview(ctx, rec.ID, fmt.Sprintf("remote client %s state is unexpected (remote IP=%d, Expiry=%d, Active=%t)", payload.ClientEmail, remote.LimitIP, remote.ExpiryTime, remote.Enable))
+	return "manual review: divergent remote state", nil
 }
 
 func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db.ReconciliationRecord) (string, error) {
@@ -405,7 +476,16 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 	}
 
 	remote, err := p.XUI.GetClientByEmail(req.ClientEmail)
-	if err == nil && remote != nil {
+	presence := ClassifyRemoteClient(remote, err)
+
+	switch presence {
+	case RemoteConfirmedPresent:
+		// Verify identity before adopting!
+		if idErr := verifyClientIdentity(remote, req.ClientEmail, "", ""); idErr != nil {
+			_ = db.MarkReconciliationManualReview(ctx, rec.ID, fmt.Sprintf("direct payment client identity verification failed: %v", idErr))
+			return "manual review: identity mismatch", nil
+		}
+
 		existing, checkErr := db.GetSubscriptionByEmail(ctx, req.ClientEmail)
 		if checkErr != nil {
 			return "", fmt.Errorf("failed to check existing subscription: %w", checkErr)
@@ -440,72 +520,122 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 				sub.EndDate = time.UnixMilli(remote.ExpiryTime)
 			}
 			if err := db.CreateSubscription(ctx, sub); err != nil {
-				return "", fmt.Errorf("failed to save subscription: %w", err)
+				_ = db.CreateReconciliationRecord(ctx, &db.ReconciliationRecord{
+					UserID:            &req.UserID,
+					PurchaseRequestID: &req.ID,
+					Kind:              KindPurchaseRemoteCreatedDbFailed,
+					Status:            "reconciliation_required",
+					OperationKey:      fmt.Sprintf("direct_pay_db_fail:%d", req.ID),
+					DesiredState: map[string]any{
+						"user_id":             req.UserID,
+						"purchase_request_id": req.ID,
+						"email":               req.ClientEmail,
+						"uuid":                remote.UUID,
+						"sub_id":              remote.SubID,
+						"ip_limit":            req.IPLimit,
+						"months":              req.Months,
+						"display_name":        req.CustomName,
+					},
+				})
+				return "", fmt.Errorf("failed to create db subscription for remote client %s: %w", req.ClientEmail, err)
 			}
 		}
-		_ = db.SetPurchaseProvisioningStatus(ctx, req.ID, db.PurchaseProvisioningSucceeded)
-		return fmt.Sprintf("adopted existing remote client %s for purchase request %d", req.ClientEmail, req.ID), nil
-	}
 
-	if req.PlanID == nil {
-		return "", errors.New("plan_id missing in purchase request")
-	}
-	plan, err := db.GetPaidPlanByID(ctx, *req.PlanID)
-	if err != nil || plan == nil {
-		return "", fmt.Errorf("paid plan not found: %w", err)
-	}
+		if statusErr := db.SetPurchaseProvisioningStatus(ctx, req.ID, db.PurchaseProvisioningSucceeded); statusErr != nil {
+			return "", fmt.Errorf("failed to set provisioning status succeeded: %w", statusErr)
+		}
+		return fmt.Sprintf("direct payment client %s confirmed, adopted into subscription", req.ClientEmail), nil
 
-	clientUUID := generateUUID()
-	subID := fmt.Sprintf("sub_%d_%d", req.ID, time.Now().UnixNano()%1000000)
-	var expireMilli int64 = -int64(req.Months * 30 * 24 * 3600 * 1000)
-	var trafficBytes int64
-	if plan.IsLimited {
-		trafficBytes = int64(req.DataGB) * 1073741824
-	}
+	case RemoteConfirmedAbsent:
+		// Client absent remotely. Create client in XUI first.
+		var inbounds []int
+		if req.PlanID != nil {
+			paidPlan, pErr := db.GetPaidPlanByID(ctx, int64(*req.PlanID))
+			if pErr == nil && paidPlan != nil {
+				inbounds = paidPlan.InboundIDs
+			}
+		}
+		expiryMilli := int64(0)
+		if req.Months > 0 {
+			expiryMilli = time.Now().Add(time.Duration(req.Months) * 30 * 24 * time.Hour).UnixMilli()
+		}
+		totalBytes := int64(req.DataGB) * 1024 * 1024 * 1024
+		newUUID := generateUUID()
+		newSubID := generateSubID()
 
-	addReq := xui.AddClientRequest{
-		InboundIDs: plan.InboundIDs,
-		Client: xui.ClientConfig{
-			ID:         clientUUID,
-			Email:      req.ClientEmail,
-			SubID:      subID,
-			Enable:     true,
-			ExpiryTime: expireMilli,
-			LimitIP:    req.IPLimit,
-			TotalGB:    trafficBytes,
-			Flow:       plan.Flow,
-		},
-	}
-	if err := p.XUI.AddClient(addReq); err != nil {
-		return "", fmt.Errorf("failed to add client on panel: %w", err)
-	}
+		addReq := xui.AddClientRequest{
+			InboundIDs: inbounds,
+			Client: xui.ClientConfig{
+				ID:         newUUID,
+				Email:      req.ClientEmail,
+				SubID:      newSubID,
+				Enable:     true,
+				ExpiryTime: expiryMilli,
+				LimitIP:    req.IPLimit,
+				TotalGB:    totalBytes,
+			},
+		}
 
-	var planID *int
-	if req.PlanID != nil {
-		id := int(*req.PlanID)
-		planID = &id
+		writeRes := p.XUI.AddClientResult(addReq)
+		if writeRes.Outcome != xui.WriteSucceeded {
+			return "", fmt.Errorf("failed to add remote client %s: %v", req.ClientEmail, writeRes.Err)
+		}
+
+		// Remote created! Now create subscription in local DB
+		var planID *int
+		if req.PlanID != nil {
+			id := int(*req.PlanID)
+			planID = &id
+		}
+		sub := &db.Subscription{
+			UserID:            req.UserID,
+			PlanID:            planID,
+			QuoteID:           req.QuoteID,
+			ClientEmail:       req.ClientEmail,
+			ClientUUID:        newUUID,
+			SubID:             newSubID,
+			Status:            db.SubscriptionStatusActive,
+			PlanType:          db.PlanTypePaid,
+			DisplayName:       req.CustomName,
+			IPLimit:           req.IPLimit,
+			ExpireTime:        &expiryMilli,
+			IsActive:          true,
+			StartDate:         time.Now().UTC(),
+			TrafficLimitBytes: totalBytes,
+		}
+		if expiryMilli > 0 {
+			sub.EndDate = time.UnixMilli(expiryMilli)
+		}
+
+		if err := db.CreateSubscription(ctx, sub); err != nil {
+			_ = db.CreateReconciliationRecord(ctx, &db.ReconciliationRecord{
+				UserID:            &req.UserID,
+				PurchaseRequestID: &req.ID,
+				Kind:              KindPurchaseRemoteCreatedDbFailed,
+				Status:            "reconciliation_required",
+				OperationKey:      fmt.Sprintf("direct_pay_db_fail:%d", req.ID),
+				DesiredState: map[string]any{
+					"user_id":             req.UserID,
+					"purchase_request_id": req.ID,
+					"email":               req.ClientEmail,
+					"uuid":                newUUID,
+					"sub_id":              newSubID,
+					"ip_limit":            req.IPLimit,
+					"months":              req.Months,
+					"display_name":        req.CustomName,
+				},
+			})
+			return "", fmt.Errorf("remote client %s created but local db subscription failed: %w", req.ClientEmail, err)
+		}
+
+		if statusErr := db.SetPurchaseProvisioningStatus(ctx, req.ID, db.PurchaseProvisioningSucceeded); statusErr != nil {
+			return "", fmt.Errorf("failed to set provisioning status succeeded: %w", statusErr)
+		}
+		return fmt.Sprintf("direct payment client %s created and provisioned successfully", req.ClientEmail), nil
+
+	default: // RemotePresenceUnknown
+		return "", fmt.Errorf("inconclusive check for direct payment client %s: %w", req.ClientEmail, err)
 	}
-	sub := &db.Subscription{
-		UserID:            req.UserID,
-		PlanID:            planID,
-		QuoteID:           req.QuoteID,
-		ClientEmail:       req.ClientEmail,
-		ClientUUID:        clientUUID,
-		SubID:             subID,
-		Status:            db.SubscriptionStatusActive,
-		PlanType:          db.PlanTypePaid,
-		DisplayName:       req.CustomName,
-		IPLimit:           req.IPLimit,
-		ExpireTime:        &expireMilli,
-		IsActive:          true,
-		StartDate:         time.Now().UTC(),
-		TrafficLimitBytes: trafficBytes,
-	}
-	if err := db.CreateSubscription(ctx, sub); err != nil {
-		return "", fmt.Errorf("client created on panel but DB subscription save failed: %w", err)
-	}
-	_ = db.SetPurchaseProvisioningStatus(ctx, req.ID, db.PurchaseProvisioningSucceeded)
-	return fmt.Sprintf("successfully provisioned purchase request %d", req.ID), nil
 }
 
 func generateUUID() string {
@@ -513,6 +643,11 @@ func generateUUID() string {
 	_, _ = rand.Read(b)
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
-	s := hex.EncodeToString(b)
-	return fmt.Sprintf("%s-%s-%s-%s-%s", s[:8], s[8:12], s[12:16], s[16:20], s[20:])
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
+func generateSubID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }

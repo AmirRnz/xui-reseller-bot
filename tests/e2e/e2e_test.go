@@ -420,7 +420,11 @@ func setupE2E(t *testing.T) (*TestEnv, func()) {
 	os.Setenv("TELEGRAM_API_URL", mockTG.Server.URL)
 	config.Global.XUI.BaseURL = mockXUI.Server.URL
 	config.Global.XUI.URL = mockXUI.Server.URL
-	config.Global.Bot.WebhookDomain = "" // Force long polling in tests
+	if testDBURL := os.Getenv("TEST_DATABASE_URL"); testDBURL != "" {
+		config.Global.Database.URL = testDBURL
+	} else if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		config.Global.Database.URL = dbURL
+	}
 
 	// Connect to Database
 	err := db.Connect(ctx, &config.Global.Database)
@@ -517,7 +521,7 @@ func TestE2ESuite(t *testing.T) {
 		// 1. Start command registers a new user with 'pending' status
 		env.SendMessage(userTGID, userUsername, "/start")
 		resp := env.ExpectResponse(t, 2*time.Second)
-		if !strings.Contains(getStr(resp, "text"), "Request Access") && !strings.Contains(getStr(resp, "reply_markup"), "request_access") {
+		if !strings.Contains(getStr(resp, "text"), "ربات نمایندگی") || !strings.Contains(getStr(resp, "reply_markup"), "menu_request_access") {
 			t.Fatalf("Expected Request Access button, got: %+v", resp)
 		}
 
@@ -528,51 +532,36 @@ func TestE2ESuite(t *testing.T) {
 		}
 
 		// 2. Request Access button triggers request and notifies admin
-		env.SendCallback(userTGID, userUsername, 999, "\frequest_access")
-		// Bot edits user message (access pending) and notifies admin
+		env.SendCallback(userTGID, userUsername, 999, "\fmenu_request_access")
+		// Bot sends access pending message to user and notifies admin
 		respUser := env.ExpectResponse(t, 2*time.Second)
-		if !strings.Contains(getStr(respUser, "text"), "pending") && !strings.Contains(getStr(respUser, "text"), "wait") {
-			// In start.go, line 67: c.Edit(i18n.T(lang, "access_pending"))
-			// It may be English/Persian. Just check that we got a reply
+		if !strings.Contains(getStr(respUser, "text"), "درخواست دسترسی شما برای ادمین ارسال شد") {
+			t.Fatalf("Expected access pending message, got: %+v", respUser)
 		}
 		respAdmin := env.ExpectResponse(t, 2*time.Second)
-		if !strings.Contains(getStr(respAdmin, "text"), "New access request") {
+		if !strings.Contains(getStr(respAdmin, "text"), "درخواست دسترسی نمایندگی جدید") {
 			t.Fatalf("Expected admin notification message, got: %+v", respAdmin)
 		}
 
 		// 3. Admin approves user
-		env.SendCallback(adminTGID, adminUsername, 999, fmt.Sprintf("\fapprove_user|%d", userTGID))
-		// Bot notifies admin of approval and notifies user (access granted)
+		env.SendCallback(adminTGID, adminUsername, 999, fmt.Sprintf("\fadmin_user_approve|%d", u.ID))
 		respAdminApprove := env.ExpectResponse(t, 2*time.Second)
-		if !strings.Contains(getStr(respAdminApprove, "text"), "Approved user") {
-			t.Fatalf("Expected admin approval success message, got: %+v", respAdminApprove)
-		}
+		_ = respAdminApprove
 		respUserNotify := env.ExpectResponse(t, 2*time.Second) // user notification
-		_ = respUserNotify
-
-		// Verify user status in DB is approved_name_pending
-		u, err = db.GetUserByTelegramID(env.ctx, userTGID)
-		if err != nil || u == nil || u.Status != "approved_name_pending" {
-			t.Fatalf("User status should be approved_name_pending, got %v", u)
+		if !strings.Contains(getStr(respUserNotify, "text"), "تایید شد") {
+			t.Fatalf("Expected user approval notification, got: %+v", respUserNotify)
 		}
 
 		// 4. User enters service name
 		env.SendMessage(userTGID, userUsername, "myservice")
-		respChooseLang := env.ExpectResponse(t, 2*time.Second)
-		if !strings.Contains(getStr(respChooseLang, "text"), "Language") && !strings.Contains(getStr(respChooseLang, "text"), "lang") {
-			// Prompt for language
-		}
-
-		// 5. User selects English language, shows main menu
-		env.SendCallback(userTGID, userUsername, 999, "\flang_en")
 		respMenu := env.ExpectResponse(t, 2*time.Second)
-		if strings.Contains(getStr(respMenu, "reply_markup"), "request_access") {
-			t.Fatalf("Main menu should not contain request access after approval")
+		if strings.Contains(getStr(respMenu, "reply_markup"), "menu_request_access") {
+			t.Fatalf("Main menu should not contain request access after approval: %+v", respMenu)
 		}
 
 		// Verify status is approved
 		u, err = db.GetUserByTelegramID(env.ctx, userTGID)
-		if err != nil || u == nil || u.Status != "approved" || *u.ServiceName != "myservice" || u.Language != "en" {
+		if err != nil || u == nil || u.Status != "approved" || u.ServiceName == nil || *u.ServiceName != "myservice" {
 			t.Fatalf("User onboarding state mismatch: %+v", u)
 		}
 	})

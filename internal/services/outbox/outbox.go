@@ -213,7 +213,21 @@ func (w *Worker) dispatchRecord(ctx context.Context, rec *OutboxRecord) {
 	if sendErr != nil {
 		errMsg := sendErr.Error()
 		log.Printf("[OUTBOX] Failed to send notification %d to user %d: %v", rec.ID, user.TelegramID, sendErr)
-		if strings.Contains(strings.ToLower(errMsg), "too many requests") || strings.Contains(strings.ToLower(errMsg), "retry after") {
+		var floodErr telebot.FloodError
+		var floodErrPtr *telebot.FloodError
+		if errors.As(sendErr, &floodErr) {
+			retryDur := time.Duration(floodErr.RetryAfter) * time.Second
+			if retryDur <= 0 {
+				retryDur = 5 * time.Minute
+			}
+			_ = MarkFailed(ctx, rec.ID, errMsg, retryDur)
+		} else if errors.As(sendErr, &floodErrPtr) && floodErrPtr != nil {
+			retryDur := time.Duration(floodErrPtr.RetryAfter) * time.Second
+			if retryDur <= 0 {
+				retryDur = 5 * time.Minute
+			}
+			_ = MarkFailed(ctx, rec.ID, errMsg, retryDur)
+		} else if strings.Contains(strings.ToLower(errMsg), "too many requests") || strings.Contains(strings.ToLower(errMsg), "retry after") {
 			_ = MarkFailed(ctx, rec.ID, errMsg, 5*time.Minute)
 		} else if rec.AttemptCount >= 5 {
 			_ = MarkFailed(ctx, rec.ID, errMsg, 0)
@@ -223,8 +237,11 @@ func (w *Worker) dispatchRecord(ctx context.Context, rec *OutboxRecord) {
 		return
 	}
 
-	_ = MarkSent(ctx, rec.ID)
-	log.Printf("[OUTBOX] Notification %d sent to user %d (sub: %d)", rec.ID, user.TelegramID, rec.SubscriptionID)
+	if err := MarkSent(ctx, rec.ID); err != nil {
+		log.Printf("[OUTBOX] Failed to mark notification %d as sent: %v", rec.ID, err)
+	} else {
+		log.Printf("[OUTBOX] Notification %d sent to user %d (sub: %d)", rec.ID, user.TelegramID, rec.SubscriptionID)
+	}
 }
 
 func (w *Worker) Start(ctx context.Context, interval time.Duration) {

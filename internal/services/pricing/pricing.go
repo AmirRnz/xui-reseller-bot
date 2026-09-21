@@ -133,21 +133,66 @@ func bestDiscountPercent(tiers []db.DiscountTier, months int) float64 {
 }
 
 func SaveQuote(ctx context.Context, q *PurchaseQuote) error {
-	if q == nil || db.Pool == nil {
-		return errors.New("invalid quote or database pool")
+	if q == nil {
+		return errors.New("invalid quote: nil")
 	}
-	return db.Pool.QueryRow(ctx, `
+	if db.Pool == nil {
+		return errors.New("database pool is not initialized")
+	}
+
+	var insertedID int64
+	err := db.Pool.QueryRow(ctx, `
 		INSERT INTO purchase_quotes (
 			quote_key, user_id, plan_id, plan_name, months, duration_days, ip_limit, data_gb,
 			base_price_toman, extra_ip_price_toman, extra_month_price_toman, traffic_price_toman,
 			discount_toman, final_price_toman, currency, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-		ON CONFLICT (quote_key) DO UPDATE SET
-			final_price_toman = EXCLUDED.final_price_toman
+		ON CONFLICT (quote_key) DO NOTHING
 		RETURNING id
 	`, q.QuoteKey, q.UserID, q.PlanID, q.PlanName, q.Months, q.DurationDays, q.IPLimit, q.DataGB,
 		q.BasePriceToman, q.ExtraIPPriceToman, q.ExtraMonthPriceToman, q.TrafficPriceToman,
-		q.DiscountToman, q.FinalPriceToman, q.Currency, q.CreatedAt).Scan(&q.ID)
+		q.DiscountToman, q.FinalPriceToman, q.Currency, q.CreatedAt).Scan(&insertedID)
+
+	if err == nil {
+		q.ID = insertedID
+		return nil
+	}
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Existing quote with this quote_key! Verify immutability.
+		existing, getErr := GetQuoteByKey(ctx, q.QuoteKey)
+		if getErr != nil {
+			return fmt.Errorf("failed to load existing quote for key %s: %w", q.QuoteKey, getErr)
+		}
+		if existing == nil {
+			return fmt.Errorf("quote with key %s conflict but not found", q.QuoteKey)
+		}
+		if !quotesEqual(existing, q) {
+			return fmt.Errorf("immutable quote violation: attempt to mutate quote %s with different parameters", q.QuoteKey)
+		}
+		q.ID = existing.ID
+		return nil
+	}
+
+	return err
+}
+
+func quotesEqual(a, b *PurchaseQuote) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.PlanName == b.PlanName &&
+		a.Months == b.Months &&
+		a.DurationDays == b.DurationDays &&
+		a.IPLimit == b.IPLimit &&
+		a.DataGB == b.DataGB &&
+		a.BasePriceToman == b.BasePriceToman &&
+		a.ExtraIPPriceToman == b.ExtraIPPriceToman &&
+		a.ExtraMonthPriceToman == b.ExtraMonthPriceToman &&
+		a.TrafficPriceToman == b.TrafficPriceToman &&
+		a.DiscountToman == b.DiscountToman &&
+		a.FinalPriceToman == b.FinalPriceToman &&
+		a.Currency == b.Currency
 }
 
 func GetQuoteByKey(ctx context.Context, quoteKey string) (*PurchaseQuote, error) {

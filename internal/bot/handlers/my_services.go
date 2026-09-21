@@ -1054,7 +1054,7 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		if sub.EndDate.Before(nowUTC()) {
 			sub.EndDate = nowUTC()
 		}
-		sub.EndDate = sub.EndDate.AddDate(0, months, 0)
+		sub.EndDate = sub.EndDate.Add(time.Duration(months) * 30 * 24 * time.Hour)
 		newExpiryMilli = sub.EndDate.UnixMilli()
 		sub.ExpireTime = &newExpiryMilli
 		newExpiryLabel = sub.EndDate.Format("2006-01-02")
@@ -1332,29 +1332,33 @@ func syncActivationExpiry(sub *db.Subscription, client xui.XUIClientInfo) bool {
 }
 
 func syncIPLimitFromXUI(sub *db.Subscription) {
-	if bot.XUIClient == nil {
+	if bot.XUIClient == nil || sub == nil || sub.ClientEmail == "" {
 		return
 	}
-	clients, err := bot.XUIClient.ListClients()
+	client, err := bot.XUIClient.GetClientByEmail(sub.ClientEmail)
 	if err != nil {
-		log.Printf("XUI ListClients failed during sync: %v", err)
+		log.Printf("XUI GetClientByEmail failed during sync for %s: %v", sub.ClientEmail, err)
 		return
 	}
-	for _, client := range clients {
-		if client.Email == sub.ClientEmail {
-			changed := false
-			if devLimit, ok := parseDeviceLimitFromXUI(client); ok && devLimit != sub.IPLimit {
-				log.Printf("Syncing device limit for %s: DB had %d, XUI has %d", sub.ClientEmail, sub.IPLimit, devLimit)
-				sub.IPLimit = devLimit
-				changed = true
-			}
-			if syncActivationExpiry(sub, client) {
-				changed = true
-			}
-			if changed {
-				_ = db.UpdateSubscription(context.Background(), sub)
-			}
-			break
-		}
+	if client == nil {
+		return
+	}
+
+	changed := false
+	if devLimit, ok := parseDeviceLimitFromXUI(*client); ok && devLimit != sub.IPLimit {
+		log.Printf("Syncing device limit for %s: DB had %d, XUI has %d", sub.ClientEmail, sub.IPLimit, devLimit)
+		sub.IPLimit = devLimit
+		changed = true
+	}
+	if sub.IsActive != client.Enable {
+		log.Printf("Syncing IsActive status for %s: DB had %t, XUI has %t", sub.ClientEmail, sub.IsActive, client.Enable)
+		sub.IsActive = client.Enable
+		changed = true
+	}
+	if syncActivationExpiry(sub, *client) {
+		changed = true
+	}
+	if changed {
+		_ = db.UpdateSubscription(context.Background(), sub)
 	}
 }

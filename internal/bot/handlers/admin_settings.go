@@ -165,7 +165,8 @@ func HandleAdminResetTests(c telebot.Context) error {
 	}
 	_, err := db.Pool.Exec(context.Background(), "DELETE FROM test_usage")
 	if err != nil {
-		return c.Send("خطا در ریست تست‌ها: " + err.Error())
+		log.Printf("[ERROR] Failed to reset test usage: %v", err)
+		return c.Send("خطا در بازنشانی تست‌ها.")
 	}
 	return c.Respond(&telebot.CallbackResponse{Text: "✅ تمامی تست‌های کاربران با موفقیت ریست شد.", ShowAlert: true})
 }
@@ -295,7 +296,8 @@ func HandleAdminSyncAllIPLimitsConfirm(c telebot.Context) error {
 	// 2. Fetch all active subscriptions
 	subs, err := db.GetActiveSubscriptions(ctx)
 	if err != nil {
-		return c.Send("خطا در بارگذاری اشتراک‌های فعال: " + err.Error())
+		log.Printf("[ERROR] Failed to fetch active subscriptions: %v", err)
+		return c.Send("خطا در بارگذاری اشتراک‌های فعال.")
 	}
 
 	// 3. Sync to XUI
