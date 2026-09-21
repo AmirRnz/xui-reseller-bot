@@ -63,10 +63,22 @@ func CalculateQuote(p QuoteParams) *PurchaseQuote {
 	}
 	extraIPs := ipLimit - p.Plan.BaseIPLimit
 
-	basePrice := int64(math.Round(p.Plan.BasePrice))
-	pricePerExtraIP := int64(math.Round(p.Plan.PricePerExtraIP))
-	pricePerGB := int64(math.Round(p.Plan.PricePerGB))
-	pricePerExtraMonth := int64(math.Round(p.Plan.PricePerExtraMonth))
+	basePrice := p.Plan.BasePriceToman
+	if basePath := int64(math.Round(p.Plan.BasePrice)); basePath > 0 && basePrice == 0 {
+		basePrice = basePath
+	}
+	pricePerExtraIP := p.Plan.PricePerExtraIPToman
+	if pIP := int64(math.Round(p.Plan.PricePerExtraIP)); pIP > 0 && pricePerExtraIP == 0 {
+		pricePerExtraIP = pIP
+	}
+	pricePerGB := p.Plan.PricePerGBToman
+	if pGB := int64(math.Round(p.Plan.PricePerGB)); pGB > 0 && pricePerGB == 0 {
+		pricePerGB = pGB
+	}
+	pricePerExtraMonth := p.Plan.PricePerExtraMonthToman
+	if pEM := int64(math.Round(p.Plan.PricePerExtraMonth)); pEM > 0 && pricePerExtraMonth == 0 {
+		pricePerExtraMonth = pEM
+	}
 
 	var trafficCost int64
 	var extraMonthCost int64
@@ -85,11 +97,11 @@ func CalculateQuote(p QuoteParams) *PurchaseQuote {
 	extraIPCost := int64(extraIPs) * pricePerExtraIP * int64(p.Months)
 	subtotal := baseCost + extraIPCost
 
-	discountPercent := bestDiscountPercent(p.Plan.DiscountTiers, p.Months)
+	discountBps := bestDiscountBasisPoints(p.Plan.DiscountTiers, p.Months)
 	var discountAmount int64
-	if discountPercent > 0 {
-		// Half-up integer rounding: (subtotal * percent*100 + 5000) / 10000
-		discountAmount = (subtotal*int64(math.Round(discountPercent*100)) + 5000) / 10000
+	if discountBps > 0 {
+		// Half-up integer rounding: (subtotal * discountBps + 5000) / 10000
+		discountAmount = (subtotal*discountBps + 5000) / 10000
 	}
 	if discountAmount > subtotal {
 		discountAmount = subtotal
@@ -121,12 +133,13 @@ func CalculateQuote(p QuoteParams) *PurchaseQuote {
 	}
 }
 
-func bestDiscountPercent(tiers []db.DiscountTier, months int) float64 {
+func bestDiscountBasisPoints(tiers []db.DiscountTier, months int) int64 {
 	sort.Slice(tiers, func(i, j int) bool { return tiers[i].Months < tiers[j].Months })
-	best := 0.0
+	best := int64(0)
 	for _, tier := range tiers {
-		if months >= tier.Months && tier.Percent > best {
-			best = tier.Percent
+		bps := tier.GetBasisPoints()
+		if months >= tier.Months && bps > best {
+			best = bps
 		}
 	}
 	return best
@@ -181,7 +194,9 @@ func quotesEqual(a, b *PurchaseQuote) bool {
 	if a == nil || b == nil {
 		return false
 	}
-	return a.PlanName == b.PlanName &&
+	return a.UserID == b.UserID &&
+		a.PlanID == b.PlanID &&
+		a.PlanName == b.PlanName &&
 		a.Months == b.Months &&
 		a.DurationDays == b.DurationDays &&
 		a.IPLimit == b.IPLimit &&

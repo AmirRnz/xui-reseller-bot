@@ -269,7 +269,7 @@ func showAdminDraftTestPlanMenu(c telebot.Context, draft map[string]interface{})
 		"📡 اینباندها: %s\n"+
 		"⏱️ مدت اعتبار: %s\n"+
 		"💾 محدودیت حجم: %s\n"+
-		"⚡ Flow: %s\n"+
+		"⚡ فلو: %s\n"+
 		"📊 سقف مجاز روزانه: %d\n"+
 		"👥 سطح دسترسی: %s\n"+
 		"🔄 همگام‌سازی اشتراک‌های فعال: %t\n"+
@@ -290,7 +290,7 @@ func showAdminDraftTestPlanMenu(c telebot.Context, draft map[string]interface{})
 	menu.Inline(
 		menu.Row(menu.Data("📝 نام", "admin_draft_edit", "test:name"), menu.Data("📝 توضیحات", "admin_draft_edit", "test:description"), menu.Data("📝 یادداشت‌ها", "admin_draft_edit", "test:usage_description")),
 		menu.Row(menu.Data("📡 اینباندها", "admin_draft_inbounds", "test"), menu.Data("⏱️ مدت اعتبار", "admin_draft_edit", "test:duration")),
-		menu.Row(menu.Data("💾 حجم مجاز", "admin_draft_edit", "test:max_data"), menu.Data("⚡ Flow", "admin_draft_edit", "test:flow")),
+		menu.Row(menu.Data("💾 حجم مجاز", "admin_draft_edit", "test:max_data"), menu.Data("⚡ فلو", "admin_draft_edit", "test:flow")),
 		menu.Row(menu.Data("📊 سقف روزانه", "admin_draft_edit", "test:max_per_day"), menu.Data("👥 دسترسی", "admin_draft_edit", "test:access")),
 		menu.Row(menu.Data("🌐 کاربر همزمان", "admin_draft_edit", "test:ip_limit"), menu.Data("🔄 همگام‌سازی: "+toggleEmoji(syncSubs), "admin_draft_toggle_sync", "test")),
 		menu.Row(menu.Data("💾 ذخیره طرح", "admin_draft_action", "test:save"), menu.Data("❌ انصراف", "admin_draft_action", "test:cancel")),
@@ -352,7 +352,7 @@ func showAdminDraftPaidPlanMenu(c telebot.Context, draft map[string]interface{})
 		"%s"+
 		"🌐 محدودیت کاربران همزمان: %s\n"+
 		"💲 قیمت هر کاربر اضافی: %s تومان\n"+
-		"⚡ Flow: %s\n"+
+		"⚡ فلو: %s\n"+
 		"🏷️ تخفیف‌های دوره‌ای: %s\n"+
 		"👥 سطح دسترسی: %s\n"+
 		"🔄 همگام‌سازی اشتراک‌های فعال: %t\n",
@@ -382,9 +382,9 @@ func showAdminDraftPaidPlanMenu(c telebot.Context, draft map[string]interface{})
 
 	if isLimited {
 		rows = append(rows, menu.Row(menu.Data("💵 قیمت/گیگ", "admin_draft_edit", "paid:price_per_gb"), menu.Data("💾 حداقل حجم", "admin_draft_edit", "paid:min_data_gb")))
-		rows = append(rows, menu.Row(menu.Data("⏱️ قیمت ماه اضافی", "admin_draft_edit", "paid:price_per_extra_month"), menu.Data("⚡ Flow", "admin_draft_edit", "paid:flow")))
+		rows = append(rows, menu.Row(menu.Data("⏱️ قیمت ماه اضافی", "admin_draft_edit", "paid:price_per_extra_month"), menu.Data("⚡ فلو", "admin_draft_edit", "paid:flow")))
 	} else {
-		rows = append(rows, menu.Row(menu.Data("💵 قیمت پایه", "admin_draft_edit", "paid:price"), menu.Data("⚡ Flow", "admin_draft_edit", "paid:flow")))
+		rows = append(rows, menu.Row(menu.Data("💵 قیمت پایه", "admin_draft_edit", "paid:price"), menu.Data("⚡ فلو", "admin_draft_edit", "paid:flow")))
 	}
 
 	rows = append(rows, menu.Row(menu.Data("🌐 کاربران همزمان", "admin_draft_edit", "paid:ip_limits"), menu.Data("💲 قیمت کاربر اضافی", "admin_draft_edit", "paid:extra_ip")))
@@ -451,12 +451,12 @@ func HandleAdminDraftEdit(c telebot.Context) error {
 		menu := &telebot.ReplyMarkup{}
 		menu.Inline(
 			menu.Row(menu.Data("⚡ xtls-rprx-vision", "admin_draft_set_flow", editingType+":xtls-rprx-vision")),
-			menu.Row(menu.Data("❌ بدون Flow (حذف)", "admin_draft_set_flow", editingType+":none")),
+			menu.Row(menu.Data("❌ بدون فلو (حذف)", "admin_draft_set_flow", editingType+":none")),
 			menu.Row(menu.Data("✏️ مقدار سفارشی دستی", "admin_draft_set_flow", editingType+":custom")),
 			menu.Row(menu.Data("⬅️ بازگشت", "admin_draft_set_flow", editingType+":back")),
 		)
 		currentFlow := draftGetString(draft, "flow")
-		prompt := fmt.Sprintf("⚡ **انتخاب نوع Flow**:\n\n**مقدار فعلی**: %s", nonEmpty(currentFlow, "(پیش‌فرض/خالی)"))
+		prompt := fmt.Sprintf("⚡ **انتخاب فلو**:\n\n**وضعیت فعلی**: %s", nonEmpty(currentFlow, "(پیش‌فرض/خالی)"))
 		return maybeEditOrSend(c, prompt, menu)
 	}
 
@@ -721,10 +721,10 @@ func HandleAdminDraftSetFlow(c telebot.Context) error {
 	switch choice {
 	case "xtls-rprx-vision":
 		draft["flow"] = "xtls-rprx-vision"
-		_ = c.Respond(&telebot.CallbackResponse{Text: "⚡ Flow روی xtls-rprx-vision تنظیم شد."})
+		_ = c.Respond(&telebot.CallbackResponse{Text: "⚡ فلو روی xtls-rprx-vision تنظیم شد."})
 	case "none":
 		draft["flow"] = ""
-		_ = c.Respond(&telebot.CallbackResponse{Text: "⚡ Flow حذف شد."})
+		_ = c.Respond(&telebot.CallbackResponse{Text: "⚡ فلو حذف شد."})
 	case "custom":
 		inputStateData := map[string]interface{}{
 			"editing_type":  planType,
@@ -732,7 +732,7 @@ func HandleAdminDraftSetFlow(c telebot.Context) error {
 			"draft":         draft,
 		}
 		bot.FSM.SetState(user.TelegramID, "awaiting_admin_draft_input", inputStateData)
-		prompt := "⚡ مقدار سفارشی Flow را ارسال کنید (مثال: 'xtls-rprx-vision-less'):\n\nبرای انصراف /cancel را بفرستید."
+		prompt := "⚡ مقدار سفارشی فلو را ارسال کنید (مثال: 'xtls-rprx-vision-less'):\n\nبرای انصراف /cancel را بفرستید."
 		return maybeEditOrSend(c, prompt)
 	case "back":
 		// Do nothing
@@ -1284,7 +1284,7 @@ func showAdminViewPlan(c telebot.Context, planType string, planID int64) error {
 		text = fmt.Sprintf("🧪 **طرح تست شماره %d**\n"+
 			"نام: %s\nتوضیحات: %s\nنکات کاربری: %s\nوضعیت فعال: %t\nدسترسی عمومی: %t\n"+
 			"اینباندها: %s\nمدت اعتبار: %s\nسقف حجم: %.2f گیگابایت\n"+
-			"Flow: %s\nسقف روزانه: %d\nمحدودیت کاربران همزمان: %s\nکاربران اختصاصی: %s",
+			"فلو: %s\nسقف روزانه: %d\nمحدودیت کاربران همزمان: %s\nکاربران اختصاصی: %s",
 			plan.ID, plan.Name, plan.Description, plan.UsageDescription, plan.Enabled, plan.IsGlobal,
 			inboundLabel(plan.InboundIDs), humanDuration(plan.ExpireSeconds),
 			float64(plan.MaxDataBytes)/1073741824, nonEmpty(plan.Flow, "پیش‌فرض/خالی"), plan.MaxPerDay, ipLimitLabel, formatAccessLabel(plan.IsGlobal, access))
@@ -1312,7 +1312,7 @@ func showAdminViewPlan(c telebot.Context, planType string, planID int64) error {
 		text = fmt.Sprintf("💼 **طرح خرید شماره %d**\n"+
 			"نام: %s\nتوضیحات: %s\nنکات کاربری: %s\nوضعیت فعال: %t\nدسترسی عمومی: %t\n"+
 			"اینباندها: %s\n%s\nمحدودیت کاربران: %s\n"+
-			"قیمت کاربر اضافی: %s تومان\nFlow: %s\nتخفیف‌ها: %s\nکاربران اختصاصی: %s",
+			"قیمت کاربر اضافی: %s تومان\nفلو: %s\nتخفیف‌ها: %s\nکاربران اختصاصی: %s",
 			plan.ID, plan.Name, plan.Description, plan.UsageDescription, plan.Enabled, plan.IsGlobal,
 			inboundLabel(plan.InboundIDs), priceBlock, ipLabel,
 			persian.FormatMoney(int64(plan.PricePerExtraIP)), nonEmpty(plan.Flow, "پیش‌فرض/خالی"), formatDiscountLabel(plan.DiscountTiers), formatAccessLabel(plan.IsGlobal, access))

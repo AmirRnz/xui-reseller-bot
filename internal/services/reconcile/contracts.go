@@ -349,6 +349,40 @@ func coerceInt64(v any) (int64, bool) {
 	return 0, false
 }
 
+// Helper to coerce an untyped value from a map into a slice of ints safely.
+func coerceIntSlice(v any) []int {
+	if v == nil {
+		return nil
+	}
+	switch s := v.(type) {
+	case []int:
+		res := make([]int, len(s))
+		copy(res, s)
+		return res
+	case []int64:
+		res := make([]int, len(s))
+		for i, x := range s {
+			res[i] = int(x)
+		}
+		return res
+	case []float64:
+		res := make([]int, len(s))
+		for i, x := range s {
+			res[i] = int(x)
+		}
+		return res
+	case []any:
+		var res []int
+		for _, item := range s {
+			if n, ok := coerceInt64(item); ok {
+				res = append(res, int(n))
+			}
+		}
+		return res
+	}
+	return nil
+}
+
 // Helper to coerce string value from map.
 func coerceString(v any) string {
 	if v == nil {
@@ -451,6 +485,10 @@ func DecodePurchaseProvisioning(raw map[string]any, fallbackUserID *int64, fallb
 	if planIDVal, ok := coerceInt64(raw["plan_id"]); ok {
 		id := int(planIDVal)
 		p.PlanID = &id
+	}
+
+	if inbounds := coerceIntSlice(raw["inbound_ids"]); len(inbounds) > 0 {
+		p.InboundIDs = inbounds
 	}
 
 	if months, ok := coerceInt64(raw["months"]); ok {
@@ -632,12 +670,8 @@ func DecodeDirectPaymentProvisioning(raw map[string]any, fallbackReqID *int64, f
 		p.PlanID = &id
 	}
 
-	if inboundsRaw, ok := raw["inbound_ids"].([]any); ok {
-		for _, item := range inboundsRaw {
-			if id, ok := coerceInt64(item); ok {
-				p.InboundIDs = append(p.InboundIDs, int(id))
-			}
-		}
+	if inbounds := coerceIntSlice(raw["inbound_ids"]); len(inbounds) > 0 {
+		p.InboundIDs = inbounds
 	}
 
 	if months, ok := coerceInt64(raw["months"]); ok {

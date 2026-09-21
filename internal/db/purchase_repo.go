@@ -214,6 +214,25 @@ func GetRefundRequestByID(ctx context.Context, id int64) (*RefundRequest, error)
 	return r, nil
 }
 
+func GetRefundRequestByOperationKey(ctx context.Context, operationKey string) (*RefundRequest, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	r := &RefundRequest{}
+	err := Pool.QueryRow(ctx, `
+		SELECT id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
+		FROM refund_requests
+		WHERE operation_key = $1
+	`, operationKey).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.CreatedAt, &r.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return r, nil
+}
+
 func ApproveRefundRequest(ctx context.Context, id int64, adminID int64, approvedAmount int64) (*RefundRequest, error) {
 	return ApproveRefundRequestAndCredit(ctx, id, adminID, approvedAmount)
 }

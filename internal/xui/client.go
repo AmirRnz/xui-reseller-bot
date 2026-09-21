@@ -249,6 +249,65 @@ func (c *Client) AddClientResult(req AddClientRequest) WriteResult {
 	return WriteResult{Outcome: WriteUnknown, Err: &WriteError{Outcome: WriteUnknown, Err: unknownErr}}
 }
 
+func (c *Client) UpdateClientPatch(email string, patch ClientPatch) error {
+	return c.UpdateClientPatchResult(email, patch).Err
+}
+
+func (c *Client) UpdateClientPatchResult(email string, patch ClientPatch) WriteResult {
+	current, err := c.GetClientByEmail(email)
+	if err != nil {
+		outcome := WriteDefinitiveFailure
+		if isTimeoutError(err) {
+			outcome = WriteUnknown
+		}
+		return WriteResult{Outcome: outcome, Err: &WriteError{Outcome: outcome, Err: fmt.Errorf("cannot read current x-ui client %s: %w", email, err)}}
+	}
+	if current == nil {
+		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: fmt.Errorf("%w: client %s", ErrNotFound, email)}}
+	}
+
+	merged := mergeClientConfigWithPatch(*current, patch)
+	endpoint := "/panel/api/clients/update/" + pathEscape(email)
+	err = c.doRequest("POST", endpoint, merged, nil)
+	if err == nil {
+		return WriteResult{Outcome: WriteSucceeded}
+	}
+	if !isTimeoutError(err) {
+		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: err}}
+	}
+
+	// Timeout or network error! Verification step:
+	remote, verifyErr := c.GetClientByEmail(email)
+	if verifyErr == nil && remote != nil {
+		matches := true
+		if patch.Enable != nil && remote.Enable != *patch.Enable {
+			matches = false
+		}
+		if patch.ExpiryTime != nil && remote.ExpiryTime != *patch.ExpiryTime {
+			matches = false
+		}
+		if patch.LimitIP != nil && remote.LimitIP != *patch.LimitIP {
+			matches = false
+		}
+		if patch.TotalGB != nil && remote.TotalGB != *patch.TotalGB {
+			matches = false
+		}
+
+		if matches {
+			return WriteResult{Outcome: WriteSucceeded}
+		}
+		return WriteResult{
+			Outcome: WriteUnknown,
+			Err:     &WriteError{Outcome: WriteUnknown, Err: fmt.Errorf("timeout verification failed: remote state does not reflect patched fields for %s: %w", email, err)},
+		}
+	}
+
+	if verifyErr != nil {
+		err = fmt.Errorf("%w (verification: %v)", err, verifyErr)
+	}
+	return WriteResult{Outcome: WriteUnknown, Err: &WriteError{Outcome: WriteUnknown, Err: fmt.Errorf("x-ui update client patch outcome is unknown for %s: %w", email, err)}}
+}
+
 func (c *Client) UpdateClientResult(email string, client ClientConfig) WriteResult {
 	current, err := c.GetClientByEmail(email)
 	if err != nil {
@@ -257,6 +316,9 @@ func (c *Client) UpdateClientResult(email string, client ClientConfig) WriteResu
 			outcome = WriteUnknown
 		}
 		return WriteResult{Outcome: outcome, Err: &WriteError{Outcome: outcome, Err: fmt.Errorf("cannot read current x-ui client %s: %w", email, err)}}
+	}
+	if current == nil {
+		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: fmt.Errorf("%w: client %s", ErrNotFound, email)}}
 	}
 	merged := mergeClientConfig(*current, client)
 	endpoint := "/panel/api/clients/update/" + pathEscape(email)
@@ -269,8 +331,14 @@ func (c *Client) UpdateClientResult(email string, client ClientConfig) WriteResu
 	}
 
 	remote, verifyErr := c.GetClientByEmail(email)
-	if verifyErr == nil && remote != nil && clientMatchesUpdate(*remote, merged) {
-		return WriteResult{Outcome: WriteSucceeded}
+	if verifyErr == nil && remote != nil {
+		if clientMatchesUpdate(*remote, merged) {
+			return WriteResult{Outcome: WriteSucceeded}
+		}
+		return WriteResult{
+			Outcome: WriteUnknown,
+			Err:     &WriteError{Outcome: WriteUnknown, Err: fmt.Errorf("timeout verification failed: remote state does not reflect patched fields for %s: %w", email, err)},
+		}
 	}
 	unknownErr := fmt.Errorf("x-ui update client outcome is unknown for %s: %w", email, err)
 	if verifyErr != nil {
@@ -427,6 +495,61 @@ func mergeClientConfig(current XUIClientInfo, desired ClientConfig) ClientConfig
 	}
 	if desired.Auth != "" {
 		merged.Auth = desired.Auth
+	}
+
+	return merged
+}
+
+func mergeClientConfigWithPatch(current XUIClientInfo, patch ClientPatch) ClientConfig {
+	currentID := current.UUID
+	if currentID == "" && current.ID != 0 {
+		currentID = strconv.Itoa(current.ID)
+	}
+
+	merged := ClientConfig{
+		ID:                  currentID,
+		Email:               current.Email,
+		Enable:              current.Enable,
+		ExpiryTime:          current.ExpiryTime,
+		Flow:                current.Flow,
+		Group:               current.Group,
+		LimitIP:             current.LimitIP,
+		Reset:               current.Reset,
+		ResetDay:            current.ResetDay,
+		ResetMax:            current.ResetMax,
+		Security:            current.Security,
+		SubID:               current.SubID,
+		TgID:                current.TgID,
+		TotalGB:             current.TotalGB,
+		Comment:             current.Comment,
+		Password:            current.Password,
+		Auth:                current.Auth,
+		LimitHWID:           current.LimitHWID,
+		KeepAlive:           current.KeepAlive,
+		PrivateKey:          current.PrivateKey,
+		PublicKey:           current.PublicKey,
+		PreSharedKey:        current.PreSharedKey,
+		AllowedIPs:          current.AllowedIPs,
+		AllowedIPsByInbound: current.AllowedIPsByInbound,
+		Secret:              current.Secret,
+		AdTag:               current.AdTag,
+		ForwardedPorts:      current.ForwardedPorts,
+		TrafficReset:        current.TrafficReset,
+		TrafficResetDay:     current.TrafficResetDay,
+		Reverse:             current.Reverse,
+	}
+
+	if patch.Enable != nil {
+		merged.Enable = *patch.Enable
+	}
+	if patch.ExpiryTime != nil {
+		merged.ExpiryTime = *patch.ExpiryTime
+	}
+	if patch.LimitIP != nil {
+		merged.LimitIP = *patch.LimitIP
+	}
+	if patch.TotalGB != nil {
+		merged.TotalGB = *patch.TotalGB
 	}
 
 	return merged
@@ -648,20 +771,29 @@ func (c *Client) GetClientByEmail(email string) (*XUIClientInfo, error) {
 	return &client, nil
 }
 
-// FindClientBySubID searches for a client by subId using targeted paged search (/panel/api/clients/list/paged?search={subId}&pageSize=10).
-// If found, it fetches the full client details via GetClientByEmail.
+// FindClientBySubID searches for a client by subId using targeted paged search (/panel/api/clients/list/paged?search={subId}&pageSize=10&page={page}).
+// It checks up to 3 pages (pageSize=10). If found, it fetches the full client details via GetClientByEmail.
+// It never falls back to an unconstrained fleet scan.
 func (c *Client) FindClientBySubID(subID string) (*XUIClientInfo, error) {
 	subID = strings.TrimSpace(subID)
 	if subID == "" {
 		return nil, ErrNotFound
 	}
-	endpoint := fmt.Sprintf("/panel/api/clients/list/paged?search=%s&pageSize=10", url.QueryEscape(subID))
-	var pageResp struct {
-		Filtered int             `json:"filtered"`
-		Items    []XUIClientInfo `json:"items"`
-	}
-	err := c.doRequest("GET", endpoint, nil, &pageResp)
-	if err == nil {
+
+	for page := 1; page <= 3; page++ {
+		endpoint := fmt.Sprintf("/panel/api/clients/list/paged?search=%s&pageSize=10&page=%d", url.QueryEscape(subID), page)
+		var pageResp struct {
+			Filtered int             `json:"filtered"`
+			Items    []XUIClientInfo `json:"items"`
+		}
+		err := c.doRequest("GET", endpoint, nil, &pageResp)
+		if err != nil {
+			if IsNotFound(err) {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+
 		for _, item := range pageResp.Items {
 			if item.SubID == subID {
 				fullClient, fullErr := c.GetClientByEmail(item.Email)
@@ -671,18 +803,11 @@ func (c *Client) FindClientBySubID(subID string) (*XUIClientInfo, error) {
 				return &item, nil
 			}
 		}
-		return nil, ErrNotFound
-	}
 
-	// Fallback to ListClients if paged endpoint fails or is unsupported
-	clients, listErr := c.ListClients()
-	if listErr != nil {
-		return nil, err
-	}
-	for _, client := range clients {
-		if client.SubID == subID {
-			return &client, nil
+		if len(pageResp.Items) == 0 || page*10 >= pageResp.Filtered {
+			break
 		}
 	}
+
 	return nil, ErrNotFound
 }

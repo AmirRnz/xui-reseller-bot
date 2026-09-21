@@ -1,6 +1,6 @@
 # Current Architecture — `xui-resell-bot`
 
-Updated 2026-09-21 after the stabilization, correctness, typed reconciliation contracts, and release hardening pass.
+Updated 2026-09-22 after fixing production blockers, reconciliation CAS & terminal-state protection, durable payment intents, integer pricing, reseller cancellation recovery, and release hardening pass.
 
 ## Supported 3x-ui pin
 
@@ -10,16 +10,32 @@ Updated 2026-09-21 after the stabilization, correctness, typed reconciliation co
 
 Both bots are Persian-only (`internal/bot/persian`).
 - Zero English strings in any customer or admin Telegram flows.
+- Strict Persian terminology: `Flow` is translated to `فلو`.
+- Admin Reconciliation UI maps reconciliation kinds (`purchase_provisioning` -> `ایجاد اشتراک خرید`, etc.) and statuses (`pending` -> `در انتظار پردازش`, etc.) to clean Persian labels.
 - Reusable message builders and formatters for prices (`FormatMoney`), IP limits (`FormatIPLimit` with explicit concurrent IP terminology `حداکثر N آی‌پی همزمان`), traffic (`FormatTraffic`), dates, and lifecycle notifications.
 - No multilingual runtime, locale branching, or i18n package.
-- Customer-safe error messages with tracking IDs (`SafeErrorMessage`), zero raw `err.Error()` / `%v` leaks.
+- Customer-safe error messages with tracking IDs, zero raw `err.Error()` / `%v` leaks.
 
 ## Integer Toman Accounting & Pricing Snapshots
 
 - **Currency Unit**: Strictly Persian Toman (`"تومان"`). All prices, debits, credits, and refunds strictly use integer Toman (`int64` / `BIGINT`).
+- **Integer Pricing Fields**: `PaidPlan` models feature `BasePriceToman`, `PricePerExtraIPToman`, `PricePerGBToman`, and `PricePerExtraMonthToman` to eliminate floating-point arithmetic.
+- **Basis Points Discounts**: `DiscountTier` uses `BasisPoints int64` (`10000 = 100%`) for exact integer math.
 - **Quote Snapshots**: Before debiting wallet balances or submitting direct payment requests, an immutable quote snapshot is generated via `pricing.CalculateQuote` and persisted to `pricing_quotes`.
 - **Auditable Lifecycle**: The `quote_id` is linked to `purchase_requests.quote_id` and `subscriptions.quote_id`.
-- **Checkout Integrity**: Purchases charge exact stored `quote.FinalPriceToman` rather than recalculating from live plan catalog.
+- **Checkout Integrity**: Purchases charge exact stored `quote.FinalPriceToman` rather than recalculating from live plan catalog. Quote equality verification strictly asserts user and plan identity.
+
+## Database Migrations (Version 6)
+
+- **Payment Intents**: `payment_intents` table tracks durable checkout intents (`card_number`, `amount_toman`, `intent_type`, `status`) before presenting bank/card details, ensuring receipt submission survives bot restarts.
+- **Bulk Credit Operations**: `bulk_credit_operations` table tracks atomic bulk credit batches (`operation_key`, `amount_toman`, `recipient_count`, `recipient_user_ids`) with idempotency guards.
+- **Reconciliation CAS & Terminal Protection**: State transition CAS ensures reconciliation records can only transition from active pending/retryable states. Updates to terminal records (`completed`, `failed`, `manually_resolved`) are rejected.
+
+## Safe 3x-ui ClientPatch & Bounded Pagination
+
+- **ClientPatch Semantics**: Targeted updates via `ClientPatch` use pointers to distinguish between zero-value changes (`limitIp=0`, `expiryTime=0`) and unset fields. Unmanaged metadata (`subId`, `flow`, `group`, `tgId`) is strictly preserved from full remote readback.
+- **Strict Timeout Verification**: On remote timeout during client update, readback verification requires patched fields to match before reporting `WriteSucceeded`. Mismatched readback or missing client returns `WriteUnknown`.
+- **Bounded Pagination**: `FindClientBySubID` uses targeted paged endpoint (`/panel/api/clients/list/paged?search={subId}&pageSize=10&page={page}`) bounded to at most 3 pages (`page=1..3`). Unconstrained `ListClients()` fallback scans have been completely eliminated from user-facing paths.
 
 ## DB → bot → 3x-ui flow
 
@@ -36,10 +52,10 @@ Both bots are Persian-only (`internal/bot/persian`).
      - Performs 3-way desired-vs-observed update comparison.
      - Executes idempotent wallet refunds (`db.ErrWalletOperationAlreadyApplied`).
 4. **Telebot**: Starts in webhook or long-poll mode with authentication/admin middleware, FSM, and per-user locking.
-5. **PostgreSQL Authority**: Commercial source of truth for users, plans, subscriptions, wallet balances, transactions, purchase requests, quotes, outbox events, and reconciliation records. Subscription rows are preserved for historical audit.
+5. **PostgreSQL Authority**: Commercial source of truth for users, plans, subscriptions, wallet balances, transactions, purchase requests, quotes, outbox events, payment intents, and reconciliation records. Subscription rows are preserved for historical audit.
 6. **Remote Create Compensation**: If 3x-ui creation succeeds but DB insertion fails, synchronous compensating deletion is attempted. If outcome is ambiguous, a reconciliation record is created.
 7. **Direct Payment Provisioning**: When an admin approves a direct payment, payment approval is recorded immediately. If remote provisioning fails, a `direct_payment_provisioning_retry` reconciliation record is created for the worker.
-8. **Cancellation & Refunds**: Cancellation in reseller bot immediately checks for active XUI connection. If remote delete is ambiguous or DB fails, reconciliation records are created.
+8. **Cancellation & Refunds**: Cancellation in reseller bot immediately checks for active XUI connection. If remote delete is ambiguous or DB fails, reconciliation records are created. Legacy subscriptions without quotes route to admin manual refund review with `CalculatedAmount = 0` to preserve accounting safety.
 9. **Admin Reconciliation UI**: Telegram admin interface with inspection (`admin_reconcile_detail`), immediate retry (`admin_reconcile_retry`), manual review flag (`admin_reconcile_mark_manual`), and auditable manual close requiring reason input (`admin_reconcile_close`).
 
 ## Baseline test inventory
@@ -48,12 +64,12 @@ Both bots are Persian-only (`internal/bot/persian`).
   - `internal/bot`: **PASS**
   - `internal/bot/handlers`: **PASS** (100% pass)
   - `internal/bot/persian`: **PASS** (100% pass)
-  - `internal/db`: **PASS** (100% pass)
+  - `internal/db`: **PASS** (100% pass including concurrency, migration v6, and payment intents)
   - `internal/fsm`: **PASS**
   - `internal/services/outbox`: **PASS** (100% pass)
-  - `internal/services/pricing`: **PASS** (100% pass)
-  - `internal/services/reconcile`: **PASS** (100% pass)
-  - `internal/xui`: **PASS** (100% pass including contract tests)
+  - `internal/services/pricing`: **PASS** (100% pass including integer pricing and basis points)
+  - `internal/services/reconcile`: **PASS** (100% pass including contracts, identity checks, and ProcessOnce integration)
+  - `internal/xui`: **PASS** (100% pass including contract tests, ClientPatch, and bounded pagination)
   - `tests/e2e`: **PASS** (100% pass)
 - `go vet ./...` — **PASS**, zero diagnostics.
 - `gofmt -l .` — **PASS**, zero unformatted files.

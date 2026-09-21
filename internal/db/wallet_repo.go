@@ -263,6 +263,13 @@ func CreditAllApprovedUsersWithKey(ctx context.Context, amount int64, descriptio
 	defer tx.Rollback(ctx)
 
 	if operationKey != "" {
+		var existingOpID int64
+		err := tx.QueryRow(ctx, `SELECT id FROM bulk_credit_operations WHERE operation_key = $1`, operationKey).Scan(&existingOpID)
+		if err == nil {
+			_ = tx.Rollback(ctx)
+			return 0, ErrWalletOperationAlreadyApplied
+		}
+
 		tag, err := tx.Exec(ctx, `
 			WITH inserted_txs AS (
 				INSERT INTO transactions (user_id, amount, type, status, description, operation_key)
@@ -292,6 +299,15 @@ func CreditAllApprovedUsersWithKey(ctx context.Context, amount int64, descriptio
 				return 0, ErrWalletOperationAlreadyApplied
 			}
 		}
+
+		_, _ = tx.Exec(ctx, `
+			INSERT INTO bulk_credit_operations (operation_key, amount, admin_id, recipient_user_ids, status, created_at)
+			SELECT $1, $2, NULL, COALESCE(ARRAY_AGG(user_id), '{}'), 'completed', NOW()
+			FROM (
+				SELECT DISTINCT user_id FROM transactions WHERE operation_key LIKE $1 || ':user:%'
+			) s
+			ON CONFLICT (operation_key) DO NOTHING
+		`, operationKey, amount)
 
 		return count, tx.Commit(ctx)
 	}

@@ -247,7 +247,16 @@ func ProcessBulkCredit(c telebot.Context, amountStr string) error {
 	if err != nil || amount <= 0 {
 		return c.Send("مبلغ نامعتبر است. لطفاً یک عدد صحیح مثبت به تومان وارد کنید.")
 	}
-	operationKey := fmt.Sprintf("%v", bot.FSM.GetState(admin.TelegramID).Data["operation_key"])
+	var operationKey string
+	state := bot.FSM.GetState(admin.TelegramID)
+	if state != nil && state.Data != nil {
+		if k, ok := state.Data["operation_key"]; ok && k != nil && k != "" && k != "<nil>" {
+			operationKey = fmt.Sprintf("%v", k)
+		}
+	}
+	if operationKey == "" {
+		operationKey = "bulk_admin_credit:" + makeSubID()
+	}
 	count, err := db.CreditAllApprovedUsersWithKey(context.Background(), amount, "admin bulk credit", operationKey)
 	if err != nil {
 		if errors.Is(err, db.ErrWalletOperationAlreadyApplied) {

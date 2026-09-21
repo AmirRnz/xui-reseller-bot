@@ -1,6 +1,9 @@
 package db
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 const (
 	UserStatusPending             = "pending"
@@ -77,8 +80,16 @@ type WalletTransaction struct {
 }
 
 type DiscountTier struct {
-	Months  int     `json:"months"`
-	Percent float64 `json:"percent"`
+	Months      int     `json:"months"`
+	Percent     float64 `json:"percent"`
+	BasisPoints int64   `json:"basis_points,omitempty"`
+}
+
+func (d DiscountTier) GetBasisPoints() int64 {
+	if d.BasisPoints > 0 {
+		return d.BasisPoints
+	}
+	return int64(math.Round(d.Percent * 100))
 }
 
 type TestPlan struct {
@@ -100,26 +111,30 @@ type TestPlan struct {
 }
 
 type PaidPlan struct {
-	ID                 int64          `json:"id"`
-	Name               string         `json:"name"`
-	Description        string         `json:"description"`
-	UsageDescription   string         `json:"usage_description"`
-	InboundIDs         []int          `json:"inbound_ids"`
-	BasePrice          float64        `json:"base_price"`
-	BaseIPLimit        int            `json:"base_ip_limit"`
-	MaxIPLimit         int            `json:"max_ip_limit"`
-	PricePerExtraIP    float64        `json:"price_per_extra_ip"`
-	Flow               string         `json:"flow"`
-	DiscountTiers      []DiscountTier `json:"discount_tiers"`
-	IsGlobal           bool           `json:"is_global"`
-	Enabled            bool           `json:"enabled"`
-	SyncSubs           bool           `json:"sync_subs"`
-	IsLimited          bool           `json:"is_limited"`
-	PricePerGB         float64        `json:"price_per_gb"`
-	MinDataGB          int64          `json:"min_data_gb"`
-	PricePerExtraMonth float64        `json:"price_per_extra_month"`
-	CreatedAt          time.Time      `json:"created_at"`
-	UpdatedAt          time.Time      `json:"updated_at"`
+	ID                      int64          `json:"id"`
+	Name                    string         `json:"name"`
+	Description             string         `json:"description"`
+	UsageDescription        string         `json:"usage_description"`
+	InboundIDs              []int          `json:"inbound_ids"`
+	BasePrice               float64        `json:"base_price"`
+	BasePriceToman          int64          `json:"base_price_toman"`
+	BaseIPLimit             int            `json:"base_ip_limit"`
+	MaxIPLimit              int            `json:"max_ip_limit"`
+	PricePerExtraIP         float64        `json:"price_per_extra_ip"`
+	PricePerExtraIPToman    int64          `json:"price_per_extra_ip_toman"`
+	Flow                    string         `json:"flow"`
+	DiscountTiers           []DiscountTier `json:"discount_tiers"`
+	IsGlobal                bool           `json:"is_global"`
+	Enabled                 bool           `json:"enabled"`
+	SyncSubs                bool           `json:"sync_subs"`
+	IsLimited               bool           `json:"is_limited"`
+	PricePerGB              float64        `json:"price_per_gb"`
+	PricePerGBToman         int64          `json:"price_per_gb_toman"`
+	MinDataGB               int64          `json:"min_data_gb"`
+	PricePerExtraMonth      float64        `json:"price_per_extra_month"`
+	PricePerExtraMonthToman int64          `json:"price_per_extra_month_toman"`
+	CreatedAt               time.Time      `json:"created_at"`
+	UpdatedAt               time.Time      `json:"updated_at"`
 }
 
 type Plan struct {

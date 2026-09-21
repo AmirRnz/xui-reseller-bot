@@ -431,18 +431,8 @@ func HandleDeleteSubscriptionConfirm(c telebot.Context) error {
 		if quote != nil {
 			refundAmount, refundReason = pricing.CalculateRefund(quote, sub, nowUTC())
 		} else {
-			plan, _ := paidPlanForSub(sub)
-			factorStr, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-			var factor float64
-			if factorStr != "" {
-				factor, _ = strconv.ParseFloat(factorStr, 64)
-			}
-			refundAmount = CalculateRefund(plan, sub, factor, nowUTC())
-			if refundAmount > 0 {
-				refundReason = fmt.Sprintf("محاسبه تقریبی بر اساس %d ماه باقیمانده (سرویس قدیمی فاقد فاکتور)", int(sub.EndDate.Sub(nowUTC()).Hours()/24/30))
-			} else {
-				refundReason = "زمان باقیمانده کافی نیست یا سرویس فاقد فاکتور است"
-			}
+			refundAmount = 0
+			refundReason = "سرویس قدیمی فاقد فاکتور سیستمی است؛ استرداد خودکار غیرفعال بوده و در صورت نیاز پس از حذف توسط مدیریت بررسی می‌شود."
 		}
 	}
 
@@ -559,12 +549,25 @@ func HandleDeleteSubscription(c telebot.Context) error {
 			log.Printf("[CRITICAL] failed to persist cancellation reconciliation for subscription %d: %v", sub.ID, recErr)
 		}
 		return c.Send("حذف در پنل انجام شد اما ثبت لغو در دیتابیس ناموفق بود؛ لطفا با پشتیبانی تماس بگیرید.")
+	} else if sub.PlanType == db.PlanTypePaid && sub.QuoteID == nil {
+		subID64 := int64(sub.ID)
+		legacyReq := &db.RefundRequest{
+			UserID:           user.ID,
+			SubscriptionID:   &subID64,
+			CalculatedAmount: 0,
+			Status:           "pending",
+			OperationKey:     fmt.Sprintf("subscription_cancel_legacy_manual_refund:%d", sub.ID),
+		}
+		if reqErr := db.CreateRefundRequest(context.Background(), legacyReq); reqErr == nil {
+			req = legacyReq
+		} else {
+			log.Printf("[REFUND] Failed to create manual refund review for legacy sub %d: %v", sub.ID, reqErr)
+		}
 	}
 
 	bot.FSM.ClearState(user.TelegramID)
 
 	if req != nil && req.ID != 0 && req.Status == "pending" {
-
 		// Notify Admins
 		if config.Global != nil {
 			for _, adminID := range config.Global.Admin.AdminIDs {
@@ -575,17 +578,27 @@ func HandleDeleteSubscription(c telebot.Context) error {
 						menu.Data("رد استرداد", "admin_reject_refund", fmt.Sprintf("%d", req.ID)),
 					),
 				)
-				currency, _ := db.GetSetting(context.Background(), "currency_name")
-				if currency == "" {
-					currency = "تومان"
+				var caption string
+				if refundAmount > 0 {
+					currency, _ := db.GetSetting(context.Background(), "currency_name")
+					if currency == "" {
+						currency = "تومان"
+					}
+					caption = fmt.Sprintf("📥 **درخواست استرداد وجه حذف سرویس #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک حذف شده: `%s`\nمبلغ درخواستی: %s %s",
+						req.ID, user.Username, user.TelegramID, sub.ClientEmail, persian.FormatMoney(refundAmount), currency)
+				} else {
+					caption = fmt.Sprintf("📥 **درخواست بررسی دستی استرداد وجه سرویس قدیمی #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک حذف شده: `%s`\nمبلغ: فاقد فاکتور سیستمی (نیازمند تعیین دستی)",
+						req.ID, user.Username, user.TelegramID, sub.ClientEmail)
 				}
-				caption := fmt.Sprintf("📥 **درخواست استرداد وجه حذف سرویس #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک حذف شده: `%s`\nمبلغ درخواستی: %d %s",
-					req.ID, user.Username, user.TelegramID, sub.ClientEmail, refundAmount, currency)
 				_, _ = bot.Bot.Send(&telebot.User{ID: adminID}, caption, menu)
 			}
 		}
 
-		_ = c.Send("سرویس با موفقیت حذف شد. درخواست استرداد وجه برای تایید به مدیریت ارسال گردید.")
+		if refundAmount > 0 {
+			_ = c.Send("سرویس با موفقیت حذف شد. درخواست استرداد وجه برای تایید به مدیریت ارسال گردید.")
+		} else {
+			_ = c.Send("سرویس با موفقیت حذف شد. به دلیل قدیمی بودن سرویس و عدم وجود فاکتور سیستمی، درخواست بررسی استرداد وجه به مدیریت ارسال گردید.")
+		}
 	} else {
 		_ = c.Send("سرویس با موفقیت حذف شد.")
 	}
@@ -598,6 +611,16 @@ func persistDeleteReconciliation(sub *db.Subscription, user *db.User, refundAmou
 		return
 	}
 	subID := int64(sub.ID)
+	userID := user.ID
+	rec := reconcile.NewSubscriptionDeleteRecord(&reconcile.SubscriptionDeletePayload{
+		SubscriptionID:     &subID,
+		UserID:             &userID,
+		ClientEmail:        sub.ClientEmail,
+		RefundAmount:       refundAmount,
+		RefundOperationKey: fmt.Sprintf("sub:delete:%d:refund", sub.ID),
+		Reason:             "cancellation deletion unknown",
+	})
+	rec.OperationKey = fmt.Sprintf("subscription_delete_reconciliation:%d", sub.ID)
 	observed := map[string]any{"delete_outcome": "unknown"}
 	if deleteErr != nil {
 		observed["delete_error"] = deleteErr.Error()
@@ -605,19 +628,11 @@ func persistDeleteReconciliation(sub *db.Subscription, user *db.User, refundAmou
 	if verifyErr != nil {
 		observed["verification_error"] = verifyErr.Error()
 	}
-	if err := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
-		OperationKey:   fmt.Sprintf("subscription_delete_reconciliation:%d", sub.ID),
-		Kind:           "subscription_delete_unknown",
-		UserID:         &user.ID,
-		SubscriptionID: &subID,
-		DesiredState: map[string]any{
-			"remote":        "absent",
-			"status":        db.SubscriptionStatusCancelled,
-			"refund_amount": refundAmount,
-		},
-		ObservedState: observed,
-		ErrorMessage:  deleteErr.Error(),
-	}); err != nil {
+	rec.ObservedState = observed
+	if deleteErr != nil {
+		rec.ErrorMessage = deleteErr.Error()
+	}
+	if err := db.CreateReconciliationRecord(context.Background(), rec); err != nil {
 		log.Printf("[CRITICAL] failed to persist delete reconciliation for subscription %d: %v", sub.ID, err)
 	}
 }
@@ -766,7 +781,7 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 			desiredActive := sub.IsActive
 			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &newLimit, sub.ExpireTime, &desiredActive, "wallet IP upgrade has unknown 3x-ui outcome"); recErr != nil {
 				log.Printf("[CRITICAL] failed to mark IP upgrade reconciliation for subscription %d: %v", sub.ID, recErr)
-				return c.Send(fmt.Sprintf("نتیجه ارتقا در پنل نامشخص است؛ مبلغ بازگردانده نشد اما ثبت خودکار تطبیق با خطا مواجه شد (%v). هیچ درخواستی به‌طور خودکار ثبت نشده است؛ لطفا با پشتیبانی تماس بگیرید.", recErr))
+				return c.Send("نتیجه ارتقا در پنل نامشخص است؛ مبلغ بازگردانده نشد اما ثبت خودکار تطبیق با خطا مواجه شد. هیچ درخواستی به‌طور خودکار ثبت نشده است؛ لطفا با پشتیبانی تماس بگیرید.")
 			}
 			return c.Send("نتیجه ارتقا در پنل نامشخص است؛ مبلغ بازگردانده نشد و وضعیت برای تطبیق ثبت شد.")
 		}
@@ -776,7 +791,8 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 			return c.Send("خطا در بروزرسانی پنل. مبلغ ارتقا به کیف پول شما بازگردانده شد.")
 		}
 		if refundRes.ReconciliationPersisted {
-			return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد (%v). عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", refundRes.RefundErr, operationKey+":refund"))
+			log.Printf("[ERROR] IP upgrade refund failed: %v", refundRes.RefundErr)
+			return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد. عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", operationKey+":refund"))
 		}
 		log.Printf("[CRITICAL] failed to refund wallet and failed to persist reconciliation for user %d, opKey %s: refundErr=%v, reconErr=%v", user.ID, operationKey+":refund", refundRes.RefundErr, refundRes.ReconciliationErr)
 		return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد و بازگشت خودکار وجه نیز با خطا مواجه شد. ثبت خودکار گزارش خطا نیز با خطا مواجه گردید؛ هیچ درخواستی به‌طور خودکار در سیستم ثبت نشده است. لطفا فورا با ارسال شناسه زیر به پشتیبانی اطلاع دهید:\n%s", operationKey+":refund"))
@@ -827,13 +843,33 @@ func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 		currency = "تومان"
 	}
 
-	// Change state to awaiting_purchase_receipt with IP upgrade metadata
-	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", map[string]interface{}{
+	callbackToken := newOperationToken()
+	subID64 := int64(sub.ID)
+	fsmData := map[string]interface{}{
 		"type":            "upgrade_ip",
 		"subscription_id": fmt.Sprintf("%d", sub.ID),
 		"ip_limit":        fmt.Sprintf("%d", newLimit),
 		"price":           fmt.Sprintf("%d", cost),
-	})
+		"price_toman":     fmt.Sprintf("%d", cost),
+		"operation_key":   operationKeyFromToken("direct_upgrade_ip", callbackToken),
+		"operation_token": callbackToken,
+	}
+	intent := &db.PaymentIntent{
+		UserID:               user.ID,
+		IntentToken:          callbackToken,
+		ActionType:           "upgrade_ip",
+		SubscriptionID:       &subID64,
+		AmountToman:          cost,
+		Months:               months,
+		IPLimit:              newLimit,
+		ClientEmail:          sub.ClientEmail,
+		ProvisioningSnapshot: fsmData,
+		Status:               db.IntentStatusAwaitingReceipt,
+	}
+	if _, err := db.CreatePaymentIntent(context.Background(), intent); err != nil {
+		log.Printf("[INTENT] Failed to create payment intent for user %d IP upgrade: %v", user.ID, err)
+	}
+	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", fsmData)
 
 	var text strings.Builder
 	text.WriteString("💳 **پرداخت مستقیم برای ارتقای تعداد کاربران همزمان**\n\n")
@@ -1075,7 +1111,7 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		if xui.IsUnknownOutcome(err) {
 			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, nil, desiredExpireTime, &desiredActive, "wallet extension has unknown 3x-ui outcome"); recErr != nil {
 				log.Printf("[CRITICAL] failed to mark extension reconciliation for subscription %d: %v", sub.ID, recErr)
-				return c.Send(fmt.Sprintf("نتیجه تمدید در پنل نامشخص است؛ مبلغ بازگردانده نشد اما ثبت خودکار تطبیق با خطا مواجه شد (%v). هیچ درخواستی به‌طور خودکار ثبت نشده است؛ لطفا با پشتیبانی تماس بگیرید.", recErr))
+				return c.Send("نتیجه تمدید در پنل نامشخص است؛ مبلغ بازگردانده نشد اما ثبت خودکار تطبیق با خطا مواجه شد. هیچ درخواستی به‌طور خودکار ثبت نشده است؛ لطفا با پشتیبانی تماس بگیرید.")
 			}
 			return c.Send("نتیجه تمدید در پنل نامشخص است؛ مبلغ بازگردانده نشد و وضعیت برای تطبیق ثبت شد.")
 		}
@@ -1085,7 +1121,8 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 			return c.Send("خطا در بروزرسانی پنل. مبلغ تمدید به کیف پول شما بازگردانده شد.")
 		}
 		if refundRes.ReconciliationPersisted {
-			return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول با خطا مواجه شد (%v). عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", refundRes.RefundErr, operationKey+":refund"))
+			log.Printf("[ERROR] Extension refund failed: %v", refundRes.RefundErr)
+			return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد، اما بازگشت خودکار وجه به کیف پول با خطا مواجه شد. عملیات با شناسه پیگیری %s جهت بررسی و تطبیق ثبت گردید.", operationKey+":refund"))
 		}
 		log.Printf("[CRITICAL] failed to refund wallet and failed to persist reconciliation for user %d, opKey %s: refundErr=%v, reconErr=%v", user.ID, operationKey+":refund", refundRes.RefundErr, refundRes.ReconciliationErr)
 		return c.Send(fmt.Sprintf("خطا در بروزرسانی پنل رخ داد و بازگشت خودکار وجه نیز با خطا مواجه شد. ثبت خودکار گزارش خطا نیز با خطا مواجه گردید؛ هیچ درخواستی به‌طور خودکار در سیستم ثبت نشده است. لطفا فورا با ارسال شناسه زیر به پشتیبانی اطلاع دهید:\n%s", operationKey+":refund"))
@@ -1137,13 +1174,40 @@ func HandleExtendSubscriptionDirect(c telebot.Context) error {
 		currency = "تومان"
 	}
 
-	// Change state to awaiting_purchase_receipt with Extend metadata
-	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", map[string]interface{}{
+	operationToken := newOperationToken()
+	subID64 := int64(sub.ID)
+	var planID64Ptr *int64
+	if plan != nil {
+		p64 := int64(plan.ID)
+		planID64Ptr = &p64
+	}
+	extendData := map[string]interface{}{
 		"type":            "extend",
 		"subscription_id": fmt.Sprintf("%d", sub.ID),
 		"months":          fmt.Sprintf("%d", months),
 		"price":           fmt.Sprintf("%d", cost),
-	})
+		"price_toman":     fmt.Sprintf("%d", cost),
+		"operation_key":   operationKeyFromToken("direct_extend", operationToken),
+		"operation_token": operationToken,
+	}
+	extendIntent := &db.PaymentIntent{
+		UserID:               user.ID,
+		IntentToken:          operationToken,
+		ActionType:           "extend",
+		SubscriptionID:       &subID64,
+		PlanID:               planID64Ptr,
+		AmountToman:          cost,
+		Months:               months,
+		IPLimit:              sub.IPLimit,
+		DataGB:               int(sub.TrafficLimitBytes / 1073741824),
+		ClientEmail:          sub.ClientEmail,
+		ProvisioningSnapshot: extendData,
+		Status:               db.IntentStatusAwaitingReceipt,
+	}
+	if _, err := db.CreatePaymentIntent(context.Background(), extendIntent); err != nil {
+		log.Printf("[INTENT] Failed to create payment intent for user %d extend: %v", user.ID, err)
+	}
+	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", extendData)
 
 	var text strings.Builder
 	text.WriteString("💳 **پرداخت مستقیم برای تمدید سرویس**\n\n")
@@ -1218,9 +1282,24 @@ func updateXUIFromSubscription(sub *db.Subscription) error {
 	if bot.XUIClient == nil {
 		return ErrXUIClientUnavailable
 	}
-	client := clientConfigFromSubscription(sub, sub.ClientEmail)
-	client.Enable = sub.IsActive
-	return bot.XUIClient.UpdateClient(sub.ClientEmail, client)
+	expireMilli := int64(0)
+	if sub.ExpireTime != nil {
+		expireMilli = *sub.ExpireTime
+	} else if !sub.EndDate.IsZero() {
+		expireMilli = sub.EndDate.UnixMilli()
+	}
+	limitIP := sub.IPLimit
+	enable := sub.IsActive
+	patch := xui.ClientPatch{
+		Enable:     &enable,
+		ExpiryTime: &expireMilli,
+		LimitIP:    &limitIP,
+	}
+	if sub.TrafficLimitBytes > 0 {
+		totalGB := sub.TrafficLimitBytes
+		patch.TotalGB = &totalGB
+	}
+	return bot.XUIClient.UpdateClientPatch(sub.ClientEmail, patch)
 }
 
 func updateXUIRename(oldEmail string, sub *db.Subscription) error {

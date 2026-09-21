@@ -105,6 +105,16 @@ func (m *MockTelegramServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if strings.HasSuffix(r.URL.Path, "/answerCallbackQuery") {
 			w.Write([]byte(`{"ok":true,"result":true}`))
+		} else if strings.HasSuffix(r.URL.Path, "/sendPhoto") {
+			replyMarkup := ""
+			if rm, ok := params["reply_markup"]; ok {
+				replyMarkup = fmt.Sprintf(",\"reply_markup\":%s", rm)
+			}
+			caption := ""
+			if cap, ok := params["caption"]; ok {
+				caption = fmt.Sprintf(",\"caption\":\"%s\"", cap)
+			}
+			w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"message_id":999,"chat":{"id":123456},"photo":[{"file_id":"test_photo_file_id","width":100,"height":100}]%s%s,"date":1600000000}}`, caption, replyMarkup)))
 		} else {
 			replyMarkup := ""
 			if rm, ok := params["reply_markup"]; ok {

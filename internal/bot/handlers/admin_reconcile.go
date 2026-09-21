@@ -92,7 +92,7 @@ func HandleAdminReconcileManual(c telebot.Context) error {
 	for i, r := range records {
 		sb.WriteString(fmt.Sprintf("%d. شناسه رکورد: `%d`\n", i+1, r.ID))
 		sb.WriteString(fmt.Sprintf("   کلید: `%s`\n", r.OperationKey))
-		sb.WriteString(fmt.Sprintf("   نوع: %s\n", r.Kind))
+		sb.WriteString(fmt.Sprintf("   نوع: %s (`%s`)\n", formatReconcileKind(r.Kind), r.Kind))
 		if r.UserID != nil {
 			sb.WriteString(fmt.Sprintf("   کاربر: %d\n", *r.UserID))
 		}
@@ -123,8 +123,8 @@ func HandleAdminReconcileDetail(c telebot.Context) error {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("🔍 **جزئیات رکورد تطبیق #%d**\n\n", r.ID))
 	sb.WriteString(fmt.Sprintf("▫️ **کلید عملیات**: `%s`\n", r.OperationKey))
-	sb.WriteString(fmt.Sprintf("▫️ **نوع**: `%s`\n", r.Kind))
-	sb.WriteString(fmt.Sprintf("▫️ **وضعیت**: `%s`\n", r.Status))
+	sb.WriteString(fmt.Sprintf("▫️ **نوع**: %s (`%s`)\n", formatReconcileKind(r.Kind), r.Kind))
+	sb.WriteString(fmt.Sprintf("▫️ **وضعیت**: %s (`%s`)\n", formatReconcileStatus(r.Status), r.Status))
 	if r.UserID != nil {
 		sb.WriteString(fmt.Sprintf("▫️ **کاربر**: `%d`\n", *r.UserID))
 	}
@@ -194,7 +194,7 @@ func HandleAdminReconcileMarkManual(c telebot.Context) error {
 	}
 
 	reason := fmt.Sprintf("marked for manual review by admin %d", adminID)
-	if err := db.MarkReconciliationManualReview(context.Background(), id, reason); err != nil {
+	if err := db.MarkReconciliationManualReview(context.Background(), id, "", "", reason); err != nil {
 		log.Printf("[ERROR] Failed to mark reconciliation record %d as manual review: %v", id, err)
 		return maybeEditOrSend(c, "خطا در انتقال رکورد به بازبینی دستی.")
 	}
@@ -260,4 +260,46 @@ func ProcessAdminReconcileCloseReason(c telebot.Context, text string) error {
 
 	_ = c.Send(fmt.Sprintf("✅ رکورد #%d با موفقیت با ثبت دلیل ادمین بسته شد.", recordID))
 	return HandleAdminReconcileManual(c)
+}
+
+func formatReconcileKind(kind string) string {
+	switch kind {
+	case "purchase_provisioning":
+		return "ایجاد اشتراک خرید"
+	case "direct_payment_provisioning":
+		return "پرداخت مستقیم و ایجاد سرویس"
+	case "subscription_delete":
+		return "حذف اشتراک"
+	case "subscription_ip_change":
+		return "تغییر آی‌پی اشتراک"
+	case "subscription_traffic_reset":
+		return "ریست ترافیک اشتراک"
+	case "subscription_extend":
+		return "تمدید اشتراک"
+	case "bulk_credit":
+		return "شارژ گروهی کیف پول"
+	case "wallet_refund":
+		return "استرداد کیف پول"
+	default:
+		return kind
+	}
+}
+
+func formatReconcileStatus(status string) string {
+	switch status {
+	case "pending":
+		return "در انتظار پردازش"
+	case "in_progress":
+		return "در حال پردازش"
+	case "completed":
+		return "تکمیل شده"
+	case "failed":
+		return "ناموفق"
+	case "manual_review":
+		return "نیازمند بررسی دستی ادمین"
+	case "manually_resolved":
+		return "حل‌شده به صورت دستی"
+	default:
+		return status
+	}
 }

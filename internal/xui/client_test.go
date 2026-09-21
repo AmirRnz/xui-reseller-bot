@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -492,4 +493,314 @@ func TestMergeClientConfigPreservesUnmanagedMetadata(t *testing.T) {
 	if mergedOverrides.TotalGB != 100 || mergedOverrides.Flow != "new-flow" || mergedOverrides.LimitHWID != 10 || mergedOverrides.Group != "new-group" || mergedOverrides.Comment != "new-comment" || mergedOverrides.ID != "custom-uuid" {
 		t.Errorf("explicit overrides not applied: %+v", mergedOverrides)
 	}
+}
+
+func TestClientPatchSemantics(t *testing.T) {
+	current := XUIClientInfo{
+		ID:         10,
+		UUID:       "uuid-1234",
+		Email:      "patch@example.com",
+		SubID:      "sub-keep-me",
+		Flow:       "xtls-rprx-vision",
+		Group:      "reseller-group",
+		Enable:     true,
+		ExpiryTime: 1700000000000,
+		LimitIP:    5,
+		TotalGB:    50 * 1024 * 1024 * 1024,
+		TgID:       12345678,
+		LimitHWID:  2,
+	}
+
+	t.Run("nil fields preserve current values, subID and flow intact", func(t *testing.T) {
+		newExpiry := int64(1800000000000)
+		patch := ClientPatch{
+			ExpiryTime: &newExpiry,
+		}
+		merged := mergeClientConfigWithPatch(current, patch)
+		if merged.ExpiryTime != 1800000000000 {
+			t.Fatalf("expected ExpiryTime to be patched, got %d", merged.ExpiryTime)
+		}
+		if !merged.Enable {
+			t.Fatalf("expected Enable to remain true, got false")
+		}
+		if merged.LimitIP != 5 {
+			t.Fatalf("expected LimitIP to remain 5, got %d", merged.LimitIP)
+		}
+		if merged.TotalGB != 50*1024*1024*1024 {
+			t.Fatalf("expected TotalGB to remain preserved, got %d", merged.TotalGB)
+		}
+		if merged.SubID != "sub-keep-me" {
+			t.Fatalf("expected SubID to be preserved, got %q", merged.SubID)
+		}
+		if merged.Flow != "xtls-rprx-vision" {
+			t.Fatalf("expected Flow to be preserved, got %q", merged.Flow)
+		}
+		if merged.Group != "reseller-group" {
+			t.Fatalf("expected Group to be preserved, got %q", merged.Group)
+		}
+		if merged.TgID != 12345678 {
+			t.Fatalf("expected TgID to be preserved, got %d", merged.TgID)
+		}
+	})
+
+	t.Run("non-nil zero values are correctly applied", func(t *testing.T) {
+		zeroIP := 0
+		zeroExpiry := int64(0)
+		falseEnable := false
+		zeroGB := int64(0)
+		patch := ClientPatch{
+			LimitIP:    &zeroIP,
+			ExpiryTime: &zeroExpiry,
+			Enable:     &falseEnable,
+			TotalGB:    &zeroGB,
+		}
+		merged := mergeClientConfigWithPatch(current, patch)
+		if merged.LimitIP != 0 {
+			t.Fatalf("expected LimitIP 0 (unlimited), got %d", merged.LimitIP)
+		}
+		if merged.ExpiryTime != 0 {
+			t.Fatalf("expected ExpiryTime 0, got %d", merged.ExpiryTime)
+		}
+		if merged.Enable != false {
+			t.Fatalf("expected Enable false, got %v", merged.Enable)
+		}
+		if merged.TotalGB != 0 {
+			t.Fatalf("expected TotalGB 0, got %d", merged.TotalGB)
+		}
+		// Metadata must still be preserved
+		if merged.SubID != "sub-keep-me" || merged.Flow != "xtls-rprx-vision" {
+			t.Fatalf("metadata corrupted when applying zero values: SubID=%q Flow=%q", merged.SubID, merged.Flow)
+		}
+	})
+}
+
+func TestUpdateClientPatchTimeoutVerification(t *testing.T) {
+	t.Run("timeout followed by matching readback returns WriteSucceeded", func(t *testing.T) {
+		limitIP := 3
+		remote := XUIClientInfo{
+			Email:   "timeout_ok@example.com",
+			UUID:    "uuid-1",
+			LimitIP: 3,
+			Enable:  true,
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/panel/api/clients/get/timeout_ok@example.com":
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": remote})
+			case "/panel/api/clients/update/timeout_ok@example.com":
+				time.Sleep(100 * time.Millisecond) // Trigger client timeout
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		client.httpClient.Timeout = 10 * time.Millisecond
+
+		res := client.UpdateClientPatchResult("timeout_ok@example.com", ClientPatch{LimitIP: &limitIP})
+		if res.Outcome != WriteSucceeded {
+			t.Fatalf("expected WriteSucceeded when readback matches patched fields, got %v: %v", res.Outcome, res.Err)
+		}
+	})
+
+	t.Run("timeout followed by mismatched readback returns WriteUnknown", func(t *testing.T) {
+		limitIP := 3
+		remote := XUIClientInfo{
+			Email:   "timeout_mismatch@example.com",
+			UUID:    "uuid-2",
+			LimitIP: 1, // Does NOT match patched field!
+			Enable:  true,
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/panel/api/clients/get/timeout_mismatch@example.com":
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": remote})
+			case "/panel/api/clients/update/timeout_mismatch@example.com":
+				time.Sleep(100 * time.Millisecond)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		client.httpClient.Timeout = 10 * time.Millisecond
+
+		res := client.UpdateClientPatchResult("timeout_mismatch@example.com", ClientPatch{LimitIP: &limitIP})
+		if res.Outcome != WriteUnknown {
+			t.Fatalf("expected WriteUnknown when readback does not match patched fields, got %v", res.Outcome)
+		}
+		if res.Err == nil || !strings.Contains(res.Err.Error(), "timeout verification failed") {
+			t.Fatalf("expected error to mention timeout verification failed, got %v", res.Err)
+		}
+	})
+
+	t.Run("timeout followed by missing client returns WriteUnknown", func(t *testing.T) {
+		limitIP := 3
+		calls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/panel/api/clients/get/timeout_missing@example.com":
+				calls++
+				if calls == 1 {
+					_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": XUIClientInfo{Email: "timeout_missing@example.com"}})
+				} else {
+					_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "msg": "Client not found"})
+				}
+			case "/panel/api/clients/update/timeout_missing@example.com":
+				time.Sleep(100 * time.Millisecond)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		client.httpClient.Timeout = 10 * time.Millisecond
+
+		res := client.UpdateClientPatchResult("timeout_missing@example.com", ClientPatch{LimitIP: &limitIP})
+		if res.Outcome != WriteUnknown {
+			t.Fatalf("expected WriteUnknown on missing client readback, got %v", res.Outcome)
+		}
+	})
+}
+
+func TestFindClientBySubID_BoundedPagination(t *testing.T) {
+	t.Run("found on page 2", func(t *testing.T) {
+		pageCalls := 0
+		listClientsCalled := false
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/panel/api/clients/list" {
+				listClientsCalled = true
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{}})
+				return
+			}
+			if r.URL.Path == "/panel/api/clients/list/paged" {
+				pageCalls++
+				page := r.URL.Query().Get("page")
+				if page == "1" {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"success": true,
+						"obj": map[string]any{
+							"filtered": 25,
+							"items": []map[string]any{
+								{"email": "other@example.com", "subId": "sub-other"},
+							},
+						},
+					})
+					return
+				}
+				if page == "2" {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"success": true,
+						"obj": map[string]any{
+							"filtered": 25,
+							"items": []map[string]any{
+								{"email": "target@example.com", "subId": "target-sub"},
+							},
+						},
+					})
+					return
+				}
+			}
+			if r.URL.Path == "/panel/api/clients/get/target@example.com" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"success": true,
+					"obj": map[string]any{
+						"email":  "target@example.com",
+						"subId":  "target-sub",
+						"enable": true,
+					},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		found, err := client.FindClientBySubID("target-sub")
+		if err != nil {
+			t.Fatalf("expected to find client on page 2, got err: %v", err)
+		}
+		if found.Email != "target@example.com" {
+			t.Fatalf("expected target@example.com, got %s", found.Email)
+		}
+		if pageCalls != 2 {
+			t.Fatalf("expected 2 page calls, got %d", pageCalls)
+		}
+		if listClientsCalled {
+			t.Fatalf("ListClients fleet scan was called, expected none")
+		}
+	})
+
+	t.Run("not found bounded to 3 pages max and never calls ListClients", func(t *testing.T) {
+		pageCalls := 0
+		listClientsCalled := false
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/panel/api/clients/list" {
+				listClientsCalled = true
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{}})
+				return
+			}
+			if r.URL.Path == "/panel/api/clients/list/paged" {
+				pageCalls++
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"success": true,
+					"obj": map[string]any{
+						"filtered": 100,
+						"items": []map[string]any{
+							{"email": "other@example.com", "subId": "sub-other"},
+						},
+					},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		found, err := client.FindClientBySubID("non-existent")
+		if !IsNotFound(err) {
+			t.Fatalf("expected ErrNotFound, got found=%v err=%v", found, err)
+		}
+		if pageCalls != 3 {
+			t.Fatalf("expected bounded 3 page calls, got %d", pageCalls)
+		}
+		if listClientsCalled {
+			t.Fatalf("ListClients fleet scan must not be called")
+		}
+	})
+
+	t.Run("early stop when page results exhausted", func(t *testing.T) {
+		pageCalls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/panel/api/clients/list/paged" {
+				pageCalls++
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"success": true,
+					"obj": map[string]any{
+						"filtered": 3,
+						"items": []map[string]any{
+							{"email": "other@example.com", "subId": "sub-other"},
+						},
+					},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		_, err := client.FindClientBySubID("non-existent")
+		if !IsNotFound(err) {
+			t.Fatalf("expected ErrNotFound, got err=%v", err)
+		}
+		if pageCalls != 1 {
+			t.Fatalf("expected early stop after page 1 (filtered=3 <= 10), got %d calls", pageCalls)
+		}
+	})
 }

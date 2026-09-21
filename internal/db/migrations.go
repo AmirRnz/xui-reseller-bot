@@ -110,6 +110,59 @@ CREATE INDEX IF NOT EXISTS idx_subscriptions_user_status ON subscriptions (user_
 CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions (status);
 `,
 	},
+	{
+		Version: 6,
+		Name:    "reconciliation_cas_payment_intents_bulk_credits_and_integer_pricing",
+		SQL: `
+ALTER TABLE reconciliation_records
+    ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;
+
+ALTER TABLE paid_plans
+    ADD COLUMN IF NOT EXISTS base_price_toman BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS price_per_extra_ip_toman BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS price_per_gb_toman BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS price_per_extra_month_toman BIGINT NOT NULL DEFAULT 0;
+
+UPDATE paid_plans SET
+    base_price_toman = COALESCE(base_price_toman, ROUND(base_price)::BIGINT, 0),
+    price_per_extra_ip_toman = COALESCE(price_per_extra_ip_toman, ROUND(price_per_extra_ip)::BIGINT, 0),
+    price_per_gb_toman = COALESCE(price_per_gb_toman, ROUND(price_per_gb)::BIGINT, 0),
+    price_per_extra_month_toman = COALESCE(price_per_extra_month_toman, ROUND(price_per_extra_month)::BIGINT, 0)
+WHERE base_price_toman = 0 AND base_price > 0;
+
+CREATE TABLE IF NOT EXISTS payment_intents (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
+    intent_token TEXT UNIQUE NOT NULL,
+    action_type TEXT NOT NULL,
+    plan_id BIGINT REFERENCES paid_plans(id) ON DELETE SET NULL,
+    subscription_id BIGINT REFERENCES subscriptions(id) ON DELETE SET NULL,
+    quote_id BIGINT REFERENCES purchase_quotes(id) ON DELETE SET NULL,
+    amount_toman BIGINT NOT NULL,
+    months INT NOT NULL DEFAULT 1,
+    ip_limit INT NOT NULL DEFAULT 1,
+    data_gb INT NOT NULL DEFAULT 0,
+    display_name TEXT NOT NULL DEFAULT '',
+    client_email TEXT NOT NULL DEFAULT '',
+    provisioning_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status TEXT NOT NULL DEFAULT 'awaiting_receipt',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_intents_user_status ON payment_intents (user_id, status);
+
+CREATE TABLE IF NOT EXISTS bulk_credit_operations (
+    id BIGSERIAL PRIMARY KEY,
+    operation_key TEXT UNIQUE NOT NULL,
+    amount BIGINT NOT NULL,
+    admin_id BIGINT,
+    recipient_user_ids BIGINT[] NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'completed',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`,
+	},
 }
 
 func runMigrations(ctx context.Context) error {

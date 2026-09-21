@@ -32,6 +32,7 @@ type ReconciliationRecord struct {
 	ResolvedAt         *time.Time     `json:"resolved_at"`
 	Resolution         string         `json:"resolution"`
 	ManualReviewReason string         `json:"manual_review_reason"`
+	Version            int            `json:"version"`
 	CreatedAt          time.Time      `json:"created_at"`
 	UpdatedAt          time.Time      `json:"updated_at"`
 }
@@ -87,6 +88,11 @@ func CreateReconciliationRecord(ctx context.Context, record *ReconciliationRecor
 				THEN reconciliation_records.error_message
 				ELSE EXCLUDED.error_message
 			END,
+			next_attempt_at = CASE
+				WHEN reconciliation_records.status IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+				THEN reconciliation_records.next_attempt_at
+				ELSE NOW()
+			END,
 			updated_at = CASE
 				WHEN reconciliation_records.status IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
 				THEN reconciliation_records.updated_at
@@ -120,13 +126,13 @@ func ClaimPendingReconciliationRecords(ctx context.Context, lockedBy string, lim
 			FOR UPDATE SKIP LOCKED
 		)
 		UPDATE reconciliation_records r
-		SET locked_at = NOW(), locked_by = $1, attempt_count = attempt_count + 1, updated_at = NOW()
+		SET locked_at = NOW(), locked_by = $1, attempt_count = attempt_count + 1, updated_at = NOW(), version = COALESCE(version, 1) + 1
 		FROM claimable
 		WHERE r.id = claimable.id
 		RETURNING r.id, r.operation_key, r.kind, r.user_id, r.subscription_id, r.purchase_request_id,
 		          r.desired_state, r.observed_state, r.status, r.error_message, r.attempt_count,
 		          r.next_attempt_at, r.locked_at, r.locked_by, r.resolved_at, r.resolution,
-		          r.manual_review_reason, r.created_at, r.updated_at
+		          r.manual_review_reason, r.created_at, r.updated_at, COALESCE(r.version, 1)
 	`, lockedBy, limit)
 	if err != nil {
 		return nil, err
@@ -141,7 +147,7 @@ func ClaimPendingReconciliationRecords(ctx context.Context, lockedBy string, lim
 			&r.ID, &r.OperationKey, &r.Kind, &r.UserID, &r.SubscriptionID, &r.PurchaseRequestID,
 			&desiredBytes, &observedBytes, &r.Status, &r.ErrorMessage, &r.AttemptCount,
 			&r.NextAttemptAt, &r.LockedAt, &r.LockedBy, &r.ResolvedAt, &r.Resolution,
-			&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt,
+			&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt, &r.Version,
 		)
 		if err != nil {
 			return nil, err
@@ -153,30 +159,81 @@ func ClaimPendingReconciliationRecords(ctx context.Context, lockedBy string, lim
 	return records, rows.Err()
 }
 
+var (
+	ErrReconciliationTransitionNotAllowed = errors.New("reconciliation transition not allowed from current state")
+	ErrReconciliationLeaseLost            = errors.New("reconciliation worker lease lost or superseded")
+	ErrReconciliationNotFound             = errors.New("reconciliation record not found")
+)
+
 const (
 	ReconciliationStatusPending          = "pending"
 	ReconciliationStatusPendingRefund    = "pending_refund"
 	ReconciliationStatusRequired         = "reconciliation_required"
 	ReconciliationStatusManualReview     = "manual_review"
 	ReconciliationStatusResolvedVerified = "resolved_verified"
+	ReconciliationStatusResolved         = "resolved"
 	ReconciliationStatusManuallyClosed   = "manually_closed"
 	ReconciliationStatusManualWaiver     = "manual_waiver"
 	ReconciliationStatusSuperseded       = "superseded"
+	ReconciliationStatusFailedTerminal   = "failed_terminal"
 )
 
-func ResolveReconciliationRecord(ctx context.Context, id int64, resolution string) error {
+func IsTerminalReconciliationStatus(status string) bool {
+	switch status {
+	case ReconciliationStatusResolvedVerified,
+		ReconciliationStatusResolved,
+		ReconciliationStatusSuperseded,
+		ReconciliationStatusFailedTerminal,
+		ReconciliationStatusManuallyClosed,
+		ReconciliationStatusManualWaiver:
+		return true
+	default:
+		return false
+	}
+}
+
+func checkReconciliationRecordTransitionFailure(ctx context.Context, id int64, lockedBy string, expectedStatus string) error {
+	current, err := GetReconciliationRecordByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		return ErrReconciliationNotFound
+	}
+	if IsTerminalReconciliationStatus(current.Status) {
+		return ErrReconciliationTransitionNotAllowed
+	}
+	if expectedStatus != "" && current.Status != expectedStatus {
+		return ErrReconciliationTransitionNotAllowed
+	}
+	if lockedBy != "" && (current.LockedBy == nil || *current.LockedBy != lockedBy) {
+		return ErrReconciliationLeaseLost
+	}
+	return ErrReconciliationTransitionNotAllowed
+}
+
+func ResolveReconciliationRecord(ctx context.Context, id int64, lockedBy string, expectedStatus string, resolution string) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
 	if Pool == nil {
 		return errors.New("database pool is not initialized")
 	}
-	_, err := Pool.Exec(ctx, `
+	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'resolved_verified', resolution = $1, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		SET status = 'resolved_verified', resolution = $1, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
 		WHERE id = $2
-	`, resolution, id)
-	return err
+		  AND ($3 = '' OR locked_by = $3)
+		  AND ($4 = '' OR status = $4)
+		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+	`, resolution, id, lockedBy, expectedStatus)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus)
+	}
+	return nil
 }
 
 func ManuallyCloseReconciliationRecord(ctx context.Context, id int64, adminID int64, reason string) error {
@@ -187,12 +244,19 @@ func ManuallyCloseReconciliationRecord(ctx context.Context, id int64, adminID in
 		return errors.New("database pool is not initialized")
 	}
 	resolution := fmt.Sprintf("manually closed by admin %d: %s", adminID, reason)
-	_, err := Pool.Exec(ctx, `
+	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'manually_closed', manual_review_reason = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		SET status = 'manually_closed', manual_review_reason = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
 		WHERE id = $3
+		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
 	`, reason, resolution, id)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return checkReconciliationRecordTransitionFailure(ctx, id, "", "")
+	}
+	return nil
 }
 
 func ManuallyWaiveReconciliationRecord(ctx context.Context, id int64, adminID int64, reason string) error {
@@ -203,15 +267,22 @@ func ManuallyWaiveReconciliationRecord(ctx context.Context, id int64, adminID in
 		return errors.New("database pool is not initialized")
 	}
 	resolution := fmt.Sprintf("manually waived by admin %d: %s", adminID, reason)
-	_, err := Pool.Exec(ctx, `
+	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'manual_waiver', manual_review_reason = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		SET status = 'manual_waiver', manual_review_reason = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
 		WHERE id = $3
+		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
 	`, reason, resolution, id)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return checkReconciliationRecordTransitionFailure(ctx, id, "", "")
+	}
+	return nil
 }
 
-func FailAndScheduleRetry(ctx context.Context, id int64, errMessage string, retryAfter time.Duration) error {
+func FailAndScheduleRetry(ctx context.Context, id int64, lockedBy string, expectedStatus string, errMessage string, retryAfter time.Duration) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
@@ -219,27 +290,45 @@ func FailAndScheduleRetry(ctx context.Context, id int64, errMessage string, retr
 		return errors.New("database pool is not initialized")
 	}
 	intervalStr := fmt.Sprintf("%d seconds", int(retryAfter.Seconds()))
-	_, err := Pool.Exec(ctx, `
+	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET error_message = $1, next_attempt_at = NOW() + $2::interval, locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		SET error_message = $1, next_attempt_at = NOW() + $2::interval, locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
 		WHERE id = $3
-	`, errMessage, intervalStr, id)
-	return err
+		  AND ($4 = '' OR locked_by = $4)
+		  AND ($5 = '' OR status = $5)
+		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+	`, errMessage, intervalStr, id, lockedBy, expectedStatus)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus)
+	}
+	return nil
 }
 
-func MarkReconciliationManualReview(ctx context.Context, id int64, reason string) error {
+func MarkReconciliationManualReview(ctx context.Context, id int64, lockedBy string, expectedStatus string, reason string) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
 	if Pool == nil {
 		return errors.New("database pool is not initialized")
 	}
-	_, err := Pool.Exec(ctx, `
+	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'manual_review', manual_review_reason = $1, locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		SET status = 'manual_review', manual_review_reason = $1, locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
 		WHERE id = $2
-	`, reason, id)
-	return err
+		  AND ($3 = '' OR locked_by = $3)
+		  AND ($4 = '' OR status = $4)
+		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+	`, reason, id, lockedBy, expectedStatus)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus)
+	}
+	return nil
 }
 
 func GetReconciliationStats(ctx context.Context) (*ReconciliationStats, error) {
@@ -288,7 +377,7 @@ func GetManualReviewReconciliationRecords(ctx context.Context, limit int) ([]*Re
 		SELECT id, operation_key, kind, user_id, subscription_id, purchase_request_id,
 		       desired_state, observed_state, status, error_message, attempt_count,
 		       next_attempt_at, locked_at, locked_by, resolved_at, resolution,
-		       manual_review_reason, created_at, updated_at
+		       manual_review_reason, created_at, updated_at, COALESCE(version, 1)
 		FROM reconciliation_records
 		WHERE status = 'manual_review'
 		ORDER BY updated_at DESC
@@ -307,7 +396,7 @@ func GetManualReviewReconciliationRecords(ctx context.Context, limit int) ([]*Re
 			&r.ID, &r.OperationKey, &r.Kind, &r.UserID, &r.SubscriptionID, &r.PurchaseRequestID,
 			&desiredBytes, &observedBytes, &r.Status, &r.ErrorMessage, &r.AttemptCount,
 			&r.NextAttemptAt, &r.LockedAt, &r.LockedBy, &r.ResolvedAt, &r.Resolution,
-			&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt,
+			&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt, &r.Version,
 		)
 		if err != nil {
 			return nil, err
@@ -333,14 +422,14 @@ func GetReconciliationRecordByID(ctx context.Context, id int64) (*Reconciliation
 		SELECT id, operation_key, kind, user_id, subscription_id, purchase_request_id,
 		       desired_state, observed_state, status, error_message, attempt_count,
 		       next_attempt_at, locked_at, locked_by, resolved_at, resolution,
-		       manual_review_reason, created_at, updated_at
+		       manual_review_reason, created_at, updated_at, COALESCE(version, 1)
 		FROM reconciliation_records
 		WHERE id = $1
 	`, id).Scan(
 		&r.ID, &r.OperationKey, &r.Kind, &r.UserID, &r.SubscriptionID, &r.PurchaseRequestID,
 		&desiredBytes, &observedBytes, &r.Status, &r.ErrorMessage, &r.AttemptCount,
 		&r.NextAttemptAt, &r.LockedAt, &r.LockedBy, &r.ResolvedAt, &r.Resolution,
-		&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt,
+		&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt, &r.Version,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -364,8 +453,10 @@ func ResetReconciliationForRetry(ctx context.Context, id int64) error {
 	}
 	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'pending', next_attempt_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
-		WHERE id = $1 AND status IN ('retryable', 'manual_review')
+		SET status = 'pending', next_attempt_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
+		WHERE id = $1
+		  AND status IN ('retryable', 'manual_review')
+		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
 	`, id)
 	if err != nil {
 		return err

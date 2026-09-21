@@ -96,9 +96,15 @@ func (w *SyncWorker) RunSync(ctx context.Context) {
 	var targets []subTarget
 	for rows.Next() {
 		var s subTarget
-		if err := rows.Scan(&s.id, &s.userID, &s.email, &s.expireTime, &s.endDate, &s.ipLimit, &s.isActive, &s.status); err == nil {
-			targets = append(targets, s)
+		if err := rows.Scan(&s.id, &s.userID, &s.email, &s.expireTime, &s.endDate, &s.ipLimit, &s.isActive, &s.status); err != nil {
+			log.Printf("[SYNC] Failed to scan subscription row: %v", err)
+			continue
 		}
+		targets = append(targets, s)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[SYNC] Error during rows iteration: %v", err)
+		return
 	}
 	rows.Close()
 

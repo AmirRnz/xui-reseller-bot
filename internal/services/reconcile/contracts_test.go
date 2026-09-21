@@ -30,6 +30,7 @@ func TestPayloadRoundTrips(t *testing.T) {
 		ExpectedUUID:       "uuid-1234",
 		ExpectedSubID:      "sub-5678",
 		PlanID:             &planID,
+		InboundIDs:         []int{1, 2},
 		Months:             1,
 		IPLimit:            2,
 		DataGB:             50,
@@ -43,7 +44,8 @@ func TestPayloadRoundTrips(t *testing.T) {
 		t.Fatalf("DecodePurchaseProvisioning failed: %v", err)
 	}
 	if decodedPurchase.UserID != 102 || *decodedPurchase.QuoteID != 45 || decodedPurchase.Email != "user@test.com" ||
-		decodedPurchase.ExpectedUUID != "uuid-1234" || decodedPurchase.ExpectedSubID != "sub-5678" || decodedPurchase.Price != 75000 {
+		decodedPurchase.ExpectedUUID != "uuid-1234" || decodedPurchase.ExpectedSubID != "sub-5678" || decodedPurchase.Price != 75000 ||
+		len(decodedPurchase.InboundIDs) != 2 || decodedPurchase.InboundIDs[0] != 1 || decodedPurchase.InboundIDs[1] != 2 {
 		t.Fatalf("PurchaseProvisioning mismatch: %+v", decodedPurchase)
 	}
 
@@ -98,6 +100,7 @@ func TestPayloadRoundTrips(t *testing.T) {
 		ClientEmail:       "direct@test.com",
 		ExpectedUUID:      "uuid-direct-1",
 		ExpectedSubID:     "sub-direct-1",
+		InboundIDs:        []int{3, 4},
 		Months:            2,
 		IPLimit:           1,
 		DataGB:            30,
@@ -109,7 +112,8 @@ func TestPayloadRoundTrips(t *testing.T) {
 		t.Fatalf("DecodeDirectPaymentProvisioning failed: %v", err)
 	}
 	if decodedDirect.PurchaseRequestID != 401 || decodedDirect.UserID != 105 || decodedDirect.ExpectedUUID != "uuid-direct-1" ||
-		decodedDirect.ExpectedSubID != "sub-direct-1" || decodedDirect.ClientEmail != "direct@test.com" {
+		decodedDirect.ExpectedSubID != "sub-direct-1" || decodedDirect.ClientEmail != "direct@test.com" ||
+		len(decodedDirect.InboundIDs) != 2 || decodedDirect.InboundIDs[0] != 3 || decodedDirect.InboundIDs[1] != 4 {
 		t.Fatalf("DirectPaymentProvisioning mismatch: %+v", decodedDirect)
 	}
 

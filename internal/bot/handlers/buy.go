@@ -14,6 +14,7 @@ import (
 	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/db"
 	"xui-reseller-bot/internal/services/pricing"
+	"xui-reseller-bot/internal/services/reconcile"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -753,32 +754,34 @@ func HandleBuyConfirm(c telebot.Context) error {
 			return c.Send(formatCompensationUserMessage(compErr.Result, operationKey))
 		}
 		if xui.IsUnknownOutcome(err) {
-			userID := user.ID
 			var unknownCreate *paidSubscriptionCreateUnknownError
-			desired := map[string]any{
-				"email": email, "display_name": name, "months": months,
-				"ip_limit": ipLimit, "data_gb": dataGB, "plan_id": plan.ID,
-				"operation_key": operationKey,
-			}
+			var expUUID, expSubID string
+			var inbounds []int
 			if errors.As(err, &unknownCreate) {
-				desired["client"] = unknownCreate.Request.Client
-				desired["inbound_ids"] = unknownCreate.Request.InboundIDs
-				desired["client_id"] = unknownCreate.Request.Client.ID
-				desired["client_uuid"] = unknownCreate.Request.Client.ID
-				desired["sub_id"] = unknownCreate.Request.Client.SubID
-				desired["enable"] = unknownCreate.Request.Client.Enable
-				desired["expiry_time"] = unknownCreate.Request.Client.ExpiryTime
-				desired["limit_ip"] = unknownCreate.Request.Client.LimitIP
-				desired["total_gb"] = unknownCreate.Request.Client.TotalGB
+				expUUID = unknownCreate.Request.Client.ID
+				expSubID = unknownCreate.Request.Client.SubID
+				inbounds = unknownCreate.Request.InboundIDs
 			}
-			record := &db.ReconciliationRecord{
-				OperationKey:  operationKey + ":provisioning",
-				Kind:          "purchase_provisioning_unknown",
-				UserID:        &userID,
-				DesiredState:  desired,
-				ObservedState: map[string]any{"outcome": "unknown"},
-				ErrorMessage:  err.Error(),
+			planID := int(plan.ID)
+			payload := &reconcile.PurchaseProvisioningPayload{
+				UserID:             user.ID,
+				QuoteID:            quoteID,
+				OperationKey:       operationKey,
+				DebitOperationKey:  operationKey,
+				Email:              email,
+				ExpectedUUID:       expUUID,
+				ExpectedSubID:      expSubID,
+				PlanID:             &planID,
+				InboundIDs:         inbounds,
+				Months:             months,
+				IPLimit:            ipLimit,
+				DataGB:             dataGB,
+				Price:              priceToman,
+				RefundOperationKey: operationKey + ":refund",
+				DisplayName:        name,
 			}
+			record := reconcile.NewPurchaseProvisioningRecord(payload)
+			record.ErrorMessage = err.Error()
 			recErr := db.CreateReconciliationRecord(context.Background(), record)
 			if recErr != nil {
 				log.Printf("[CRITICAL] failed to persist purchase reconciliation for %s: %v", email, recErr)
@@ -829,6 +832,54 @@ func HandleBuyDirectPayment(c telebot.Context) error {
 	card, _ := db.GetSetting(context.Background(), "card_number")
 	owner, _ := db.GetSetting(context.Background(), "card_owner")
 	desc, _ := db.GetSetting(context.Background(), "topup_description")
+
+	var quoteID *int64
+	if qIDStr, ok := state.Data["quote_id"]; ok && qIDStr != nil {
+		if qVal, err := strconv.ParseInt(fmt.Sprintf("%v", qIDStr), 10, 64); err == nil && qVal > 0 {
+			quoteID = &qVal
+		}
+	}
+	var planIDPtr *int64
+	if pIDStr, ok := state.Data["plan_id"]; ok && pIDStr != nil {
+		if pVal, err := strconv.ParseInt(fmt.Sprintf("%v", pIDStr), 10, 64); err == nil && pVal > 0 {
+			planIDPtr = &pVal
+		}
+	}
+	months, _ := strconv.Atoi(fmt.Sprintf("%v", state.Data["months"]))
+	if months <= 0 {
+		months = 1
+	}
+	ipLimit, _ := strconv.Atoi(fmt.Sprintf("%v", state.Data["ip_limit"]))
+	if ipLimit <= 0 {
+		ipLimit = 1
+	}
+	dataGB, _ := strconv.Atoi(fmt.Sprintf("%v", state.Data["data_gb"]))
+	customName := fmt.Sprintf("%v", state.Data["custom_name"])
+	email := fmt.Sprintf("%v", state.Data["email"])
+
+	intentToken := stateToken
+	if intentToken == "" {
+		intentToken = fmt.Sprintf("intent_%d_%d", user.ID, time.Now().UnixNano())
+	}
+
+	intent := &db.PaymentIntent{
+		UserID:               user.ID,
+		IntentToken:          intentToken,
+		ActionType:           "new_subscription",
+		PlanID:               planIDPtr,
+		QuoteID:              quoteID,
+		AmountToman:          priceToman,
+		Months:               months,
+		IPLimit:              ipLimit,
+		DataGB:               dataGB,
+		DisplayName:          customName,
+		ClientEmail:          email,
+		ProvisioningSnapshot: state.Data,
+		Status:               db.IntentStatusAwaitingReceipt,
+	}
+	if _, err := db.CreatePaymentIntent(context.Background(), intent); err != nil {
+		log.Printf("[INTENT] Failed to create payment intent for user %d: %v", user.ID, err)
+	}
 
 	// Change state step to awaiting_purchase_receipt so HandleReceiptPhoto will catch it
 	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", state.Data)

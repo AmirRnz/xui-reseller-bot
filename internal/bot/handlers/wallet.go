@@ -93,6 +93,38 @@ func HandleReceiptPhoto(c telebot.Context) error {
 	defer unlock()
 
 	state := bot.FSM.GetState(user.TelegramID)
+	var activeIntent *db.PaymentIntent
+	if state == nil {
+		if recovered, err := db.GetLatestActivePaymentIntent(context.Background(), user.ID); err == nil && recovered != nil {
+			activeIntent = recovered
+			stateData := make(map[string]interface{})
+			for k, v := range recovered.ProvisioningSnapshot {
+				stateData[k] = v
+			}
+			stateData["type"] = recovered.ActionType
+			stateData["price"] = fmt.Sprintf("%d", recovered.AmountToman)
+			stateData["price_toman"] = fmt.Sprintf("%d", recovered.AmountToman)
+			if recovered.PlanID != nil {
+				stateData["plan_id"] = fmt.Sprintf("%d", *recovered.PlanID)
+			}
+			if recovered.SubscriptionID != nil {
+				stateData["subscription_id"] = fmt.Sprintf("%d", *recovered.SubscriptionID)
+			}
+			if recovered.QuoteID != nil {
+				stateData["quote_id"] = fmt.Sprintf("%d", *recovered.QuoteID)
+			}
+			stateData["months"] = fmt.Sprintf("%d", recovered.Months)
+			stateData["ip_limit"] = fmt.Sprintf("%d", recovered.IPLimit)
+			stateData["data_gb"] = fmt.Sprintf("%d", recovered.DataGB)
+			stateData["custom_name"] = recovered.DisplayName
+			stateData["email"] = recovered.ClientEmail
+			stateData["operation_token"] = recovered.IntentToken
+			stateData["operation_key"] = operationKeyFromToken("direct_payment", recovered.IntentToken)
+
+			bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", stateData)
+			state = bot.FSM.GetState(user.TelegramID)
+		}
+	}
 	if state == nil {
 		return c.Send("هیچ فرآیند فعالی برای ارسال رسید وجود ندارد. لطفا ابتدا درخواست پرداخت خود را ثبت کنید.")
 	}
@@ -211,6 +243,13 @@ func HandleReceiptPhoto(c telebot.Context) error {
 		if err := db.CreatePurchaseRequest(context.Background(), req); err != nil {
 			log.Printf("Failed to create purchase request: %v", err)
 			return c.Send("خطا در ثبت درخواست خرید مستقیم.")
+		}
+		if activeIntent != nil {
+			_ = db.MarkPaymentIntentStatus(context.Background(), activeIntent.ID, db.IntentStatusReceiptSubmitted)
+		} else if opToken, ok := state.Data["operation_token"]; ok && opToken != nil && opToken != "" {
+			if intentByToken, err := db.GetPaymentIntentByToken(context.Background(), fmt.Sprintf("%v", opToken)); err == nil && intentByToken != nil {
+				_ = db.MarkPaymentIntentStatus(context.Background(), intentByToken.ID, db.IntentStatusReceiptSubmitted)
+			}
 		}
 		bot.FSM.ClearState(user.TelegramID)
 

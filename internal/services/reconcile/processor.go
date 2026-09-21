@@ -63,12 +63,18 @@ type ProcessOutcome struct {
 }
 
 type Processor struct {
-	WorkerID  string
-	XUI       XUIClient
-	CreditFn  func(ctx context.Context, userID int64, amount int64, description, operationKey string) error
-	DebitTxFn func(ctx context.Context, userID int64, operationKey string) (*db.WalletTransaction, error)
-	BatchSize int
-	MaxRetry  int
+	WorkerID                       string
+	XUI                            XUIClient
+	CreditFn                       func(ctx context.Context, userID int64, amount int64, description, operationKey string) error
+	DebitTxFn                      func(ctx context.Context, userID int64, operationKey string) (*db.WalletTransaction, error)
+	CancelSubscriptionWithRefundFn func(ctx context.Context, subscriptionID int, userID int64, amount int64, operationKey string) (*db.RefundRequest, error)
+	UpdateSubscriptionStatusFn     func(ctx context.Context, id int, status string) error
+	GetSubscriptionByIDFn          func(ctx context.Context, id int) (*db.Subscription, error)
+	GetSubscriptionByEmailFn       func(ctx context.Context, email string) (*db.Subscription, error)
+	GetPurchaseRequestByIDFn       func(ctx context.Context, id int64) (*db.PurchaseRequest, error)
+	CreateRefundRequestFn          func(ctx context.Context, r *db.RefundRequest) error
+	BatchSize                      int
+	MaxRetry                       int
 }
 
 func NewProcessor(workerID string, xuiClient XUIClient) *Processor {
@@ -76,12 +82,64 @@ func NewProcessor(workerID string, xuiClient XUIClient) *Processor {
 		workerID = fmt.Sprintf("worker_%d", time.Now().UnixNano())
 	}
 	return &Processor{
-		WorkerID:  workerID,
-		XUI:       xuiClient,
-		CreditFn:  db.CreditWalletBalanceWithKey,
-		BatchSize: 10,
-		MaxRetry:  5,
+		WorkerID:                       workerID,
+		XUI:                            xuiClient,
+		CreditFn:                       db.CreditWalletBalanceWithKey,
+		CancelSubscriptionWithRefundFn: db.CancelSubscriptionWithRefund,
+		UpdateSubscriptionStatusFn:     db.UpdateSubscriptionStatus,
+		GetSubscriptionByIDFn:          db.GetSubscriptionByID,
+		GetSubscriptionByEmailFn:       db.GetSubscriptionByEmail,
+		GetPurchaseRequestByIDFn:       db.GetPurchaseRequestByID,
+		CreateRefundRequestFn:          db.CreateRefundRequest,
+		BatchSize:                      10,
+		MaxRetry:                       5,
 	}
+}
+
+func (p *Processor) cancelSubWithRefund(ctx context.Context, subscriptionID int, userID int64, amount int64, operationKey string) (*db.RefundRequest, error) {
+	fn := p.CancelSubscriptionWithRefundFn
+	if fn == nil {
+		fn = db.CancelSubscriptionWithRefund
+	}
+	return fn(ctx, subscriptionID, userID, amount, operationKey)
+}
+
+func (p *Processor) updateSubStatus(ctx context.Context, id int, status string) error {
+	fn := p.UpdateSubscriptionStatusFn
+	if fn == nil {
+		fn = db.UpdateSubscriptionStatus
+	}
+	return fn(ctx, id, status)
+}
+
+func (p *Processor) getSubByID(ctx context.Context, id int) (*db.Subscription, error) {
+	fn := p.GetSubscriptionByIDFn
+	if fn == nil {
+		fn = db.GetSubscriptionByID
+	}
+	return fn(ctx, id)
+}
+
+func (p *Processor) getSubscriptionByEmail(ctx context.Context, email string) (*db.Subscription, error) {
+	if p.GetSubscriptionByEmailFn != nil {
+		return p.GetSubscriptionByEmailFn(ctx, email)
+	}
+	return db.GetSubscriptionByEmail(ctx, email)
+}
+
+func (p *Processor) getPurchaseRequestByID(ctx context.Context, id int64) (*db.PurchaseRequest, error) {
+	if p.GetPurchaseRequestByIDFn != nil {
+		return p.GetPurchaseRequestByIDFn(ctx, id)
+	}
+	return db.GetPurchaseRequestByID(ctx, id)
+}
+
+func (p *Processor) createRefundRequest(ctx context.Context, r *db.RefundRequest) error {
+	fn := p.CreateRefundRequestFn
+	if fn == nil {
+		fn = db.CreateRefundRequest
+	}
+	return fn(ctx, r)
 }
 
 // Start launches a background loop that periodically processes pending reconciliation records.
@@ -148,14 +206,14 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 
 	switch outcome.Kind {
 	case OutcomeResolved:
-		if err := db.ResolveReconciliationRecord(ctx, rec.ID, outcome.Resolution); err != nil {
+		if err := db.ResolveReconciliationRecord(ctx, rec.ID, p.WorkerID, rec.Status, outcome.Resolution); err != nil {
 			log.Printf("[RECONCILE] Failed to mark record %d resolved: %v", rec.ID, err)
 		} else {
 			log.Printf("[RECONCILE] Resolved record %d (op=%s, kind=%s): %s", rec.ID, rec.OperationKey, rec.Kind, outcome.Resolution)
 		}
 
 	case OutcomeManualReview:
-		if err := db.MarkReconciliationManualReview(ctx, rec.ID, outcome.Reason); err != nil {
+		if err := db.MarkReconciliationManualReview(ctx, rec.ID, p.WorkerID, rec.Status, outcome.Reason); err != nil {
 			log.Printf("[RECONCILE] Failed to mark record %d manual review: %v", rec.ID, err)
 		} else {
 			log.Printf("[RECONCILE] Record %d (op=%s, kind=%s) moved to manual review: %s", rec.ID, rec.OperationKey, rec.Kind, outcome.Reason)
@@ -164,7 +222,7 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 	case OutcomeRetry:
 		if rec.AttemptCount >= p.MaxRetry {
 			reason := fmt.Sprintf("exceeded %d attempts; last error: %v", p.MaxRetry, outcome.Err)
-			if err := db.MarkReconciliationManualReview(ctx, rec.ID, reason); err != nil {
+			if err := db.MarkReconciliationManualReview(ctx, rec.ID, p.WorkerID, rec.Status, reason); err != nil {
 				log.Printf("[RECONCILE] Failed to mark record %d manual review after max retries: %v", rec.ID, err)
 			} else {
 				log.Printf("[RECONCILE] Record %d moved to manual review after %d retries: %v", rec.ID, p.MaxRetry, outcome.Err)
@@ -175,7 +233,7 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 			if outcome.Err != nil {
 				errMsg = outcome.Err.Error()
 			}
-			if err := db.FailAndScheduleRetry(ctx, rec.ID, errMsg, backoff); err != nil {
+			if err := db.FailAndScheduleRetry(ctx, rec.ID, p.WorkerID, rec.Status, errMsg, backoff); err != nil {
 				log.Printf("[RECONCILE] Failed to schedule retry for record %d: %v", rec.ID, err)
 			} else {
 				log.Printf("[RECONCILE] Record %d failed (attempt %d/%d), retry in %v: %v", rec.ID, rec.AttemptCount, p.MaxRetry, backoff, errMsg)
@@ -269,6 +327,31 @@ func verifyClientIdentity(remote *xui.XUIClientInfo, expectedEmail, expectedUUID
 	return nil
 }
 
+func verifySubscriptionCommercialIdentity(sub *db.Subscription, expectedUserID int64, expectedUUID, expectedSubID string, expectedQuoteID *int64) error {
+	if sub == nil {
+		return errors.New("subscription is nil")
+	}
+	if sub.UserID != expectedUserID {
+		return fmt.Errorf("user_id mismatch: sub.UserID=%d expected=%d", sub.UserID, expectedUserID)
+	}
+	if strings.TrimSpace(expectedUUID) != "" && sub.ClientUUID != expectedUUID {
+		return fmt.Errorf("UUID mismatch: sub.ClientUUID=%q expected=%q", sub.ClientUUID, expectedUUID)
+	}
+	if strings.TrimSpace(expectedSubID) != "" && sub.SubID != expectedSubID {
+		return fmt.Errorf("sub_id mismatch: sub.SubID=%q expected=%q", sub.SubID, expectedSubID)
+	}
+	if expectedQuoteID != nil && *expectedQuoteID > 0 {
+		if sub.QuoteID == nil || *sub.QuoteID != *expectedQuoteID {
+			subQuote := int64(0)
+			if sub.QuoteID != nil {
+				subQuote = *sub.QuoteID
+			}
+			return fmt.Errorf("quote_id mismatch: sub.QuoteID=%d expected=%d", subQuote, *expectedQuoteID)
+		}
+	}
+	return nil
+}
+
 func (p *Processor) getCompletedDebitTransaction(ctx context.Context, userID int64, operationKey string) (*db.WalletTransaction, error) {
 	if p.DebitTxFn != nil {
 		return p.DebitTxFn(ctx, userID, operationKey)
@@ -307,7 +390,7 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 		}
 
 		// 2. Check existing subscription in DB
-		existing, checkErr := db.GetSubscriptionByEmail(ctx, payload.Email)
+		existing, checkErr := p.getSubscriptionByEmail(ctx, payload.Email)
 		if checkErr != nil {
 			return ProcessOutcome{
 				Kind: OutcomeRetry,
@@ -315,9 +398,15 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 			}
 		}
 		if existing != nil {
+			if idErr := verifySubscriptionCommercialIdentity(existing, payload.UserID, payload.ExpectedUUID, payload.ExpectedSubID, payload.QuoteID); idErr != nil {
+				return ProcessOutcome{
+					Kind:   OutcomeManualReview,
+					Reason: fmt.Sprintf("commercial identity verification failed for existing subscription %d: %v", existing.ID, idErr),
+				}
+			}
 			return ProcessOutcome{
 				Kind:       OutcomeResolved,
-				Resolution: fmt.Sprintf("remote client %s and subscription %d both exist", payload.Email, existing.ID),
+				Resolution: fmt.Sprintf("remote client %s and verified subscription %d both exist", payload.Email, existing.ID),
 			}
 		}
 
@@ -455,6 +544,10 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 }
 
 func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
+	return p.handleSubscriptionCancellation(ctx, rec)
+}
+
+func (p *Processor) handleSubscriptionCancellation(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
 	payload, err := DecodeSubscriptionDelete(rec.DesiredState, rec.SubscriptionID, rec.UserID, rec.OperationKey)
 	if err != nil {
 		return ProcessOutcome{
@@ -475,57 +568,13 @@ func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.Reco
 
 	switch presence {
 	case RemoteConfirmedAbsent:
-		// Step 1: Remote is confirmed absent.
-		// Step 2: Persist local cancellation/deleted state in DB.
-		if payload.SubscriptionID != nil {
-			if delErr := db.DeleteSubscription(ctx, int(*payload.SubscriptionID)); delErr != nil {
-				return ProcessOutcome{
-					Kind: OutcomeRetry,
-					Err:  fmt.Errorf("failed to mark subscription %d deleted in DB: %w", *payload.SubscriptionID, delErr),
-				}
-			}
-		}
-		// Step 3: Perform/confirm refund if required.
-		if payload.RefundAmount > 0 && payload.UserID != nil {
-			refundErr := p.executeRefund(ctx, *payload.UserID, payload.RefundAmount, "refund for cancelled subscription", payload.RefundOperationKey)
-			if refundErr != nil {
-				return ProcessOutcome{
-					Kind: OutcomeRetry,
-					Err:  refundErr, // Keep retryable! Never resolve with failed refund!
-				}
-			}
-		}
-		// Step 4: Resolve.
-		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: fmt.Sprintf("remote client %s confirmed deleted, local record cleaned", payload.ClientEmail),
-		}
+		return p.reconcileAbsentSubscription(ctx, rec, payload)
 
 	case RemoteConfirmedPresent:
 		// Remote client still exists. Attempt delete once.
 		delErr := p.XUI.DeleteClient(payload.ClientEmail)
 		if delErr == nil || xui.IsNotFound(delErr) {
-			if payload.SubscriptionID != nil {
-				if dbDelErr := db.DeleteSubscription(ctx, int(*payload.SubscriptionID)); dbDelErr != nil {
-					return ProcessOutcome{
-						Kind: OutcomeRetry,
-						Err:  fmt.Errorf("failed to mark subscription %d deleted in DB after remote deletion: %w", *payload.SubscriptionID, dbDelErr),
-					}
-				}
-			}
-			if payload.RefundAmount > 0 && payload.UserID != nil {
-				refundErr := p.executeRefund(ctx, *payload.UserID, payload.RefundAmount, "refund for cancelled subscription", payload.RefundOperationKey)
-				if refundErr != nil {
-					return ProcessOutcome{
-						Kind: OutcomeRetry,
-						Err:  refundErr, // Keep retryable!
-					}
-				}
-			}
-			return ProcessOutcome{
-				Kind:       OutcomeResolved,
-				Resolution: fmt.Sprintf("remote client %s deleted on retry", payload.ClientEmail),
-			}
+			return p.reconcileAbsentSubscription(ctx, rec, payload)
 		}
 		return ProcessOutcome{
 			Kind: OutcomeRetry,
@@ -538,6 +587,97 @@ func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.Reco
 			Kind: OutcomeRetry,
 			Err:  fmt.Errorf("inconclusive delete check for %s: %w", payload.ClientEmail, err),
 		}
+	}
+}
+
+func (p *Processor) reconcileAbsentSubscription(ctx context.Context, rec *db.ReconciliationRecord, payload *SubscriptionDeletePayload) ProcessOutcome {
+	// Remote client is confirmed absent.
+	// Step 1: Ensure subscription is marked CANCELLED (never deleted).
+	// Step 2: Under no circumstances perform direct wallet credit or bypass the refund queue.
+	//         Ensure refund request is recorded in refund_requests with status 'pending'.
+	if payload.SubscriptionID != nil {
+		subID := int(*payload.SubscriptionID)
+		sub, err := p.getSubByID(ctx, subID)
+		if err != nil {
+			return ProcessOutcome{
+				Kind: OutcomeRetry,
+				Err:  fmt.Errorf("failed to fetch subscription %d: %w", subID, err),
+			}
+		}
+		if sub == nil {
+			return ProcessOutcome{
+				Kind:   OutcomeManualReview,
+				Reason: fmt.Sprintf("remote client %s confirmed deleted, but local subscription %d not found in DB", payload.ClientEmail, subID),
+			}
+		}
+		if payload.UserID != nil && sub.UserID != *payload.UserID {
+			return ProcessOutcome{
+				Kind:   OutcomeManualReview,
+				Reason: fmt.Sprintf("remote client %s confirmed deleted, but subscription %d user mismatch (db=%d, payload=%d)", payload.ClientEmail, subID, sub.UserID, *payload.UserID),
+			}
+		}
+
+		if payload.RefundAmount > 0 {
+			userID := sub.UserID
+			if payload.UserID != nil {
+				userID = *payload.UserID
+			}
+			refundOpKey := payload.RefundOperationKey
+			if refundOpKey == "" {
+				refundOpKey = fmt.Sprintf("subscription_cancel_refund:%d", subID)
+			}
+
+			refundReq, cancelErr := p.cancelSubWithRefund(ctx, subID, userID, payload.RefundAmount, refundOpKey)
+			if cancelErr != nil {
+				return ProcessOutcome{
+					Kind: OutcomeRetry,
+					Err:  fmt.Errorf("remote client %s confirmed deleted, but CancelSubscriptionWithRefund failed for sub %d: %w", payload.ClientEmail, subID, cancelErr),
+				}
+			}
+			if refundReq == nil {
+				return ProcessOutcome{
+					Kind:   OutcomeManualReview,
+					Reason: fmt.Sprintf("remote client %s confirmed deleted, CancelSubscriptionWithRefund returned nil request for sub %d", payload.ClientEmail, subID),
+				}
+			}
+		} else {
+			if updateErr := p.updateSubStatus(ctx, subID, db.SubscriptionStatusCancelled); updateErr != nil {
+				return ProcessOutcome{
+					Kind: OutcomeRetry,
+					Err:  fmt.Errorf("remote client %s confirmed deleted, but UpdateSubscriptionStatus failed for sub %d: %w", payload.ClientEmail, subID, updateErr),
+				}
+			}
+		}
+
+		return ProcessOutcome{
+			Kind:       OutcomeResolved,
+			Resolution: fmt.Sprintf("remote client %s confirmed deleted, subscription %d marked cancelled and refund recorded in pending queue", payload.ClientEmail, subID),
+		}
+	}
+
+	// If no subscription ID provided but refund requested:
+	if payload.RefundAmount > 0 && payload.UserID != nil {
+		refundOpKey := payload.RefundOperationKey
+		if refundOpKey == "" {
+			refundOpKey = rec.OperationKey
+		}
+		req := &db.RefundRequest{
+			UserID:           *payload.UserID,
+			CalculatedAmount: payload.RefundAmount,
+			Status:           "pending",
+			OperationKey:     refundOpKey,
+		}
+		if createErr := p.createRefundRequest(ctx, req); createErr != nil {
+			return ProcessOutcome{
+				Kind: OutcomeRetry,
+				Err:  fmt.Errorf("remote client %s confirmed deleted, but CreateRefundRequest failed: %w", payload.ClientEmail, createErr),
+			}
+		}
+	}
+
+	return ProcessOutcome{
+		Kind:       OutcomeResolved,
+		Resolution: fmt.Sprintf("remote client %s confirmed deleted", payload.ClientEmail),
 	}
 }
 
@@ -697,7 +837,7 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 		}
 	}
 
-	req, err := db.GetPurchaseRequestByID(ctx, payload.PurchaseRequestID)
+	req, err := p.getPurchaseRequestByID(ctx, payload.PurchaseRequestID)
 	if err != nil {
 		return ProcessOutcome{
 			Kind: OutcomeRetry,
@@ -717,9 +857,15 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 		}
 	}
 	if req.Status != "approved" {
+		if req.Status == "rejected" || req.Status == "cancelled" {
+			return ProcessOutcome{
+				Kind:       OutcomeResolved,
+				Resolution: fmt.Sprintf("purchase request %d %s; provisioning superseded", payload.PurchaseRequestID, req.Status),
+			}
+		}
 		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: "purchase request not approved; skipping provisioning",
+			Kind:   OutcomeManualReview,
+			Reason: fmt.Sprintf("purchase request %d still pending admin approval (status=%q); awaiting decision", payload.PurchaseRequestID, req.Status),
 		}
 	}
 
@@ -743,18 +889,25 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 			}
 		}
 
-		existing, checkErr := db.GetSubscriptionByEmail(ctx, payload.ClientEmail)
+		existing, checkErr := p.getSubscriptionByEmail(ctx, payload.ClientEmail)
 		if checkErr != nil {
 			return ProcessOutcome{
 				Kind: OutcomeRetry,
 				Err:  fmt.Errorf("failed to check existing subscription: %w", checkErr),
 			}
 		}
-		clientUUID := remote.UUID
-		if clientUUID == "" {
-			clientUUID = payload.ExpectedUUID
-		}
-		if existing == nil {
+		if existing != nil {
+			if idErr := verifySubscriptionCommercialIdentity(existing, payload.UserID, payload.ExpectedUUID, payload.ExpectedSubID, payload.QuoteID); idErr != nil {
+				return ProcessOutcome{
+					Kind:   OutcomeManualReview,
+					Reason: fmt.Sprintf("commercial identity verification failed for existing direct payment subscription %d: %v", existing.ID, idErr),
+				}
+			}
+		} else {
+			clientUUID := remote.UUID
+			if clientUUID == "" {
+				clientUUID = payload.ExpectedUUID
+			}
 			sub := &db.Subscription{
 				UserID:            payload.UserID,
 				PlanID:            payload.PlanID,

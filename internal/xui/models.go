@@ -138,3 +138,12 @@ type XUIClientInfo struct {
 	TrafficResetDay     int                 `json:"trafficResetDay"`
 	Reverse             map[string]any      `json:"reverse"`
 }
+
+// ClientPatch defines a partial update where nil means "preserve current remote value",
+// and non-nil means "set or clear this value".
+type ClientPatch struct {
+	Enable     *bool  `json:"enable,omitempty"`
+	ExpiryTime *int64 `json:"expiryTime,omitempty"`
+	LimitIP    *int   `json:"limitIp,omitempty"`
+	TotalGB    *int64 `json:"totalGB,omitempty"`
+}

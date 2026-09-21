@@ -150,3 +150,218 @@ func TestConcurrencyStress(t *testing.T) {
 		t.Log("Concurrency stress test completed successfully without errors!")
 	}
 }
+
+func TestReconciliationConcurrencyAndTerminalStates(t *testing.T) {
+	ctx := setupTestDB(t)
+
+	defer func() {
+		if Pool != nil {
+			_, _ = Pool.Exec(ctx, "DELETE FROM reconciliation_records WHERE operation_key LIKE 'test_cas_%'")
+		}
+	}()
+
+	// 1. Worker claims record, admin manually closes it, worker later tries to resolve -> admin close remains final
+	t.Run("worker claims record, admin manually closes it, stale worker cannot resolve", func(t *testing.T) {
+		opKey := fmt.Sprintf("test_cas_close_%d", time.Now().UnixNano())
+		rec := &ReconciliationRecord{
+			OperationKey: opKey,
+			Kind:         "test_kind",
+			DesiredState: map[string]any{"data": "1"},
+			Status:       ReconciliationStatusPending,
+		}
+		if err := CreateReconciliationRecord(ctx, rec); err != nil {
+			t.Fatalf("failed to create record: %v", err)
+		}
+
+		claimed, err := ClaimPendingReconciliationRecords(ctx, "worker_1", 10)
+		if err != nil {
+			t.Fatalf("failed to claim record: %v", err)
+		}
+		var myRec *ReconciliationRecord
+		for _, r := range claimed {
+			if r.OperationKey == opKey {
+				myRec = r
+				break
+			}
+		}
+		if myRec == nil {
+			t.Fatalf("record was not claimed by worker_1")
+		}
+
+		// Admin manually closes record
+		if err := ManuallyCloseReconciliationRecord(ctx, myRec.ID, 999, "admin closed during review"); err != nil {
+			t.Fatalf("failed to manually close record: %v", err)
+		}
+
+		// Stale worker_1 tries to resolve
+		resErr := ResolveReconciliationRecord(ctx, myRec.ID, "worker_1", myRec.Status, "worker resolution")
+		if resErr == nil {
+			t.Fatalf("expected error when stale worker resolves manually closed record, got nil")
+		}
+
+		// Verify record is still manually closed
+		finalRec, err := GetReconciliationRecordByID(ctx, myRec.ID)
+		if err != nil || finalRec == nil {
+			t.Fatalf("failed to get record: %v", err)
+		}
+		if finalRec.Status != ReconciliationStatusManuallyClosed {
+			t.Fatalf("expected status %s, got %s", ReconciliationStatusManuallyClosed, finalRec.Status)
+		}
+	})
+
+	// 2. Worker claims record, admin moves it to manual review -> stale worker cannot overwrite it
+	t.Run("worker claims record, admin moves to manual review, stale worker cannot overwrite", func(t *testing.T) {
+		opKey := fmt.Sprintf("test_cas_review_%d", time.Now().UnixNano())
+		rec := &ReconciliationRecord{
+			OperationKey: opKey,
+			Kind:         "test_kind",
+			DesiredState: map[string]any{"data": "2"},
+			Status:       ReconciliationStatusPending,
+		}
+		if err := CreateReconciliationRecord(ctx, rec); err != nil {
+			t.Fatalf("failed to create record: %v", err)
+		}
+
+		claimed, err := ClaimPendingReconciliationRecords(ctx, "worker_1", 10)
+		if err != nil {
+			t.Fatalf("failed to claim record: %v", err)
+		}
+		var myRec *ReconciliationRecord
+		for _, r := range claimed {
+			if r.OperationKey == opKey {
+				myRec = r
+				break
+			}
+		}
+		if myRec == nil {
+			t.Fatalf("record was not claimed by worker_1")
+		}
+
+		// Admin moves to manual review
+		if err := MarkReconciliationManualReview(ctx, myRec.ID, "", "", "admin flagged for manual review"); err != nil {
+			t.Fatalf("failed to mark manual review: %v", err)
+		}
+
+		// Stale worker_1 tries to resolve
+		resErr := ResolveReconciliationRecord(ctx, myRec.ID, "worker_1", myRec.Status, "worker resolution")
+		if resErr == nil {
+			t.Fatalf("expected error when stale worker resolves record moved to manual review, got nil")
+		}
+
+		// Verify record is still in manual_review
+		finalRec, err := GetReconciliationRecordByID(ctx, myRec.ID)
+		if err != nil || finalRec == nil {
+			t.Fatalf("failed to get record: %v", err)
+		}
+		if finalRec.Status != ReconciliationStatusManualReview {
+			t.Fatalf("expected status %s, got %s", ReconciliationStatusManualReview, finalRec.Status)
+		}
+	})
+
+	// 3. Two workers cannot both successfully complete the same claim
+	t.Run("two workers cannot both successfully complete the same claim", func(t *testing.T) {
+		opKey := fmt.Sprintf("test_cas_two_workers_%d", time.Now().UnixNano())
+		rec := &ReconciliationRecord{
+			OperationKey: opKey,
+			Kind:         "test_kind",
+			DesiredState: map[string]any{"data": "3"},
+			Status:       ReconciliationStatusPending,
+		}
+		if err := CreateReconciliationRecord(ctx, rec); err != nil {
+			t.Fatalf("failed to create record: %v", err)
+		}
+
+		claimed, err := ClaimPendingReconciliationRecords(ctx, "worker_A", 10)
+		if err != nil {
+			t.Fatalf("failed to claim: %v", err)
+		}
+		var myRec *ReconciliationRecord
+		for _, r := range claimed {
+			if r.OperationKey == opKey {
+				myRec = r
+				break
+			}
+		}
+		if myRec == nil {
+			t.Fatalf("record not claimed by worker_A")
+		}
+
+		// worker_B tries to resolve worker_A's lease
+		errB := ResolveReconciliationRecord(ctx, myRec.ID, "worker_B", myRec.Status, "resolved by B")
+		if errB == nil {
+			t.Fatalf("worker_B should not be able to resolve record claimed by worker_A")
+		}
+
+		// worker_A successfully resolves
+		errA := ResolveReconciliationRecord(ctx, myRec.ID, "worker_A", myRec.Status, "resolved by A")
+		if errA != nil {
+			t.Fatalf("worker_A should be able to resolve own lease, got: %v", errA)
+		}
+
+		// worker_A tries to resolve again (now terminal)
+		errA2 := ResolveReconciliationRecord(ctx, myRec.ID, "worker_A", myRec.Status, "resolved by A again")
+		if errA2 == nil {
+			t.Fatalf("worker_A should not be able to resolve an already terminal record")
+		}
+	})
+
+	// 4. Retry reset cannot reopen a terminal record
+	t.Run("retry reset cannot reopen a terminal record", func(t *testing.T) {
+		opKey := fmt.Sprintf("test_cas_reset_terminal_%d", time.Now().UnixNano())
+		rec := &ReconciliationRecord{
+			OperationKey: opKey,
+			Kind:         "test_kind",
+			DesiredState: map[string]any{"data": "4"},
+			Status:       ReconciliationStatusResolvedVerified,
+		}
+		if err := CreateReconciliationRecord(ctx, rec); err != nil {
+			t.Fatalf("failed to create record: %v", err)
+		}
+
+		err := ResetReconciliationForRetry(ctx, rec.ID)
+		if err == nil || err != ErrReconciliationNotRetryable {
+			t.Fatalf("expected ErrReconciliationNotRetryable, got: %v", err)
+		}
+
+		finalRec, _ := GetReconciliationRecordByID(ctx, rec.ID)
+		if finalRec.Status != ReconciliationStatusResolvedVerified {
+			t.Fatalf("expected status to remain %s, got: %s", ReconciliationStatusResolvedVerified, finalRec.Status)
+		}
+	})
+
+	// 5. Ordinary CreateReconciliationRecord upserts still cannot reopen terminal records
+	t.Run("CreateReconciliationRecord upsert cannot reopen terminal records", func(t *testing.T) {
+		opKey := fmt.Sprintf("test_cas_upsert_terminal_%d", time.Now().UnixNano())
+		rec := &ReconciliationRecord{
+			OperationKey: opKey,
+			Kind:         "test_kind",
+			DesiredState: map[string]any{"initial": "true"},
+			Status:       ReconciliationStatusManuallyClosed,
+		}
+		if err := CreateReconciliationRecord(ctx, rec); err != nil {
+			t.Fatalf("failed to create record: %v", err)
+		}
+
+		// Try to upsert with pending status and different desired state
+		upsertRec := &ReconciliationRecord{
+			OperationKey: opKey,
+			Kind:         "test_kind",
+			DesiredState: map[string]any{"initial": "false"},
+			Status:       ReconciliationStatusPending,
+		}
+		if err := CreateReconciliationRecord(ctx, upsertRec); err != nil {
+			t.Fatalf("upsert should succeed without error: %v", err)
+		}
+
+		finalRec, err := GetReconciliationRecordByID(ctx, rec.ID)
+		if err != nil || finalRec == nil {
+			t.Fatalf("failed to get record: %v", err)
+		}
+		if finalRec.Status != ReconciliationStatusManuallyClosed {
+			t.Fatalf("expected status to remain %s, got: %s", ReconciliationStatusManuallyClosed, finalRec.Status)
+		}
+		if fmt.Sprintf("%v", finalRec.DesiredState["initial"]) != "true" {
+			t.Fatalf("expected desired_state to be preserved on terminal record")
+		}
+	})
+}

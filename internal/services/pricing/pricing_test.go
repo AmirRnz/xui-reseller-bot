@@ -156,3 +156,79 @@ func TestCalculateRefund(t *testing.T) {
 		t.Fatalf("expected 0 for legacy without quote, got %d", refundLegacy)
 	}
 }
+
+func TestQuotesEqual_OwnershipAndIdentity(t *testing.T) {
+	q1 := &PurchaseQuote{
+		UserID:          100,
+		PlanID:          1,
+		PlanName:        "Plan 1",
+		Months:          1,
+		DurationDays:    30,
+		IPLimit:         1,
+		FinalPriceToman: 50000,
+		Currency:        "تومان",
+	}
+	q2 := &PurchaseQuote{
+		UserID:          100,
+		PlanID:          1,
+		PlanName:        "Plan 1",
+		Months:          1,
+		DurationDays:    30,
+		IPLimit:         1,
+		FinalPriceToman: 50000,
+		Currency:        "تومان",
+	}
+	if !quotesEqual(q1, q2) {
+		t.Fatalf("identical quotes should be equal")
+	}
+
+	// Different UserID
+	qDiffUser := *q2
+	qDiffUser.UserID = 101
+	if quotesEqual(q1, &qDiffUser) {
+		t.Fatalf("quotes with different UserID must NOT be equal")
+	}
+
+	// Different PlanID
+	qDiffPlan := *q2
+	qDiffPlan.PlanID = 2
+	if quotesEqual(q1, &qDiffPlan) {
+		t.Fatalf("quotes with different PlanID must NOT be equal")
+	}
+}
+
+func TestCalculateQuote_IntegerAndBasisPoints(t *testing.T) {
+	plan := &db.PaidPlan{
+		ID:                   1,
+		Name:                 "Plan Int",
+		BasePriceToman:       60000,
+		BasePrice:            50000, // Should prefer BasePriceToman
+		BaseIPLimit:          1,
+		MaxIPLimit:           5,
+		PricePerExtraIPToman: 20000,
+		DiscountTiers: []db.DiscountTier{
+			{Months: 3, Percent: 15, BasisPoints: 1500},
+		},
+	}
+	q := CalculateQuote(QuoteParams{
+		UserID:  200,
+		Plan:    plan,
+		Months:  3,
+		IPLimit: 2, // 1 extra IP
+	})
+	if q.BasePriceToman != 180000 {
+		t.Fatalf("expected base 180000, got %d", q.BasePriceToman)
+	}
+	if q.ExtraIPPriceToman != 60000 {
+		t.Fatalf("expected extra IP 60000, got %d", q.ExtraIPPriceToman)
+	}
+	if q.DiscountToman != 36000 {
+		t.Fatalf("expected discount 36000, got %d", q.DiscountToman)
+	}
+	if q.FinalPriceToman != 204000 {
+		t.Fatalf("expected final 204000, got %d", q.FinalPriceToman)
+	}
+	if q.UserID != 200 || q.PlanID != 1 {
+		t.Fatalf("expected UserID 200, PlanID 1, got %d, %d", q.UserID, q.PlanID)
+	}
+}
