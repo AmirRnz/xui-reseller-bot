@@ -33,7 +33,7 @@ func RegisterStart(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.Mi
 		}
 		return c.Send("برای پشتیبانی لطفا با ادمین در ارتباط باشید.")
 	}, auth)
-	
+
 	b.Handle("\fmenu_request_access", func(c telebot.Context) error {
 		user := userFromContext(c)
 		if user == nil {
@@ -42,13 +42,13 @@ func RegisterStart(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.Mi
 		if user.Status != db.UserStatusPending {
 			return c.Send("شما قبلا درخواست دسترسی داده‌اید یا تایید شده‌اید.")
 		}
-		
+
 		msg := fmt.Sprintf("📝 درخواست دسترسی نمایندگی جدید:\nکاربر: %s\nآیدی عددی: `%d`\n\nبرای تایید به منوی ادمین مراجعه کنید.", userIdentifier(user), user.TelegramID)
 		for _, adminID := range adminCfg.AdminIDs {
 			adminUser := &telebot.User{ID: adminID}
 			_, _ = bot.Bot.Send(adminUser, msg, telebot.ModeMarkdown)
 		}
-		
+
 		return c.Send("✅ درخواست دسترسی شما برای ادمین ارسال شد. پس از تایید به شما اطلاع داده خواهد شد.")
 	}, auth)
 }
@@ -173,12 +173,12 @@ func ProcessServiceName(c telebot.Context, text string) error {
 	if user == nil {
 		return c.Send("خطا.")
 	}
-	
+
 	validPattern := regexp.MustCompile(`^[a-zA-Z0-9_-]{3,32}$`)
 	if !validPattern.MatchString(text) {
 		return c.Send("نام نامعتبر است. فقط حروف انگلیسی، اعداد، خط تیره (-) و آندرلاین (_) مجاز است. طول نام باید بین ۳ تا ۳۲ کاراکتر باشد.\nلطفا دوباره وارد کنید:")
 	}
-	
+
 	err := db.UpdateUserServiceName(context.Background(), user.TelegramID, text)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique constraint") || strings.Contains(strings.ToLower(err.Error()), "duplicate key") {
@@ -186,9 +186,8 @@ func ProcessServiceName(c telebot.Context, text string) error {
 		}
 		return c.Send("خطا در ثبت نام سرویس.")
 	}
-	
+
 	bot.FSM.ClearState(user.TelegramID)
 	user.ServiceName = &text
 	return showMainMenu(c, user)
 }
-

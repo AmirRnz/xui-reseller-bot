@@ -2,16 +2,14 @@ package scheduler
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"time"
 
-	"gopkg.in/telebot.v3"
-	"xui-reseller-bot/internal/bot"
 	"xui-reseller-bot/internal/config"
 	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/services/outbox"
 )
 
 var schedulerConfig *config.Config
@@ -73,18 +71,9 @@ func processExpiringSubscriptions(ctx context.Context) {
 			default:
 			}
 
-			user, err := db.GetUserByID(ctx, sub.UserID)
-			if err != nil || user == nil || bot.Bot == nil {
-				continue
+			if err := outbox.EnqueueExpiryNotification(ctx, int64(sub.ID), sub.UserID, days, sub.ClientEmail, sub.EndDate.Format("2006-01-02")); err != nil {
+				log.Printf("Scheduler: failed to enqueue notification for sub %d: %v", sub.ID, err)
 			}
-			text := fmt.Sprintf("⚠️ Subscription expiring in %d day(s)\nService: %s\nExpires: %s",
-				days, sub.ClientEmail, sub.EndDate.Format("2006-01-02"))
-			if _, err := bot.Bot.Send(&telebot.User{ID: user.TelegramID}, text); err != nil {
-				log.Printf("Scheduler: failed to notify user %d: %v", user.TelegramID, err)
-			}
-			
-			// Rate limiting: sleep between telegram sends (e.g. 35ms) to prevent Telegram API rate limits
-			time.Sleep(35 * time.Millisecond)
 		}
 	}
 }
@@ -108,4 +97,3 @@ func notificationDays(ctx context.Context) []int {
 	}
 	return days
 }
-

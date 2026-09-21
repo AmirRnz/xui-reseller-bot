@@ -40,7 +40,7 @@ func HandleWalletFlow(c telebot.Context) error {
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	menu := &telebot.ReplyMarkup{}
 	row := []telebot.Row{menu.Row(menu.Data("📥 شارژ کیف پول", "btn_topup"))}
@@ -165,12 +165,36 @@ func HandleReceiptPhoto(c telebot.Context) error {
 			email = fmt.Sprintf("%v", em)
 		}
 
+		operationKey := ""
+		if op, ok := state.Data["operation_key"]; ok {
+			operationKey = strings.TrimSpace(fmt.Sprintf("%v", op))
+		}
+
+		var quoteIDPtr *int64
+		if qIDStr, ok := state.Data["quote_id"]; ok && qIDStr != "" {
+			if qID, err := strconv.ParseInt(fmt.Sprintf("%v", qIDStr), 10, 64); err == nil && qID > 0 {
+				quoteIDPtr = &qID
+			}
+		}
+		var priceTomanPtr *int64
+		if ptStr, ok := state.Data["price_toman"]; ok && ptStr != "" {
+			if pt, err := strconv.ParseInt(fmt.Sprintf("%v", ptStr), 10, 64); err == nil && pt > 0 {
+				priceTomanPtr = &pt
+			}
+		}
+		if priceTomanPtr == nil && price > 0 {
+			pt := int64(price)
+			priceTomanPtr = &pt
+		}
+
 		req := &db.PurchaseRequest{
 			UserID:         user.ID,
 			Type:           pType,
 			PlanID:         planIDPtr,
 			SubscriptionID: subIDPtr,
 			Price:          price,
+			PriceToman:     priceTomanPtr,
+			QuoteID:        quoteIDPtr,
 			Months:         months,
 			IPLimit:        ipLimit,
 			DataGB:         dataGB,
@@ -178,6 +202,7 @@ func HandleReceiptPhoto(c telebot.Context) error {
 			ClientEmail:    email,
 			TelegramFileID: fileID,
 			Status:         "pending",
+			OperationKey:   operationKey,
 		}
 
 		if err := db.CreatePurchaseRequest(context.Background(), req); err != nil {
@@ -188,7 +213,7 @@ func HandleReceiptPhoto(c telebot.Context) error {
 
 		currency, _ := db.GetSetting(context.Background(), "currency_name")
 		if currency == "" {
-			currency = "IRR"
+			currency = "تومان"
 		}
 
 		if walletAdminCfg != nil {
@@ -351,7 +376,7 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 	var activationErr error
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	switch req.Type {
@@ -385,23 +410,32 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 		provisioningStatus := db.PurchaseProvisioningFailed
 		if xui.IsUnknownOutcome(activationErr) {
 			provisioningStatus = db.PurchaseProvisioningRetryable
-			purchaseID := req.ID
-			if recErr := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
-				OperationKey:      fmt.Sprintf("purchase_request_reconciliation:%d", req.ID),
-				Kind:              "purchase_provisioning_unknown",
-				UserID:            &req.UserID,
-				PurchaseRequestID: &purchaseID,
-				DesiredState:      map[string]any{"type": req.Type, "email": req.ClientEmail, "subscription_id": req.SubscriptionID, "ip_limit": req.IPLimit, "months": req.Months, "data_gb": req.DataGB},
-				ObservedState:     map[string]any{"outcome": "unknown"},
-				ErrorMessage:      activationErr.Error(),
-			}); recErr != nil {
-				log.Printf("[CRITICAL] failed to persist purchase request reconciliation #%d: %v", req.ID, recErr)
-			}
 		}
 		if statusErr := db.SetPurchaseProvisioningStatus(context.Background(), reqID, provisioningStatus); statusErr != nil {
 			log.Printf("[CRITICAL] failed to persist provisioning status for purchase request #%d: %v", reqID, statusErr)
 		}
-		return c.Send("پرداخت شما تایید شده است اما فعال‌سازی سرویس کامل نشد؛ مبلغ حذف نشده و وضعیت برای تلاش مجدد/تطبیق ثبت شد.")
+		if provisioningStatus == db.PurchaseProvisioningRetryable {
+			record := &db.ReconciliationRecord{
+				OperationKey:      fmt.Sprintf("direct_payment:%d:provisioning", reqID),
+				Kind:              "direct_payment_provisioning_retry",
+				UserID:            &user.ID,
+				PurchaseRequestID: &reqID,
+				DesiredState: map[string]any{
+					"purchase_request_id": reqID,
+					"email":               req.ClientEmail,
+				},
+				ObservedState: map[string]any{
+					"outcome": "activation_failed",
+					"error":   activationErr.Error(),
+				},
+				ErrorMessage: activationErr.Error(),
+			}
+			if recErr := db.CreateReconciliationRecord(context.Background(), record); recErr != nil {
+				log.Printf("[CRITICAL] failed to persist provisioning reconciliation for purchase request #%d: %v", reqID, recErr)
+			}
+			return c.Send("پرداخت شما تایید شده است اما نتیجه فعال‌سازی سرویس در پنل نامشخص است؛ مبلغ و تایید پرداخت حفظ شد و وضعیت برای تلاش مجدد خودکار ثبت گردید.")
+		}
+		return c.Send("پرداخت شما تایید شده است اما فعال‌سازی سرویس انجام نشد؛ تایید پرداخت و تراکنش مالی حفظ شد و وضعیت خطا ثبت گردید.")
 	}
 	if err := db.SetPurchaseProvisioningStatus(context.Background(), reqID, db.PurchaseProvisioningSucceeded); err != nil {
 		log.Printf("[CRITICAL] purchase request #%d activated but provisioning status update failed: %v", reqID, err)
@@ -477,7 +511,7 @@ func HandleAdminApproveRefund(c telebot.Context) error {
 	if user != nil {
 		currency, _ := db.GetSetting(context.Background(), "currency_name")
 		if currency == "" {
-			currency = "IRR"
+			currency = "تومان"
 		}
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ مبلغ %d %s بابت لغو سرویس به کیف پول شما اضافه شد.", req.CalculatedAmount, currency))
 	}
@@ -552,6 +586,7 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 	sub := &db.Subscription{
 		UserID:            user.ID,
 		PlanID:            &planID,
+		QuoteID:           req.QuoteID,
 		ClientEmail:       req.ClientEmail,
 		ClientUUID:        clientUUID,
 		SubID:             subID,
@@ -642,7 +677,7 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	var dataLabel = "نامحدود"
 	if plan.IsLimited {
@@ -715,7 +750,7 @@ func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, 
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	msg := fmt.Sprintf("✅ پرداخت شما تایید و اشتراک **%s** به مدت %d ماه تمدید شد.\nتاریخ انقضای جدید: %s\nمبلغ پرداخت شده: %.0f %s.",
@@ -749,7 +784,7 @@ func upgradeSubscriptionIPFromApprovedRequest(user *db.User, sub *db.Subscriptio
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	msg := fmt.Sprintf("✅ پرداخت شما تایید و سقف کاربر همزمان اشتراک **%s** به %d دستگاه ارتقا یافت.\nهزینه ارتقا پرداخت شده: %.0f %s.",

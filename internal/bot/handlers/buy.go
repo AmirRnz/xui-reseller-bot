@@ -11,7 +11,9 @@ import (
 
 	"gopkg.in/telebot.v3"
 	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/services/pricing"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -46,7 +48,7 @@ func HandleBuySubFlow(c telebot.Context) error {
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	var text strings.Builder
 	text.WriteString("💼 **طرح‌های خرید سرویس**:\n\n")
@@ -88,7 +90,7 @@ func HandleSelectBuyPlan(c telebot.Context) error {
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	discountText := ""
 	if len(plan.DiscountTiers) > 0 {
@@ -153,7 +155,7 @@ func handlePostDuration(c telebot.Context, plan *db.PaidPlan, months int) error 
 		})
 		currency, _ := db.GetSetting(context.Background(), "currency_name")
 		if currency == "" {
-			currency = "IRR"
+			currency = "تومان"
 		}
 		menu := &telebot.ReplyMarkup{}
 		menu.Inline(
@@ -307,7 +309,7 @@ func showIPChoicesLimited(c telebot.Context, plan *db.PaidPlan, months int, gb i
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	menu := &telebot.ReplyMarkup{}
 	var rows []telebot.Row
@@ -354,7 +356,7 @@ func HandleBuyIPRunLimited(c telebot.Context) error {
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
@@ -386,7 +388,7 @@ func showIPChoices(c telebot.Context, planID int64, months int) error {
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	menu := &telebot.ReplyMarkup{}
 	var rows []telebot.Row
@@ -447,7 +449,7 @@ func HandleBuyIPRun(c telebot.Context) error {
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
@@ -503,36 +505,37 @@ func ProcessBuyCustomName(c telebot.Context, customName string) error {
 		}
 	}
 
-	price := calculatePaidPrice(plan, months, ipLimit, dataGB)
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "IRR"
-	}
 	operationToken := makeSubID()
+	opKey := fmt.Sprintf("wallet_purchase:%s", operationToken)
+	quote := pricing.CalculateQuote(pricing.QuoteParams{
+		UserID:       user.ID,
+		Plan:         plan,
+		Months:       months,
+		IPLimit:      ipLimit,
+		DataGB:       dataGB,
+		OperationKey: opKey,
+	})
+	_ = pricing.SaveQuote(context.Background(), quote)
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
 		"plan_id":         fmt.Sprintf("%d", plan.ID),
+		"quote_id":        fmt.Sprintf("%d", quote.ID),
+		"quote_key":       quote.QuoteKey,
 		"months":          fmt.Sprintf("%d", months),
 		"ip_limit":        fmt.Sprintf("%d", ipLimit),
-		"price":           fmt.Sprintf("%.2f", price),
+		"price":           fmt.Sprintf("%d", quote.FinalPriceToman),
+		"price_toman":     fmt.Sprintf("%d", quote.FinalPriceToman),
 		"custom_name":     name,
 		"email":           email,
 		"data_gb":         fmt.Sprintf("%d", dataGB),
 		"type":            "buy",
 		"operation_token": operationToken,
-		"operation_key":   fmt.Sprintf("wallet_purchase:%s", operationToken),
+		"operation_key":   opKey,
 	})
 
 	var dataLabel = "نامحدود"
 	if plan.IsLimited {
 		dataLabel = fmt.Sprintf("%d گیگابایت", dataGB)
-	}
-
-	var ipLimitLabel string
-	if ipLimit == 0 {
-		ipLimitLabel = "نامحدود"
-	} else {
-		ipLimitLabel = fmt.Sprintf("%d کاربر همزمان", ipLimit)
 	}
 
 	menu := &telebot.ReplyMarkup{}
@@ -546,9 +549,10 @@ func ProcessBuyCustomName(c telebot.Context, customName string) error {
 		),
 	)
 	return maybeEditOrSend(c, fmt.Sprintf(
-		"🧾 **خلاصه فاکتور خرید**\n\nطرح: %s\nاشتراک: %s\nمدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\nکاربر همزمان: %s\nسقف ترافیک: %s\nمبلغ کل: %.0f %s\n\nموجودی کیف پول شما: %d %s\n\nنحوه پرداخت را انتخاب کنید:",
-		plan.Name, email, months, ipLimitLabel, dataLabel, price, currency,
-		user.WalletBalance, currency,
+		"🧾 **خلاصه فاکتور خرید**\n\nطرح: %s\nاشتراک: %s\nمدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\nکاربر همزمان: %s\nسقف ترافیک: %s\nمبلغ کل: %s\n\nموجودی کیف پول شما: %s\n\nنحوه پرداخت را انتخاب کنید:",
+		plan.Name, email, months, persian.FormatIPLimit(ipLimit), dataLabel,
+		persian.FormatMoney(quote.FinalPriceToman),
+		persian.FormatMoney(user.WalletBalance),
 	), menu)
 }
 
@@ -598,36 +602,37 @@ func HandleBuyAutoName(c telebot.Context) error {
 		}
 	}
 
-	price := calculatePaidPrice(plan, months, ipLimit, dataGB)
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "IRR"
-	}
 	operationToken := makeSubID()
+	opKey := fmt.Sprintf("wallet_purchase:%s", operationToken)
+	quote := pricing.CalculateQuote(pricing.QuoteParams{
+		UserID:       user.ID,
+		Plan:         plan,
+		Months:       months,
+		IPLimit:      ipLimit,
+		DataGB:       dataGB,
+		OperationKey: opKey,
+	})
+	_ = pricing.SaveQuote(context.Background(), quote)
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
 		"plan_id":         fmt.Sprintf("%d", plan.ID),
+		"quote_id":        fmt.Sprintf("%d", quote.ID),
+		"quote_key":       quote.QuoteKey,
 		"months":          fmt.Sprintf("%d", months),
 		"ip_limit":        fmt.Sprintf("%d", ipLimit),
-		"price":           fmt.Sprintf("%.2f", price),
+		"price":           fmt.Sprintf("%d", quote.FinalPriceToman),
+		"price_toman":     fmt.Sprintf("%d", quote.FinalPriceToman),
 		"custom_name":     baseName,
 		"email":           email,
 		"data_gb":         fmt.Sprintf("%d", dataGB),
 		"type":            "buy",
 		"operation_token": operationToken,
-		"operation_key":   fmt.Sprintf("wallet_purchase:%s", operationToken),
+		"operation_key":   opKey,
 	})
 
 	var dataLabel = "نامحدود"
 	if plan.IsLimited {
 		dataLabel = fmt.Sprintf("%d گیگابایت", dataGB)
-	}
-
-	var ipLimitLabel string
-	if ipLimit == 0 {
-		ipLimitLabel = "نامحدود"
-	} else {
-		ipLimitLabel = fmt.Sprintf("%d کاربر همزمان", ipLimit)
 	}
 
 	menu := &telebot.ReplyMarkup{}
@@ -641,9 +646,10 @@ func HandleBuyAutoName(c telebot.Context) error {
 		),
 	)
 	return maybeEditOrSend(c, fmt.Sprintf(
-		"🧾 **خلاصه فاکتور خرید**\n\nطرح: %s\nاشتراک: %s\nمدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\nکاربر همزمان: %s\nسقف ترافیک: %s\nمبلغ کل: %.0f %s\n\nموجودی کیف پول شما: %d %s\n\nنحوه پرداخت را انتخاب کنید:",
-		plan.Name, email, months, ipLimitLabel, dataLabel, price, currency,
-		user.WalletBalance, currency,
+		"🧾 **خلاصه فاکتور خرید**\n\nطرح: %s\nاشتراک: %s\nمدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\nکاربر همزمان: %s\nسقف ترافیک: %s\nمبلغ کل: %s\n\nموجودی کیف پول شما: %s\n\nنحوه پرداخت را انتخاب کنید:",
+		plan.Name, email, months, persian.FormatIPLimit(ipLimit), dataLabel,
+		persian.FormatMoney(quote.FinalPriceToman),
+		persian.FormatMoney(user.WalletBalance),
 	), menu)
 }
 
@@ -693,12 +699,41 @@ func HandleBuyConfirm(c telebot.Context) error {
 		return c.Send("این نام اشتراک در همین حین توسط شخص دیگری گرفته شد. لطفا فرآیند خرید را مجددا شروع کنید.")
 	}
 
-	price := calculatePaidPrice(plan, months, ipLimit, dataGB)
-	if err := db.DebitWalletBalanceWithKey(context.Background(), user.ID, price, "subscription purchase: "+email, operationKey); err != nil {
+	var quoteID *int64
+	if qIDStr, ok := state.Data["quote_id"]; ok && qIDStr != "" {
+		if qID, err := strconv.ParseInt(fmt.Sprintf("%v", qIDStr), 10, 64); err == nil && qID > 0 {
+			quoteID = &qID
+		}
+	}
+	var priceToman int64
+	if ptStr, ok := state.Data["price_toman"]; ok && ptStr != "" {
+		priceToman, _ = strconv.ParseInt(fmt.Sprintf("%v", ptStr), 10, 64)
+	}
+	if priceToman <= 0 {
+		quote := pricing.CalculateQuote(pricing.QuoteParams{
+			UserID:       user.ID,
+			Plan:         plan,
+			Months:       months,
+			IPLimit:      ipLimit,
+			DataGB:       dataGB,
+			OperationKey: operationKey,
+		})
+		if quote != nil {
+			priceToman = quote.FinalPriceToman
+			if quoteID == nil {
+				_ = pricing.SaveQuote(context.Background(), quote)
+				if quote.ID > 0 {
+					quoteID = &quote.ID
+				}
+			}
+		}
+	}
+
+	if err := db.DebitWalletBalanceWithKey(context.Background(), user.ID, float64(priceToman), "subscription purchase: "+email, operationKey); err != nil {
 		return c.Send("موجودی کیف پول شما کافی نیست. لطفا ابتدا کیف پول خود را شارژ کنید یا از گزینه پرداخت مستقیم استفاده کنید.")
 	}
 
-	if err := createPaidSubscription(c, user, plan, email, name, months, ipLimit, price, dataGB, operationKey); err != nil {
+	if err := createPaidSubscription(c, user, plan, email, name, months, ipLimit, float64(priceToman), dataGB, operationKey, quoteID); err != nil {
 		var compErr *paidSubscriptionCompensationError
 		if errors.As(err, &compErr) {
 			if compErr.Result.ReconErr != nil {
@@ -717,19 +752,19 @@ func HandleBuyConfirm(c telebot.Context) error {
 			recErr := db.CreateReconciliationRecord(context.Background(), record)
 			if recErr != nil {
 				log.Printf("[CRITICAL] failed to persist purchase reconciliation for %s: %v", email, recErr)
-				return c.Send(fmt.Sprintf("نتیجه ایجاد سرویس در پنل نامشخص است؛ به دلیل عدم قطعیت از بازگشت وجه خودداری شد. متاسفانه ثبت خودکار درخواست تطبیق نیز با خطا مواجه شد (%v) و هیچ درخواستی به‌طور خودکار در سیستم ثبت نشده است. لطفا فورا با پشتیبانی تماس گرفته و شناسه زیر را برای پیگیری ارسال فرمایید:\n%s", recErr, operationKey))
+				return c.Send(fmt.Sprintf("نتیجه ایجاد سرویس در پنل نامشخص است؛ برای جلوگیری از کسر مجدد از بازگشت وجه خودداری شد. ثبت خودکار درخواست تطبیق نیز با خطا مواجه گردید. لطفا با ارسال شناسه زیر با پشتیبانی تماس بگیرید:\n%s", operationKey))
 			}
-			return c.Send("نتیجه ایجاد سرویس در پنل نامشخص است؛ برای جلوگیری از ایجاد سرویس تکراری، مبلغ فعلا در کیف پول محفوظ ماند و درخواست برای بررسی ثبت شد.")
+			return c.Send("نتیجه ایجاد سرویس در پنل نامشخص است؛ برای جلوگیری از ایجاد سرویس تکراری، مبلغ در کیف پول محفوظ ماند و درخواست برای بررسی و تکمیل خودکار ثبت شد.")
 		}
-		refundRes := safeRefundWallet(context.Background(), user.ID, price, "refund for failed purchase: "+email, operationKey, operationKey+":refund", nil, map[string]any{"email": email, "plan_id": plan.ID})
+		refundRes := safeRefundWallet(context.Background(), user.ID, float64(priceToman), "refund for failed purchase: "+email, operationKey, operationKey+":refund", nil, map[string]any{"email": email, "plan_id": plan.ID})
 		if refundRes.Refunded {
-			return c.Send("خطا در ایجاد اشتراک در پنل. مبلغ کسر شده به کیف پول شما عودت داده شد. " + err.Error())
+			return c.Send("خطا در ایجاد اشتراک در پنل. مبلغ کسر شده به کیف پول شما عودت داده شد.")
 		}
 		if refundRes.ReconciliationPersisted {
-			return c.Send(fmt.Sprintf("خطا در ایجاد اشتراک در پنل رخ داد (%v)، اما بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد (%v). مبلغ جهت بررسی و بازگشت دستی توسط پشتیبانی با شناسه %s ثبت شد.", err, refundRes.RefundErr, operationKey+":refund"))
+			return c.Send(fmt.Sprintf("خطا در ایجاد اشتراک در پنل رخ داد، اما بازگشت خودکار وجه به کیف پول با مشکل مواجه شد. مبلغ جهت بررسی و بازگشت توسط پشتیبانی با شناسه زیر ثبت شد:\n%s", operationKey+":refund"))
 		}
 		log.Printf("[CRITICAL] failed to refund wallet and failed to persist reconciliation for user %d, opKey %s: refundErr=%v, reconErr=%v", user.ID, operationKey+":refund", refundRes.RefundErr, refundRes.ReconciliationErr)
-		return c.Send(fmt.Sprintf("خطا در ایجاد اشتراک در پنل رخ داد (%v) و بازگشت خودکار وجه به کیف پول نیز با خطا مواجه شد. ثبت خودکار گزارش خطا نیز با خطا مواجه گردید؛ هیچ درخواستی به‌طور خودکار در سیستم ثبت نشده است. لطفا فورا با ارسال شناسه زیر به پشتیبانی اطلاع دهید:\n%s", err, operationKey+":refund"))
+		return c.Send(fmt.Sprintf("خطا در ایجاد اشتراک در پنل رخ داد و بازگشت خودکار وجه نیز با خطا مواجه شد. لطفا فورا با ارسال شناسه زیر به پشتیبانی اطلاع دهید:\n%s", operationKey+":refund"))
 	}
 	return nil
 }
@@ -750,23 +785,27 @@ func HandleBuyDirectPayment(c telebot.Context) error {
 		return c.Send("این تاییدیه منقضی شده است؛ لطفا خلاصه خرید فعلی را دوباره باز کنید.")
 	}
 
-	priceStr := fmt.Sprintf("%v", state.Data["price"])
-	price, _ := strconv.ParseFloat(priceStr, 64)
+	var priceToman int64
+	if ptStr, ok := state.Data["price_toman"]; ok && ptStr != "" {
+		priceToman, _ = strconv.ParseInt(fmt.Sprintf("%v", ptStr), 10, 64)
+	}
+	if priceToman <= 0 {
+		priceStr := fmt.Sprintf("%v", state.Data["price"])
+		if pF, err := strconv.ParseFloat(priceStr, 64); err == nil {
+			priceToman = int64(pF)
+		}
+	}
 
 	card, _ := db.GetSetting(context.Background(), "card_number")
 	owner, _ := db.GetSetting(context.Background(), "card_owner")
 	desc, _ := db.GetSetting(context.Background(), "topup_description")
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "IRR"
-	}
 
 	// Change state step to awaiting_purchase_receipt so HandleReceiptPhoto will catch it
 	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", state.Data)
 
 	var text strings.Builder
 	text.WriteString("💳 **راهنمای پرداخت مستقیم (کارت به کارت)**\n\n")
-	text.WriteString(fmt.Sprintf("مبلغ قابل پرداخت: **%.0f %s**\n\n", price, currency))
+	text.WriteString(fmt.Sprintf("مبلغ قابل پرداخت: **%s**\n\n", persian.FormatMoney(priceToman)))
 	if card != "" {
 		text.WriteString(fmt.Sprintf("شماره کارت جهت واریز:\n`%s`\n", card))
 	}
@@ -791,7 +830,7 @@ func HandleBuyCancel(c telebot.Context) error {
 	return maybeEditOrSend(c, "❌ فرآیند خرید لغو شد.")
 }
 
-func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan, email, displayName string, months int, ipLimit int, price float64, dataGB int, operationKey string) error {
+func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan, email, displayName string, months int, ipLimit int, price float64, dataGB int, operationKey string, quoteID *int64) error {
 	if bot.XUIClient == nil {
 		return fmt.Errorf("x-ui client is not initialized")
 	}
@@ -828,6 +867,7 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 	sub := &db.Subscription{
 		UserID:            user.ID,
 		PlanID:            &planID,
+		QuoteID:           quoteID,
 		ClientEmail:       email,
 		ClientUUID:        clientUUID,
 		SubID:             subID,
@@ -873,10 +913,6 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 		return &paidSubscriptionCompensationError{Result: compResult}
 	}
 
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "IRR"
-	}
 	links, err := bot.XUIClient.GetSubscriptionLinks(subID)
 	var subLink string
 	if err == nil {
@@ -895,8 +931,8 @@ func createPaidSubscription(c telebot.Context, user *db.User, plan *db.PaidPlan,
 		dataLabel = fmt.Sprintf("%d گیگابایت", dataGB)
 	}
 
-	detailsMsg := fmt.Sprintf("✅ اشتراک شما با موفقیت فعال شد!\n📦 طرح: %s\n⏱️ مدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\n📊 سقف ترافیک: %s\n💰 هزینه پرداخت شده: %.0f %s",
-		plan.Name, months, dataLabel, price, currency)
+	detailsMsg := fmt.Sprintf("✅ اشتراک شما با موفقیت فعال شد!\n📦 طرح: %s\n⏱️ مدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\n📊 سقف ترافیک: %s\n💰 هزینه پرداخت شده: %s",
+		plan.Name, months, dataLabel, persian.FormatMoney(int64(price)))
 
 	if plan.UsageDescription != "" {
 		detailsMsg += fmt.Sprintf("\n\nنکات استفاده:\n%s", plan.UsageDescription)

@@ -4,3 +4,9 @@ bot.exe
 *.zip
 config.yaml
 .gocache/
+coverage/
+coverage
+*.test.exe
+*.test
+coverage.out
+*.prof

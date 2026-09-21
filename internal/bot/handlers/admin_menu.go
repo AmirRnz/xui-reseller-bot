@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"gopkg.in/telebot.v3"
+	"xui-reseller-bot/internal/bot/persian"
 )
 
 func RegisterAdminMenu(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.MiddlewareFunc) {
@@ -14,18 +15,21 @@ func RegisterAdminMenu(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebo
 	RegisterAdminSettings(b, auth, admin)
 	RegisterAdminPlans(b, auth, admin)
 	RegisterAdminStats(b, auth, admin)
+	RegisterAdminReconcile(b, auth, admin)
 }
 
 func HandleAdminMenu(c telebot.Context) error {
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
-		menu.Row(menu.Data("👥 Users", "admin_users"), menu.Data("📋 Plans", "admin_plans")),
-		menu.Row(menu.Data("⚙️ Settings", "admin_settings"), menu.Data("📊 Stats", "admin_stats")),
+		menu.Row(menu.Data(persian.BtnAdminUsers, "admin_users"), menu.Data(persian.BtnAdminPlans, "admin_plans")),
+		menu.Row(menu.Data(persian.BtnAdminSettings, "admin_settings"), menu.Data(persian.BtnAdminStats, "admin_stats")),
 		menu.Row(
-			menu.Data("📥 Pending Top-Ups", "admin_pending_topups"),
+			menu.Data(persian.BtnAdminTopups, "admin_pending_topups"),
 		),
+		menu.Row(menu.Data(persian.BtnAdminReconcile, "admin_reconcile")),
+		menu.Row(menu.Data(persian.BtnBack, "menu_main")),
 	)
-	return maybeEditOrSend(c, "⚙️ **Admin Panel**", menu)
+	return maybeEditOrSend(c, "⚙️ **پنل مدیریت ربات**", menu)
 }
 
 func HandleAdminFlow(c telebot.Context) error {
@@ -38,6 +42,8 @@ func HandleAdminFlow(c telebot.Context) error {
 		return HandleAdminSettings(c)
 	case "stats":
 		return HandleAdminStats(c)
+	case "reconcile":
+		return HandleAdminReconcile(c)
 	default:
 		return HandleAdminMenu(c)
 	}

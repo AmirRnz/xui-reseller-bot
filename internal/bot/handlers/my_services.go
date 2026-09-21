@@ -11,8 +11,10 @@ import (
 
 	"gopkg.in/telebot.v3"
 	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/config"
 	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/services/pricing"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -139,40 +141,6 @@ func showServicesPage(c telebot.Context, page int) error {
 		}
 	}
 	subs = paidSubs
-
-	if bot.XUIClient != nil {
-		allClients, listErr := bot.XUIClient.ListClients()
-		if listErr != nil {
-			log.Printf("x-ui service reconciliation read failed: %v", listErr)
-		} else {
-			// subscriptions.user_id is the only ownership relation. The remote
-			// group is metadata and must never import, filter, or transfer rows.
-			existingClients := make(map[string]xui.XUIClientInfo, len(allClients))
-			for _, client := range allClients {
-				existingClients[client.Email] = client
-			}
-			for _, sub := range subs {
-				if client, exists := existingClients[sub.ClientEmail]; exists {
-					changed := false
-					if devLimit, ok := parseDeviceLimitFromXUI(client); ok && devLimit != sub.IPLimit {
-						log.Printf("Syncing device limit for %s during page load: DB had %d, XUI has %d", sub.ClientEmail, sub.IPLimit, devLimit)
-						sub.IPLimit = devLimit
-						changed = true
-					}
-					if syncActivationExpiry(sub, client) {
-						changed = true
-					}
-					if changed {
-						_ = db.UpdateSubscription(context.Background(), sub)
-					}
-				} else {
-					// A missing infrastructure row is drift, never a reason to
-					// delete the commercial subscription while displaying it.
-					log.Printf("subscription drift: %s (subscription id %d) is absent from 3x-ui; preserving DB row", sub.ClientEmail, sub.ID)
-				}
-			}
-		}
-	}
 
 	if len(subs) == 0 {
 		menu := &telebot.ReplyMarkup{}
@@ -453,26 +421,35 @@ func HandleDeleteSubscriptionConfirm(c telebot.Context) error {
 	text.WriteString(fmt.Sprintf("⚠️ **تایید حذف سرویس %s**\n\nآیا از حذف این سرویس اطمینان دارید؟", sub.DisplayName))
 
 	var refundAmount int64 = 0
+	var refundReason = ""
 	if sub.PlanType == db.PlanTypePaid {
-		plan, _ := paidPlanForSub(sub)
-		factorStr, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-		var factor float64
-		if factorStr != "" {
-			factor, _ = strconv.ParseFloat(factorStr, 64)
+		var quote *pricing.PurchaseQuote
+		if sub.QuoteID != nil {
+			quote, _ = pricing.GetQuoteByID(context.Background(), *sub.QuoteID)
 		}
-		refundAmount = CalculateRefund(plan, sub, factor, nowUTC())
-	}
-
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "IRR"
+		if quote != nil {
+			refundAmount, refundReason = pricing.CalculateRefund(quote, sub, nowUTC())
+		} else {
+			plan, _ := paidPlanForSub(sub)
+			factorStr, _ := db.GetSetting(context.Background(), "ip_limit_factor")
+			var factor float64
+			if factorStr != "" {
+				factor, _ = strconv.ParseFloat(factorStr, 64)
+			}
+			refundAmount = CalculateRefund(plan, sub, factor, nowUTC())
+			if refundAmount > 0 {
+				refundReason = fmt.Sprintf("محاسبه تقریبی بر اساس %d ماه باقیمانده (سرویس قدیمی فاقد فاکتور)", int(sub.EndDate.Sub(nowUTC()).Hours()/24/30))
+			} else {
+				refundReason = "زمان باقیمانده کافی نیست یا سرویس فاقد فاکتور است"
+			}
+		}
 	}
 
 	if refundAmount > 0 {
-		text.WriteString(fmt.Sprintf("\n\nمبلغ عودتی تقریبی شما بابت %d ماه کامل باقیمانده: **%d %s**\nمبلغ پس از تایید مدیریت به کیف پول شما اضافه خواهد شد.",
-			int(sub.EndDate.Sub(nowUTC()).Hours()/24/30), refundAmount, currency))
+		text.WriteString(fmt.Sprintf("\n\nمبلغ استرداد محاسبه شده: **%s**\nعلت/مبنا: %s\nمبلغ پس از تایید مدیریت به کیف پول شما اضافه خواهد شد.",
+			persian.FormatMoney(refundAmount), refundReason))
 	} else {
-		text.WriteString("\n\nبا حذف این سرویس هیچ مبلغی به کیف پول شما عودت داده نخواهد شد (زمان باقیمانده کافی نیست یا سرویس تست است).")
+		text.WriteString(fmt.Sprintf("\n\nبا حذف این سرویس هیچ مبلغی به کیف پول شما عودت داده نخواهد شد (%s).", refundReason))
 	}
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_delete_sub_confirm", map[string]interface{}{
@@ -592,7 +569,7 @@ func HandleDeleteSubscription(c telebot.Context) error {
 				)
 				currency, _ := db.GetSetting(context.Background(), "currency_name")
 				if currency == "" {
-					currency = "IRR"
+					currency = "تومان"
 				}
 				caption := fmt.Sprintf("📥 **درخواست استرداد وجه حذف سرویس #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک حذف شده: `%s`\nمبلغ درخواستی: %d %s",
 					req.ID, user.Username, user.TelegramID, sub.ClientEmail, refundAmount, currency)
@@ -660,7 +637,7 @@ func HandleSubscriptionLimitMenu(c telebot.Context) error {
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	menu := &telebot.ReplyMarkup{}
 	var rows []telebot.Row
@@ -707,7 +684,7 @@ func HandleSubscriptionLimitConfirmPrompt(c telebot.Context) error {
 	cost := float64(newLimit-displayIPLimit) * plan.PricePerExtraIP * float64(months)
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 	operationID := makeSubID()
 	confirmPayload := fmt.Sprintf("%d:%d:%s", newLimit, sub.ID, operationID)
@@ -758,7 +735,7 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 	cost := float64(newLimit-displayIPLimit) * plan.PricePerExtraIP * float64(months)
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	operationKey := fmt.Sprintf("wallet_upgrade_ip:%s", parts[2])
@@ -840,7 +817,7 @@ func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 	desc, _ := db.GetSetting(context.Background(), "topup_description")
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	// Change state to awaiting_purchase_receipt with IP upgrade metadata
@@ -885,7 +862,7 @@ func HandleSubscriptionExtendMenu(c telebot.Context) error {
 	}
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	displayIPLimit := sub.IPLimit
@@ -987,7 +964,7 @@ func showExtendConfirmation(c telebot.Context, user *db.User, subID int, months 
 	cost := calculatePaidPrice(plan, months, displayIPLimit, dataGB)
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	payload := fmt.Sprintf("%d:%d:%s", months, sub.ID, makeSubID())
@@ -1040,7 +1017,7 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 	cost := calculatePaidPrice(plan, months, displayIPLimit, dataGB)
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	operationKey := fmt.Sprintf("wallet_extend:%s", parts[2])
@@ -1154,7 +1131,7 @@ func HandleExtendSubscriptionDirect(c telebot.Context) error {
 	desc, _ := db.GetSetting(context.Background(), "topup_description")
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	// Change state to awaiting_purchase_receipt with Extend metadata

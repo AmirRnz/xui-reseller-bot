@@ -64,4 +64,3 @@ func Start(cfg *config.BotConfig, xuiClient *xui.Client) {
 
 	log.Println("Bot starting...")
 }
-

@@ -21,10 +21,10 @@ func CreatePurchaseRequest(ctx context.Context, r *PurchaseRequest) error {
 
 	return Pool.QueryRow(ctx, `
 		INSERT INTO purchase_requests (
-			user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, operation_key
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULLIF($16, ''))
 		RETURNING id, created_at, updated_at
-	`, r.UserID, r.Type, r.PlanID, r.SubscriptionID, r.Price, r.Months, r.IPLimit, r.DataGB, r.CustomName, r.ClientEmail, r.TelegramFileID, r.Status, r.ProvisioningStatus).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
+	`, r.UserID, r.Type, r.PlanID, r.SubscriptionID, r.QuoteID, r.PriceToman, r.Price, r.Months, r.IPLimit, r.DataGB, r.CustomName, r.ClientEmail, r.TelegramFileID, r.Status, r.ProvisioningStatus, r.OperationKey).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
 }
 
 func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, error) {
@@ -33,10 +33,10 @@ func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, er
 
 	r := &PurchaseRequest{}
 	err := Pool.QueryRow(ctx, `
-		SELECT id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, admin_id, created_at, updated_at
+		SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at
 		FROM purchase_requests
 		WHERE id = $1
-	`, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+	`, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -61,8 +61,8 @@ func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purc
 		UPDATE purchase_requests
 		SET status = 'approved', provisioning_status = 'pending', admin_id = $1, updated_at = NOW()
 		WHERE id = $2 AND status = 'pending'
-		RETURNING id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, admin_id, created_at, updated_at
-	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+		RETURNING id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at
+	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -71,11 +71,19 @@ func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purc
 	}
 
 	// Add to transactions table
+	operationKey := r.OperationKey
+	if operationKey == "" {
+		operationKey = fmt.Sprintf("purchase_approval:%d", r.ID)
+	}
+	debitAmount := int64(r.Price)
+	if r.PriceToman != nil && *r.PriceToman > 0 {
+		debitAmount = *r.PriceToman
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id, operation_key)
 		VALUES ($1, $2, 'debit', 'completed', $3, 'purchase_request', $4, $5)
 		ON CONFLICT (operation_key) DO NOTHING
-	`, r.UserID, int64(r.Price), "direct purchase approved: "+r.Type+" - "+r.ClientEmail, r.ID, fmt.Sprintf("purchase_approval:%d", r.ID))
+	`, r.UserID, debitAmount, "direct purchase approved: "+r.Type+" - "+r.ClientEmail, r.ID, operationKey)
 	if err != nil {
 		return nil, err
 	}
@@ -95,8 +103,8 @@ func RejectPurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purch
 		UPDATE purchase_requests
 		SET status = 'rejected', admin_id = $1, updated_at = NOW()
 		WHERE id = $2 AND status = 'pending'
-		RETURNING id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, admin_id, created_at, updated_at
-	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+		RETURNING id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at
+	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -111,7 +119,7 @@ func GetPendingPurchaseRequests(ctx context.Context) ([]*PurchaseRequest, error)
 	defer cancel()
 
 	rows, err := Pool.Query(ctx, `
-		SELECT id, user_id, type, plan_id, subscription_id, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, admin_id, created_at, updated_at
+		SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at
 		FROM purchase_requests
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
@@ -124,7 +132,7 @@ func GetPendingPurchaseRequests(ctx context.Context) ([]*PurchaseRequest, error)
 	var reqs []*PurchaseRequest
 	for rows.Next() {
 		r := &PurchaseRequest{}
-		if err := rows.Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.AdminID, &r.CreatedAt, &r.UpdatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		reqs = append(reqs, r)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"gopkg.in/telebot.v3"
+	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/db"
 )
 
@@ -24,24 +25,23 @@ func HandleAdminStats(c telebot.Context) error {
 
 	currency, _ := db.GetSetting(ctx, "currency_name")
 	if currency == "" {
-		currency = "IRR"
+		currency = "تومان"
 	}
 
 	text := fmt.Sprintf(
-		"📊 **Bot Statistics**\n\n"+
-			"👥 Total users: %d\n"+
-			"✅ Approved users: %d\n"+
-			"📦 Active subscriptions: %d\n"+
-			"🧪 Test subs created today: %d\n"+
-			"📥 Pending top-ups: %d\n"+
-			"💰 Revenue this month: %.0f %s",
-		totalUsers, approvedUsers, activeSubs, testsToday, pendingTopups, monthlyRevenue, currency)
+		"📊 **آمار و وضعیت ربات**\n\n"+
+			"👥 کل کاربران: %d\n"+
+			"✅ کاربران تایید شده: %d\n"+
+			"📦 اشتراک‌های فعال: %d\n"+
+			"🧪 تست‌های ایجاد شده امروز: %d\n"+
+			"📥 درخواست‌های شارژ در انتظار: %d\n"+
+			"💰 درآمد این ماه: %s",
+		totalUsers, approvedUsers, activeSubs, testsToday, pendingTopups, persian.FormatMoney(int64(monthlyRevenue)))
 
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
-		menu.Row(menu.Data("📥 Pending Top-Ups", "admin_pending_topups")),
-		menu.Row(menu.Data("« Back", "admin_menu")),
+		menu.Row(menu.Data("📥 شارژهای در انتظار", "admin_pending_topups")),
+		menu.Row(menu.Data("« بازگشت", "admin_menu")),
 	)
 	return maybeEditOrSend(c, text, menu)
 }
-

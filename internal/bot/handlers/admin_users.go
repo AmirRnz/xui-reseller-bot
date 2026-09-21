@@ -8,6 +8,7 @@ import (
 
 	"gopkg.in/telebot.v3"
 	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/db"
 )
 
@@ -49,20 +50,23 @@ func showAdminUsersPage(c telebot.Context, page int) error {
 
 	users, err := db.ListUsers(context.Background(), usersPageSize, offset)
 	if err != nil {
-		return c.Send("Failed to load users.")
+		return c.Send("خطا در بارگذاری لیست کاربران.")
 	}
 
 	var text strings.Builder
-	text.WriteString(fmt.Sprintf("👥 **Users** (%d total, page %d/%d)\n\n", total, page+1, max(totalPages, 1)))
+	text.WriteString(fmt.Sprintf("👥 **کاربران و نمایندگان** (%d کاربر کل، صفحه %d از %d)\n\n", total, page+1, max(totalPages, 1)))
 	for _, user := range users {
 		statusIcon := "⏳"
+		statusText := "در انتظار"
 		switch user.Status {
 		case "approved", "active":
 			statusIcon = "✅"
+			statusText = "تایید شده"
 		case "banned":
 			statusIcon = "🚫"
+			statusText = "مسدود"
 		}
-		text.WriteString(fmt.Sprintf("%s #%d @%s %s — %d\n", statusIcon, user.ID, user.Username, user.Status, user.WalletBalance))
+		text.WriteString(fmt.Sprintf("%s #%d @%s (%s) — %s\n", statusIcon, user.ID, user.Username, statusText, persian.FormatMoney(int64(user.WalletBalance))))
 	}
 
 	menu := &telebot.ReplyMarkup{}
@@ -80,17 +84,17 @@ func showAdminUsersPage(c telebot.Context, page int) error {
 
 	navRow := []telebot.Btn{}
 	if page > 0 {
-		navRow = append(navRow, menu.Data("◀️ Prev", "admin_users_page", fmt.Sprintf("%d", page-1)))
+		navRow = append(navRow, menu.Data("◀️ صفحه قبل", "admin_users_page", fmt.Sprintf("%d", page-1)))
 	}
 	if totalPages > 0 && page < totalPages-1 {
-		navRow = append(navRow, menu.Data("Next ▶️", "admin_users_page", fmt.Sprintf("%d", page+1)))
+		navRow = append(navRow, menu.Data("صفحه بعد ▶️", "admin_users_page", fmt.Sprintf("%d", page+1)))
 	}
 	if len(navRow) > 0 {
 		rows = append(rows, navRow)
 	}
 	rows = append(rows,
-		menu.Row(menu.Data("📢 Bulk credit approved", "bulk_credit")),
-		menu.Row(menu.Data("« Back", "admin_menu")),
+		menu.Row(menu.Data("📢 شارژ همگانی تاییدشدگان", "bulk_credit")),
+		menu.Row(menu.Data("« بازگشت", "admin_menu")),
 	)
 	menu.Inline(rows...)
 	return maybeEditOrSend(c, text.String(), menu)
@@ -99,11 +103,11 @@ func showAdminUsersPage(c telebot.Context, page int) error {
 func HandleAdminViewUser(c telebot.Context) error {
 	userID, err := parseInt64(callbackPayload(c))
 	if err != nil {
-		return c.Send("Invalid user.")
+		return c.Send("کاربر نامعتبر است.")
 	}
 	user, err := db.GetUserByID(context.Background(), userID)
 	if err != nil || user == nil {
-		return c.Send("User not found.")
+		return c.Send("کاربر مورد نظر یافت نشد.")
 	}
 	return showAdminViewUser(c, user)
 }
@@ -111,30 +115,42 @@ func HandleAdminViewUser(c telebot.Context) error {
 func showAdminViewUser(c telebot.Context, user *db.User) error {
 	subs, _ := db.GetSubscriptionsByUserID(context.Background(), user.ID)
 
+	statusText := user.Status
+	switch user.Status {
+	case "approved":
+		statusText = "تایید شده"
+	case "pending":
+		statusText = "در انتظار تایید"
+	case "banned":
+		statusText = "مسدود شده"
+	case "approved_name_pending":
+		statusText = "تایید شده (در انتظار ثبت نام)"
+	}
+
 	var text strings.Builder
-	text.WriteString(fmt.Sprintf("👤 **User #%d**\n\n", user.ID))
-	text.WriteString(fmt.Sprintf("🆔 **Telegram ID**: `%d`\n", user.TelegramID))
-	text.WriteString(fmt.Sprintf("🌐 **Username**: @%s\n", user.Username))
-	text.WriteString(fmt.Sprintf("📝 **Name**: %s %s\n", user.FirstName, user.LastName))
-	text.WriteString(fmt.Sprintf("⚡ **Status**: %s\n", user.Status))
-	text.WriteString(fmt.Sprintf("💼 **Service**: %s\n", user.ServiceNameValue()))
-	text.WriteString(fmt.Sprintf("👛 **Balance**: %d\n", user.WalletBalance))
-	text.WriteString(fmt.Sprintf("📦 **Subscriptions**: %d\n", len(subs)))
+	text.WriteString(fmt.Sprintf("👤 **مشخصات نماینده #%d**\n\n", user.ID))
+	text.WriteString(fmt.Sprintf("🆔 **شناسه عددی تلگرام**: `%d`\n", user.TelegramID))
+	text.WriteString(fmt.Sprintf("🌐 **نام کاربری**: @%s\n", user.Username))
+	text.WriteString(fmt.Sprintf("📝 **نام**: %s %s\n", user.FirstName, user.LastName))
+	text.WriteString(fmt.Sprintf("⚡ **وضعیت حساب**: %s\n", statusText))
+	text.WriteString(fmt.Sprintf("💼 **نام برند نماینده**: %s\n", user.ServiceNameValue()))
+	text.WriteString(fmt.Sprintf("👛 **موجودی کیف پول**: %s تومان\n", persian.FormatMoney(int64(user.WalletBalance))))
+	text.WriteString(fmt.Sprintf("📦 **تعداد اشتراک‌ها**: %d\n", len(subs)))
 
 	menu := &telebot.ReplyMarkup{}
 	rows := []telebot.Row{
-		menu.Row(menu.Data("👥 View User's Clients", "admin_user_clients", fmt.Sprintf("%d", user.ID))),
-		menu.Row(menu.Data("💳 Manual credit", "admin_user_credit", fmt.Sprintf("%d", user.ID))),
+		menu.Row(menu.Data("👥 مشاهده کلاینت‌های کاربر", "admin_user_clients", fmt.Sprintf("%d", user.ID))),
+		menu.Row(menu.Data("💳 افزایش موجودی دستی", "admin_user_credit", fmt.Sprintf("%d", user.ID))),
 	}
 	if user.Status == db.UserStatusBanned {
-		rows = append(rows, menu.Row(menu.Data("✅ Unban", "admin_user_unban", fmt.Sprintf("%d", user.ID))))
+		rows = append(rows, menu.Row(menu.Data("✅ رفع مسدودیت (آنبن)", "admin_user_unban", fmt.Sprintf("%d", user.ID))))
 	} else if user.Status == db.UserStatusPending {
-		rows = append(rows, menu.Row(menu.Data("✅ Approve", "admin_user_approve", fmt.Sprintf("%d", user.ID))))
-		rows = append(rows, menu.Row(menu.Data("🚫 Ban", "admin_user_ban", fmt.Sprintf("%d", user.ID))))
+		rows = append(rows, menu.Row(menu.Data("✅ تایید نماینده", "admin_user_approve", fmt.Sprintf("%d", user.ID))))
+		rows = append(rows, menu.Row(menu.Data("🚫 مسدودسازی (بن)", "admin_user_ban", fmt.Sprintf("%d", user.ID))))
 	} else {
-		rows = append(rows, menu.Row(menu.Data("🚫 Ban", "admin_user_ban", fmt.Sprintf("%d", user.ID))))
+		rows = append(rows, menu.Row(menu.Data("🚫 مسدودسازی (بن)", "admin_user_ban", fmt.Sprintf("%d", user.ID))))
 	}
-	rows = append(rows, menu.Row(menu.Data("« Back", "admin_users")))
+	rows = append(rows, menu.Row(menu.Data("« بازگشت به لیست", "admin_users")))
 	menu.Inline(rows...)
 	return maybeEditOrSend(c, text.String(), menu)
 }
@@ -142,16 +158,16 @@ func showAdminViewUser(c telebot.Context, user *db.User) error {
 func HandleAdminUserBan(c telebot.Context) error {
 	userID, err := parseInt64(callbackPayload(c))
 	if err != nil {
-		return c.Send("Invalid user.")
+		return c.Send("کاربر نامعتبر است.")
 	}
 	user, err := db.GetUserByID(context.Background(), userID)
 	if err != nil || user == nil {
-		return c.Send("User not found.")
+		return c.Send("کاربر مورد نظر یافت نشد.")
 	}
 	if err := db.UpdateUserStatusByID(context.Background(), user.ID, db.UserStatusBanned); err != nil {
-		return c.Send("Failed to ban user.")
+		return c.Send("خطا در مسدود کردن کاربر.")
 	}
-	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("🚫 User #%d banned.", user.ID)})
+	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("🚫 کاربر #%d مسدود شد.", user.ID)})
 	user.Status = db.UserStatusBanned
 	return showAdminViewUser(c, user)
 }
@@ -159,20 +175,20 @@ func HandleAdminUserBan(c telebot.Context) error {
 func HandleAdminUserUnban(c telebot.Context) error {
 	userID, err := parseInt64(callbackPayload(c))
 	if err != nil {
-		return c.Send("Invalid user.")
+		return c.Send("کاربر نامعتبر است.")
 	}
 	user, err := db.GetUserByID(context.Background(), userID)
 	if err != nil || user == nil {
-		return c.Send("User not found.")
+		return c.Send("کاربر مورد نظر یافت نشد.")
 	}
 	status := db.UserStatusApproved
 	if user.ServiceNameValue() == "" {
 		status = db.UserStatusApprovedNamePending
 	}
 	if err := db.UpdateUserStatusByID(context.Background(), user.ID, status); err != nil {
-		return c.Send("Failed to unban user.")
+		return c.Send("خطا در رفع مسدودیت کاربر.")
 	}
-	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ User #%d unbanned.", user.ID)})
+	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ کاربر #%d از مسدودیت خارج شد.", user.ID)})
 	user.Status = status
 	return showAdminViewUser(c, user)
 }
@@ -180,21 +196,21 @@ func HandleAdminUserUnban(c telebot.Context) error {
 func HandleAdminUserApprove(c telebot.Context) error {
 	userID, err := parseInt64(callbackPayload(c))
 	if err != nil {
-		return c.Send("Invalid user.")
+		return c.Send("کاربر نامعتبر است.")
 	}
 	user, err := db.GetUserByID(context.Background(), userID)
 	if err != nil || user == nil {
-		return c.Send("User not found.")
+		return c.Send("کاربر مورد نظر یافت نشد.")
 	}
 
 	if err := db.UpdateUserStatusByID(context.Background(), user.ID, db.UserStatusApproved); err != nil {
-		return c.Send("Failed to approve user.")
+		return c.Send("خطا در تایید کاربر.")
 	}
-	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ User #%d approved.", user.ID)})
+	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ کاربر #%d تایید شد.", user.ID)})
 	user.Status = db.UserStatusApproved
 
 	if bot.Bot != nil {
-		msg := "✅ درخواست دسترسی شما تایید شد.\n\nلطفا نام سرویس (شناسه نمایندگی) خود را وارد کنید.\nاین نام باید فقط شامل حروف انگلیسی، اعداد، خط تیره (-) و آندرلاین (_) باشد و بین ۳ تا ۳۲ کاراکتر باشد."
+		msg := "✅ درخواست نمایندگی شما تایید شد.\n\nلطفاً نام برند/سرویس خود را وارد کنید.\nاین نام باید فقط شامل حروف انگلیسی، اعداد، خط تیره (-) و آندرلاین (_) باشد و بین ۳ تا ۳۲ کاراکتر باشد:"
 		bot.FSM.SetState(user.TelegramID, "awaiting_service_name", nil)
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, msg)
 	}
@@ -206,37 +222,37 @@ func HandleAdminUserCreditPrompt(c telebot.Context) error {
 	admin := userFromContext(c)
 	userID, err := parseInt64(callbackPayload(c))
 	if admin == nil || err != nil {
-		return c.Send("Invalid user.")
+		return c.Send("کاربر نامعتبر است.")
 	}
 	bot.FSM.SetState(admin.TelegramID, "awaiting_manual_credit", map[string]interface{}{"target_user_id": fmt.Sprintf("%d", userID), "operation_key": "manual_admin_credit:" + makeSubID()})
-	return maybeEditOrSend(c, "Enter amount to credit this user.")
+	return maybeEditOrSend(c, "لطفاً مبلغ مورد نظر جهت شارژ حساب این کاربر را به تومان وارد کنید:")
 }
 
 func HandleBulkCreditPrompt(c telebot.Context) error {
 	admin := userFromContext(c)
 	if admin == nil {
-		return c.Send("Could not load admin account.")
+		return c.Send("امکان بارگذاری حساب ادمین وجود ندارد.")
 	}
 	bot.FSM.SetState(admin.TelegramID, "awaiting_bulk_credit_amount", map[string]interface{}{"operation_key": "bulk_admin_credit:" + makeSubID()})
-	return maybeEditOrSend(c, "Enter amount to credit all approved users.")
+	return maybeEditOrSend(c, "لطفاً مبلغ مورد نظر جهت شارژ همگانی کلیه نمایندگان تایید شده را به تومان وارد کنید:")
 }
 
 func ProcessBulkCredit(c telebot.Context, amountStr string) error {
 	admin := userFromContext(c)
 	if admin == nil || !isConfiguredAdmin(admin.TelegramID) {
-		return c.Send("You do not have permission to use this command.")
+		return c.Send("شما دسترسی به این دستور را ندارید.")
 	}
 	amount, err := strconv.ParseFloat(strings.TrimSpace(amountStr), 64)
 	if err != nil || amount <= 0 {
-		return c.Send("Invalid amount. Enter a positive number.")
+		return c.Send("مبلغ نامعتبر است. لطفاً یک عدد مثبت وارد کنید.")
 	}
 	operationKey := fmt.Sprintf("%v", bot.FSM.GetState(admin.TelegramID).Data["operation_key"])
 	count, err := db.CreditAllApprovedUsersWithKey(context.Background(), amount, "admin bulk credit", operationKey)
 	if err != nil {
-		return c.Send("Failed to credit approved users.")
+		return c.Send("خطا در افزایش موجودی همگانی کاربران.")
 	}
 	bot.FSM.ClearState(admin.TelegramID)
-	_ = c.Send(fmt.Sprintf("✅ Credited %.0f to %d approved users.", amount, count))
+	_ = c.Send(fmt.Sprintf("✅ مبلغ %s تومان با موفقیت به حساب %d کاربر تایید شده افزوده شد.", persian.FormatMoney(int64(amount)), count))
 	return HandleAdminUsers(c)
 }
 
@@ -250,23 +266,23 @@ func max(a, b int) int {
 func HandleAdminUserClients(c telebot.Context) error {
 	userID, err := parseInt64(callbackPayload(c))
 	if err != nil {
-		return c.Send("Invalid user.")
+		return c.Send("کاربر نامعتبر است.")
 	}
 	user, err := db.GetUserByID(context.Background(), userID)
 	if err != nil || user == nil {
-		return c.Send("User not found.")
+		return c.Send("کاربر مورد نظر یافت نشد.")
 	}
 
 	subs, err := db.GetSubscriptionsByUserID(context.Background(), user.ID)
 	if err != nil {
-		return c.Send("Failed to get clients.")
+		return c.Send("خطا در دریافت کلاینت‌های کاربر.")
 	}
 
 	menu := &telebot.ReplyMarkup{}
 	var rows []telebot.Row
 
 	var text strings.Builder
-	text.WriteString(fmt.Sprintf("👥 **Clients for @%s**\n\n", user.Username))
+	text.WriteString(fmt.Sprintf("👥 **کلاینت‌های کاربر @%s**\n\n", user.Username))
 
 	hasUnassigned := false
 	for _, sub := range subs {
@@ -277,29 +293,29 @@ func HandleAdminUserClients(c telebot.Context) error {
 	}
 
 	if hasUnassigned {
-		text.WriteString("⚠️ **Unassigned Clients (Need Plan)**\n")
+		text.WriteString("⚠️ **کلاینت‌های فاقد طرح (نیاز به انتساب طرح)**\n")
 		for _, sub := range subs {
 			if sub.PlanID == nil {
 				text.WriteString(fmt.Sprintf("🔸 %s\n", sub.ClientEmail))
 				rows = append(rows, menu.Row(
-					menu.Data(fmt.Sprintf("Assign Plan: %s", sub.ClientEmail), "admin_assign_plan", fmt.Sprintf("%d", sub.ID)),
+					menu.Data(fmt.Sprintf("انتساب طرح: %s", sub.ClientEmail), "admin_assign_plan", fmt.Sprintf("%d", sub.ID)),
 				))
 			}
 		}
 		text.WriteString("\n")
 	}
 
-	text.WriteString("✅ **Assigned Clients**\n")
+	text.WriteString("✅ **کلاینت‌های دارای طرح**\n")
 	for _, sub := range subs {
 		if sub.PlanID != nil {
 			text.WriteString(fmt.Sprintf("🔹 %s\n", sub.ClientEmail))
 		}
 	}
 	if len(subs) == 0 {
-		text.WriteString("No clients found.\n")
+		text.WriteString("هیچ کلاینتی یافت نشد.\n")
 	}
 
-	rows = append(rows, menu.Row(menu.Data("« Back to User", "admin_view_user", fmt.Sprintf("%d", user.ID))))
+	rows = append(rows, menu.Row(menu.Data("« بازگشت به کاربر", "admin_view_user", fmt.Sprintf("%d", user.ID))))
 	menu.Inline(rows...)
 	return maybeEditOrSend(c, text.String(), menu)
 }
@@ -307,17 +323,17 @@ func HandleAdminUserClients(c telebot.Context) error {
 func HandleAdminAssignPlanPrompt(c telebot.Context) error {
 	subID, err := parseInt64(callbackPayload(c))
 	if err != nil {
-		return c.Send("Invalid subscription.")
+		return c.Send("اشتراک نامعتبر است.")
 	}
 
 	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
 	if err != nil || sub == nil {
-		return c.Send("Subscription not found.")
+		return c.Send("اشتراک مورد نظر یافت نشد.")
 	}
 
 	paidPlans, err := db.GetPaidPlans(context.Background(), false)
 	if err != nil {
-		return c.Send("Failed to load plans.")
+		return c.Send("خطا در بارگذاری طرح‌ها.")
 	}
 
 	menu := &telebot.ReplyMarkup{}
@@ -327,34 +343,34 @@ func HandleAdminAssignPlanPrompt(c telebot.Context) error {
 			menu.Data(plan.Name, "admin_assign_plan_confirm", fmt.Sprintf("%d:%d", sub.ID, plan.ID)),
 		))
 	}
-	rows = append(rows, menu.Row(menu.Data("« Cancel", "admin_user_clients", fmt.Sprintf("%d", sub.UserID))))
+	rows = append(rows, menu.Row(menu.Data("« انصراف", "admin_user_clients", fmt.Sprintf("%d", sub.UserID))))
 	menu.Inline(rows...)
 
-	return maybeEditOrSend(c, fmt.Sprintf("Please select a plan to assign to **%s**:", sub.ClientEmail), menu)
+	return maybeEditOrSend(c, fmt.Sprintf("لطفاً طرح مورد نظر جهت انتساب به **%s** را انتخاب کنید:", sub.ClientEmail), menu)
 }
 
 func HandleAdminAssignPlanConfirm(c telebot.Context) error {
 	parts := strings.Split(callbackPayload(c), ":")
 	if len(parts) != 2 {
-		return c.Send("Invalid request.")
+		return c.Send("درخواست نامعتبر است.")
 	}
 	subID, _ := parseInt64(parts[0])
 	planID, _ := parseInt64(parts[1])
 
 	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
 	if err != nil || sub == nil {
-		return c.Send("Subscription not found.")
+		return c.Send("اشتراک مورد نظر یافت نشد.")
 	}
 
 	plan, err := db.GetPaidPlanByID(context.Background(), planID)
 	if err != nil || plan == nil {
-		return c.Send("Plan not found.")
+		return c.Send("طرح مورد نظر یافت نشد.")
 	}
 
 	pID := int(plan.ID)
 	sub.PlanID = &pID
 	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
-		return c.Send("Failed to update subscription.")
+		return c.Send("خطا در به‌روزرسانی اشتراک.")
 	}
 
 	user, _ := db.GetUserByID(context.Background(), sub.UserID)
@@ -362,7 +378,7 @@ func HandleAdminAssignPlanConfirm(c telebot.Context) error {
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ اشتراک %s با موفقیت به طرح %s متصل شد. هم‌اکنون می‌توانید از امکانات تمدید و ارتقا استفاده کنید.", sub.ClientEmail, plan.Name))
 	}
 
-	_ = c.Respond(&telebot.CallbackResponse{Text: "Plan assigned successfully."})
+	_ = c.Respond(&telebot.CallbackResponse{Text: "✅ طرح با موفقیت منتسب شد."})
 
 	if c.Callback() != nil {
 		c.Callback().Data = fmt.Sprintf("\fadmin_user_clients|%d", sub.UserID)

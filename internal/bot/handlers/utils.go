@@ -34,7 +34,7 @@ func showMainMenu(c telebot.Context, user *db.User) error {
 	}
 
 	menu := &telebot.ReplyMarkup{}
-	
+
 	if user.IsApproved() {
 		rows := []telebot.Row{
 			menu.Row(menu.Data("🧪 تست رایگان", "menu_test_sub"), menu.Data("💼 خرید سرویس", "menu_buy_sub")),
@@ -575,4 +575,3 @@ func parseDeviceLimitFromXUI(client xui.XUIClientInfo) (int, bool) {
 	}
 	return 0, false
 }
-

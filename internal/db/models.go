@@ -125,6 +125,7 @@ type Subscription struct {
 	ID                 int       `json:"id"`
 	UserID             int64     `json:"user_id"`
 	PlanID             *int      `json:"plan_id"`
+	QuoteID            *int64    `json:"quote_id"`
 	ClientEmail        string    `json:"client_email"`
 	ClientUUID         string    `json:"client_uuid"`
 	SubID              string    `json:"sub_id"`
@@ -167,6 +168,8 @@ type PurchaseRequest struct {
 	Type               string    `json:"type"` // 'buy', 'extend', 'upgrade_ip'
 	PlanID             *int64    `json:"plan_id"`
 	SubscriptionID     *int64    `json:"subscription_id"`
+	QuoteID            *int64    `json:"quote_id"`
+	PriceToman         *int64    `json:"price_toman"`
 	Price              float64   `json:"price"`
 	Months             int       `json:"months"`
 	IPLimit            int       `json:"ip_limit"`
@@ -176,6 +179,7 @@ type PurchaseRequest struct {
 	TelegramFileID     string    `json:"telegram_file_id"`
 	Status             string    `json:"status"` // 'pending', 'approved', 'rejected'
 	ProvisioningStatus string    `json:"provisioning_status"`
+	OperationKey       string    `json:"operation_key"`
 	AdminID            *int64    `json:"admin_id"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`

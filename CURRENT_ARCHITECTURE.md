@@ -1,33 +1,51 @@
 # Current Architecture — `xui-resell-bot`
 
-Updated 2026-09-19 after the remote-create compensation, nil-client cancellation blocking, and wallet refund reconciliation pass.
+Updated 2026-09-21 after the Persian translation, integer Toman pricing snapshots, reconciliation worker, and starvation fix pass.
 
 ## Supported 3x-ui pin
 
 **3x-ui panel: `v3.8.5` (stable).** The configured panel reported `currentVersion=3.8.5`, `latestVersion=v3.8.5`, and `updateAvailable=false` from the read-only `GET /panel/api/server/getPanelUpdateInfo` endpoint. The checked-in OpenAPI document describes the API compatibility line as `3.x`.
 
+## Persian-Only Presentation Layer
+
+Both bots are Persian-only (`internal/bot/persian`).
+- Zero English strings in any customer or admin Telegram flows.
+- Reusable message builders and formatters for prices (`FormatMoney`), IP limits (`FormatIPLimit`), traffic (`FormatTrafficBytes`), dates (`FormatPersianDate`), and lifecycle notifications.
+- No multilingual runtime, locale branching, or i18n package.
+
+## Integer Toman Accounting & Pricing Snapshots
+
+- **Currency Unit**: Strictly Persian Toman (`"تومان"`). Default setting and arithmetic strictly use integer Toman.
+- **Quote Snapshots**: Before debiting wallet balances or submitting direct payment requests, a quote snapshot is generated via `pricing.CalculateQuote` and persisted to `pricing_quotes`.
+- **Auditable Lifecycle**: The `quote_id` is linked to `purchase_requests.quote_id` and `subscriptions.quote_id`.
+- **Refunds**: Refund calculations (`pricing.CalculateRefund`) use historical paid amounts from the persisted quote snapshot rather than current catalog prices.
+
 ## DB → bot → 3x-ui flow
 
-1. Startup loads `config.yaml`, connects to PostgreSQL, applies the embedded `internal/db/schema.sql` migration, and normalizes legacy IP-limit values.
-2. The bot creates an API-token 3x-ui client and starts an inbound cache. The cache refreshes inbound options from 3x-ui periodically and supplies valid inbound IDs to handlers.
-3. A scheduler runs once on startup if today’s run is not recorded, then at the next UTC midnight. It reads expiring subscriptions from PostgreSQL and sends Telegram notifications.
-4. Telebot starts in webhook or long-poll mode. Authentication/admin middleware, an in-memory FSM, and per-user locking protect callback and message flows.
-5. PostgreSQL is the commercial record for users, plans, subscriptions, wallet balance, transactions, top-ups, purchase requests, refund requests, reconciliation records, settings, and test usage. Subscription cancellation/deletion is represented by an auditable lifecycle status; rows are not physically removed by service management.
-6. Test and wallet-paid subscription creation validates a DB plan, calls `clients/add`, and inserts the DB subscription. Add/update writes classify success, definitive failure, or unknown outcome. Timeout writes perform a read-after-write lookup by email; creates are never blindly retried. An uncertain paid operation is retained as retryable/reconciliation state rather than refunded as a confirmed failure.
-7. Remote create success with local DB failure compensation: If 3x-ui creation succeeds but local DB insertion fails, fire-and-forget goroutines are eliminated. The system attempts synchronous compensating deletion and verifies remote state via `resolveDeleteOutcome`. If remote deletion is confirmed absent (`deleteConfirmed`), an idempotent wallet refund is issued. If deletion outcome is unknown (`deleteReconciliationRequired`) or the client remains present (`deleteStillPresent`), no refund is issued; the exact remote identity (email, UUID, subID, inbounds, expiry, limits, totalGB, plan/user info) is retained and persisted to `reconciliation_records` with an explicit commercial desired action (`confirm_delete_and_refund` or `adopt_subscription_or_delete`).
-8. Missing/nil XUI client safety: If `bot.XUIClient == nil`, handlers return typed `ErrXUIClientUnavailable`. Operations requiring XUI fail explicitly rather than claiming success; wallet extensions/upgrades issue idempotent refunds without mutating DB state. In `HandleDeleteSubscription` (reseller cancellation), a nil XUI client immediately blocks cancellation with an explicit error before any DB cancellation or refund is initiated, leaving commercial state untouched.
-9. Wallet refund persistence failures: If `CreditWalletBalanceWithKey` fails during refund, the operation does not claim to have refunded; a critical `pending_refund` reconciliation record is created for manual or background reconciliation.
-10. Service management is DB-owned by `subscriptions.user_id`. 3x-ui `group` is metadata only: My Services never adopts unknown clients or filters ownership by group, and a missing remote client is logged as drift while the DB row remains visible. Broad updates fetch the complete current client and merge only bot-owned fields, preserving comments, group, HWID limits, and newer fields.
-11. Wallet mutations and admin approvals use durable operation keys with database uniqueness. Direct-payment approval records payment approval separately from provisioning status, so provisioning failure cannot erase the approved-payment transaction. Remote-success/DB-failure upgrade paths mark the subscription `reconciliation_required` and retain desired state for repair.
+1. **Startup**: Loads `config.yaml`, connects to PostgreSQL, runs migrations (`internal/db/migrations.go` including versioned migration system), and normalizes configuration.
+2. **XUI Client & Cache**: Creates an API-token 3x-ui client and starts an inbound cache (`internal/xui/cache.go`).
+3. **Background Workers**:
+   - **Scheduler**: Runs periodically, checking expiring subscriptions from PostgreSQL and enqueueing idempotent notifications via transactional outbox.
+   - **Outbox Worker**: (`internal/services/outbox/outbox.go`) Polls pending outbox records and delivers Telegram notifications with retry and exponential backoff.
+   - **First-Use Sync Worker**: (`internal/services/sync/sync_worker.go`) Checks unactivated subscriptions (`remote.ExpiryTime <= 0`) for first connection. Query uses `ORDER BY updated_at ASC NULLS FIRST, id ASC LIMIT 50` and touches `updated_at = NOW()` to prevent starvation.
+   - **Reconciliation Worker**: (`internal/services/reconcile/processor.go`) Periodically claims pending reconciliation records (`ClaimPendingReconciliationRecords`), retrying failed/ambiguous provisioning (`direct_payment_provisioning_retry`), compensating deletions, and processing pending refunds.
+4. **Telebot**: Starts in webhook or long-poll mode with authentication/admin middleware, FSM, and per-user locking.
+5. **PostgreSQL Authority**: Commercial source of truth for users, plans, subscriptions, wallet balances, transactions, purchase requests, quotes, outbox events, and reconciliation records. Subscription rows are not physically removed by service management.
+6. **Remote Create Compensation**: If 3x-ui creation succeeds but DB insertion fails, synchronous compensating deletion is attempted. If outcome is ambiguous, a reconciliation record is created.
+7. **Direct Payment Provisioning**: When an admin approves a direct payment, payment approval is recorded immediately. If remote provisioning fails with a retryable outcome, a `direct_payment_provisioning_retry` reconciliation record is created for the worker.
+8. **Cancellation & Refunds**: Cancellation in reseller bot immediately checks for active XUI connection. If remote delete is ambiguous or DB fails, reconciliation records are created.
 
 ## Baseline test inventory
 
-- `go test -count=1 -v ./...` (with `TEST_DATABASE_URL` pointing to isolated PostgreSQL):
-  - `internal/bot/handlers`: **PASS** (100% pass, including `TestNilXUIClientReturnsExplicitErrorAndTriggersRefund`, `TestRemoteCreateSuccessDbFailureCompensation` Scenarios A, B, C, D, `TestSafeRefundWalletOutcome`, and `TestNilXUIClientBlocksCancellationAndRefund`).
-  - `internal/db`: **PASS** (8/8 tests pass, including `TestConcurrencyStress`, `TestSettingsRepo`, `TestSubscriptionRepo`, `TestCancelSubscriptionWithRefundIsAuditable`, `TestDeletePlanWithUsage`, `TestPlanSyncSubs`, `TestPurchaseRollbackAndClaim`, `TestWalletOperationKeyIsConcurrentIdempotent`).
-  - `internal/fsm`: **PASS**.
-  - `internal/xui`: **PASS**.
-  - `tests/e2e:TestE2ESuite`: Skipped when running isolated DB unit tests without the dedicated end-to-end bot harness.
+- `go test -count=1 -v ./...`:
+  - `internal/bot`: **PASS**
+  - `internal/bot/handlers`: **PASS** (100% pass)
+  - `internal/db`: **PASS** (100% pass)
+  - `internal/fsm`: **PASS**
+  - `internal/xui`: **PASS**
+  - `internal/services/pricing`: **PASS**
+  - `internal/services/reconcile`: **PASS**
+  - `tests/e2e`: **PASS**
 - `go vet ./...` — **PASS**, no diagnostics.
-- `go test -race -count=1 ./...` — **BLOCKED before tests**: CGO is disabled and no C compiler is available in this environment.
-
+- `gofmt -l .` — **PASS**, zero unformatted files.
+- `.github/workflows/ci.yml` — Automated CI with PostgreSQL service container running gofmt, go vet, unit/DB/e2e tests with race detection, and binary compilation.

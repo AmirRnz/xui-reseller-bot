@@ -135,6 +135,48 @@ func (c *Client) Login() error {
 	return nil
 }
 
+type PanelUpdateInfo struct {
+	CurrentVersion  string `json:"currentVersion"`
+	LatestVersion   string `json:"latestVersion"`
+	UpdateAvailable bool   `json:"updateAvailable"`
+}
+
+type ReadinessStatus struct {
+	MasterReachable bool   `json:"master_reachable"`
+	TokenValid      bool   `json:"token_valid"`
+	Version         string `json:"version"`
+	VersionOK       bool   `json:"version_ok"`
+	InboundsCount   int    `json:"inbounds_count"`
+	Error           error  `json:"error,omitempty"`
+}
+
+func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
+	status := &ReadinessStatus{}
+	if c == nil || c.apiToken == "" {
+		status.Error = errors.New("API token is empty or client uninitialized")
+		return status, status.Error
+	}
+
+	var updateInfo PanelUpdateInfo
+	err := c.doRequest("GET", "/panel/api/server/getPanelUpdateInfo", nil, &updateInfo)
+	if err != nil {
+		status.Error = fmt.Errorf("master server unreachable or token invalid: %w", err)
+		return status, status.Error
+	}
+	status.MasterReachable = true
+	status.TokenValid = true
+	status.Version = updateInfo.CurrentVersion
+	status.VersionOK = strings.Contains(updateInfo.CurrentVersion, "3.8") || strings.HasPrefix(updateInfo.CurrentVersion, "v3.")
+
+	inbounds, err := c.GetInbounds()
+	if err != nil {
+		status.Error = fmt.Errorf("failed to fetch panel inbounds: %w", err)
+		return status, status.Error
+	}
+	status.InboundsCount = len(inbounds)
+	return status, nil
+}
+
 func (c *Client) GetInbounds() ([]Inbound, error) {
 	var inbounds []Inbound
 	if err := c.doRequest("GET", "/panel/api/inbounds/options", nil, &inbounds); err != nil {

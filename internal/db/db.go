@@ -43,12 +43,7 @@ func Connect(ctx context.Context, cfg *config.DatabaseConfig) error {
 }
 
 func Migrate(ctx context.Context) error {
-	_, err := Pool.Exec(ctx, schemaSQL)
-	if err != nil {
-		return fmt.Errorf("failed to execute schema.sql: %w", err)
-	}
-
-	return nil
+	return runMigrations(ctx)
 }
 
 func dbCtx(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -101,4 +96,3 @@ func NormalizeIPLimits(ctx context.Context) error {
 
 	return nil
 }
-

@@ -10,6 +10,7 @@ import (
 
 	"gopkg.in/telebot.v3"
 	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/db"
 	"xui-reseller-bot/internal/xui"
 )
@@ -42,17 +43,17 @@ func HandleAdminPlans(c telebot.Context) error {
 	inboundNames := cachedInboundNames()
 
 	var text strings.Builder
-	text.WriteString("📋 **Plans**\n\n")
-	text.WriteString("🧪 Test plans:\n")
+	text.WriteString("📋 **طرح‌های ربات**\n\n")
+	text.WriteString("🧪 طرح‌های تست:\n")
 	for _, p := range testPlans {
 		enabledMark := "✅"
 		if !p.Enabled {
 			enabledMark = "🔴"
 		}
-		text.WriteString(fmt.Sprintf("%s #%d %s (max %d/day, %s)\n",
+		text.WriteString(fmt.Sprintf("%s #%d %s (حداکثر %d در روز، %s)\n",
 			enabledMark, p.ID, p.Name, p.MaxPerDay, humanDuration(p.ExpireSeconds)))
 	}
-	text.WriteString("\n💼 Paid plans:\n")
+	text.WriteString("\n💼 طرح‌های خرید نقدی:\n")
 	for _, p := range paidPlans {
 		enabledMark := "✅"
 		if !p.Enabled {
@@ -60,19 +61,19 @@ func HandleAdminPlans(c telebot.Context) error {
 		}
 		var ipLabel string
 		if p.BaseIPLimit == 0 && p.MaxIPLimit == 0 {
-			ipLabel = "unlimited IP"
+			ipLabel = "کاربر همزمان نامحدود"
 		} else {
-			ipLabel = fmt.Sprintf("%d-%d IP", p.BaseIPLimit, p.MaxIPLimit)
+			ipLabel = fmt.Sprintf("%d-%d کاربر همزمان", p.BaseIPLimit, p.MaxIPLimit)
 		}
-		text.WriteString(fmt.Sprintf("%s #%d %s (base %.0f, %s)\n",
-			enabledMark, p.ID, p.Name, p.BasePrice, ipLabel))
+		text.WriteString(fmt.Sprintf("%s #%d %s (قیمت پایه %s تومان، %s)\n",
+			enabledMark, p.ID, p.Name, persian.FormatMoney(int64(p.BasePrice)), ipLabel))
 	}
 
 	if bot.XUIClient != nil {
-		text.WriteString("\n📡 Cached inbounds:\n")
+		text.WriteString("\n📡 اینباندهای کش شده:\n")
 		for _, inbound := range bot.XUIClient.GetCachedInbounds() {
 			inboundNames[inbound.ID] = inbound.Remark
-			text.WriteString(fmt.Sprintf("  ID %d: %s (%s:%d)\n", inbound.ID, inbound.Remark, inbound.Protocol, inbound.Port))
+			text.WriteString(fmt.Sprintf("  شناسه %d: %s (%s:%d)\n", inbound.ID, inbound.Remark, inbound.Protocol, inbound.Port))
 		}
 	}
 
@@ -85,13 +86,13 @@ func HandleAdminPlans(c telebot.Context) error {
 		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("💼 #%d %s", p.ID, p.Name), "admin_view_plan", fmt.Sprintf("paid:%d", p.ID))))
 	}
 	rows = append(rows, menu.Row(
-		menu.Data("➕ Test plan", "admin_create_test_plan"),
-		menu.Data("➕ Paid plan", "admin_create_paid_plan"),
+		menu.Data("➕ طرح تست جدید", "admin_create_test_plan"),
+		menu.Data("➕ طرح خرید جدید", "admin_create_paid_plan"),
 	))
 	rows = append(rows, menu.Row(
-		menu.Data("🔄 Refresh Inbounds", "admin_refresh_inbounds"),
+		menu.Data("🔄 بازخوانی اینباندها", "admin_refresh_inbounds"),
 	))
-	rows = append(rows, menu.Row(menu.Data("« Back", "admin_menu")))
+	rows = append(rows, menu.Row(menu.Data("« بازگشت", "admin_menu")))
 	menu.Inline(rows...)
 	return maybeEditOrSend(c, text.String(), menu)
 }
@@ -100,14 +101,14 @@ func HandleAdminRefreshInbounds(c telebot.Context) error {
 	if bot.XUIClient != nil && bot.XUIClient.Cache != nil {
 		bot.XUIClient.Cache.RefreshSync()
 	}
-	_ = c.Respond(&telebot.CallbackResponse{Text: "🔄 Inbounds cache refreshed!"})
+	_ = c.Respond(&telebot.CallbackResponse{Text: "🔄 کش اینباندها با موفقیت به‌روز شد."})
 	return HandleAdminPlans(c)
 }
 
 func HandleCreateTestPlan(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	draft := map[string]interface{}{
@@ -134,7 +135,7 @@ func HandleCreateTestPlan(c telebot.Context) error {
 func HandleCreatePaidPlan(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	draft := map[string]interface{}{
@@ -166,12 +167,12 @@ func HandleCreatePaidPlan(c telebot.Context) error {
 func HandleAdminPlanEdit(c telebot.Context) error {
 	planType, planID, ok := parsePlanRef(callbackPayload(c))
 	if !ok {
-		return c.Send("Invalid plan.")
+		return c.Send("طرح نامعتبر است.")
 	}
 
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	ctx := context.Background()
@@ -180,7 +181,7 @@ func HandleAdminPlanEdit(c telebot.Context) error {
 	if planType == db.PlanTypeTest {
 		plan, err := db.GetTestPlanByID(ctx, planID)
 		if err != nil || plan == nil {
-			return c.Send("Test plan not found.")
+			return c.Send("طرح تست یافت نشد.")
 		}
 
 		draft := map[string]interface{}{
@@ -205,7 +206,7 @@ func HandleAdminPlanEdit(c telebot.Context) error {
 	} else {
 		plan, err := db.GetPaidPlanByID(ctx, planID)
 		if err != nil || plan == nil {
-			return c.Send("Paid plan not found.")
+			return c.Send("طرح خرید یافت نشد.")
 		}
 
 		draft := map[string]interface{}{
@@ -251,35 +252,35 @@ func showAdminDraftTestPlanMenu(c telebot.Context, draft map[string]interface{})
 
 	inboundLabel := formatInboundLabel(inboundIDs)
 	durationLabel := humanDuration(expireSeconds)
-	dataLabel := "unlimited"
+	dataLabel := "نامحدود"
 	if maxDataBytes > 0 {
-		dataLabel = fmt.Sprintf("%.2f GB", float64(maxDataBytes)/1073741824)
+		dataLabel = fmt.Sprintf("%.2f گیگابایت", float64(maxDataBytes)/1073741824)
 	}
 
-	ipLimitLabel := fmt.Sprintf("%d", ipLimit)
+	ipLimitLabel := fmt.Sprintf("%d کاربر همزمان", ipLimit)
 	if ipLimit == 0 {
-		ipLimitLabel = "Unlimited"
+		ipLimitLabel = "نامحدود"
 	}
 
-	text := fmt.Sprintf("🧪 **Draft Test Plan Config**\n\n"+
-		"📝 Name: %s\n"+
-		"📝 Description: %s\n"+
-		"📝 Usage Notes: %s\n"+
-		"📡 Inbounds: %s\n"+
-		"⏱️ Duration: %s\n"+
-		"💾 Max Data: %s\n"+
+	text := fmt.Sprintf("🧪 **پیکربندی پیش‌نویس طرح تست**\n\n"+
+		"📝 نام: %s\n"+
+		"📝 توضیحات: %s\n"+
+		"📝 یادداشت‌های کاربری: %s\n"+
+		"📡 اینباندها: %s\n"+
+		"⏱️ مدت اعتبار: %s\n"+
+		"💾 محدودیت حجم: %s\n"+
 		"⚡ Flow: %s\n"+
-		"📊 Max per day: %d\n"+
-		"👥 Access: %s\n"+
-		"🔄 Sync Active Subscribers: %t\n"+
-		"🌐 IP Limit: %s\n",
-		nonEmpty(name, "(not set)"),
-		nonEmpty(description, "(not set)"),
-		nonEmpty(usageDescription, "(not set)"),
+		"📊 سقف مجاز روزانه: %d\n"+
+		"👥 سطح دسترسی: %s\n"+
+		"🔄 همگام‌سازی اشتراک‌های فعال: %t\n"+
+		"🌐 محدودیت کاربران همزمان: %s\n",
+		nonEmpty(name, "(تنظیم نشده)"),
+		nonEmpty(description, "(تنظیم نشده)"),
+		nonEmpty(usageDescription, "(تنظیم نشده)"),
 		inboundLabel,
 		durationLabel,
 		dataLabel,
-		nonEmpty(flow, "(default/none)"),
+		nonEmpty(flow, "(پیش‌فرض/خالی)"),
 		maxPerDay,
 		formatAccessLabel(isGlobal, allowedUserIDs),
 		syncSubs,
@@ -287,12 +288,12 @@ func showAdminDraftTestPlanMenu(c telebot.Context, draft map[string]interface{})
 
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
-		menu.Row(menu.Data("📝 Name", "admin_draft_edit", "test:name"), menu.Data("📝 Description", "admin_draft_edit", "test:description"), menu.Data("📝 Usage Notes", "admin_draft_edit", "test:usage_description")),
-		menu.Row(menu.Data("📡 Inbound IDs", "admin_draft_inbounds", "test"), menu.Data("⏱️ Duration", "admin_draft_edit", "test:duration")),
-		menu.Row(menu.Data("💾 Max Data", "admin_draft_edit", "test:max_data"), menu.Data("⚡ Flow", "admin_draft_edit", "test:flow")),
-		menu.Row(menu.Data("📊 Max/Day", "admin_draft_edit", "test:max_per_day"), menu.Data("👥 Access", "admin_draft_edit", "test:access")),
-		menu.Row(menu.Data("🌐 IP Limit", "admin_draft_edit", "test:ip_limit"), menu.Data("🔄 Sync Subs: "+toggleEmoji(syncSubs), "admin_draft_toggle_sync", "test")),
-		menu.Row(menu.Data("💾 Save", "admin_draft_action", "test:save"), menu.Data("❌ Cancel", "admin_draft_action", "test:cancel")),
+		menu.Row(menu.Data("📝 نام", "admin_draft_edit", "test:name"), menu.Data("📝 توضیحات", "admin_draft_edit", "test:description"), menu.Data("📝 یادداشت‌ها", "admin_draft_edit", "test:usage_description")),
+		menu.Row(menu.Data("📡 اینباندها", "admin_draft_inbounds", "test"), menu.Data("⏱️ مدت اعتبار", "admin_draft_edit", "test:duration")),
+		menu.Row(menu.Data("💾 حجم مجاز", "admin_draft_edit", "test:max_data"), menu.Data("⚡ Flow", "admin_draft_edit", "test:flow")),
+		menu.Row(menu.Data("📊 سقف روزانه", "admin_draft_edit", "test:max_per_day"), menu.Data("👥 دسترسی", "admin_draft_edit", "test:access")),
+		menu.Row(menu.Data("🌐 کاربر همزمان", "admin_draft_edit", "test:ip_limit"), menu.Data("🔄 همگام‌سازی: "+toggleEmoji(syncSubs), "admin_draft_toggle_sync", "test")),
+		menu.Row(menu.Data("💾 ذخیره طرح", "admin_draft_action", "test:save"), menu.Data("❌ انصراف", "admin_draft_action", "test:cancel")),
 	)
 	return maybeEditOrSend(c, text, menu)
 }
@@ -322,69 +323,74 @@ func showAdminDraftPaidPlanMenu(c telebot.Context, draft map[string]interface{})
 	var priceBlock string
 	if isLimited {
 		priceBlock = fmt.Sprintf(
-			"💵 Price/GB: %.0f\n"+
-			"💾 Min Data: %d GB\n"+
-			"⏱️ Extra Month Price: %.0f\n",
-			pricePerGB, minDataGB, pricePerExtraMonth)
+			"💵 قیمت هر گیگابایت: %s تومان\n"+
+				"💾 حداقل حجم: %d گیگابایت\n"+
+				"⏱️ قیمت هر ماه اضافی: %s تومان\n",
+			persian.FormatMoney(int64(pricePerGB)), minDataGB, persian.FormatMoney(int64(pricePerExtraMonth)))
 	} else {
-		priceBlock = fmt.Sprintf("💵 Base Price: %.0f\n", basePrice)
+		priceBlock = fmt.Sprintf("💵 قیمت پایه: %s تومان\n", persian.FormatMoney(int64(basePrice)))
 	}
 
 	var ipLimitsLabel string
 	if baseIP == 0 && maxIP == 0 {
-		ipLimitsLabel = "Unlimited"
+		ipLimitsLabel = "کاربر همزمان نامحدود"
 	} else {
-		ipLimitsLabel = fmt.Sprintf("Base %d - Max %d", baseIP, maxIP)
+		ipLimitsLabel = fmt.Sprintf("پایه %d - حداکثر %d", baseIP, maxIP)
 	}
 
-	text := fmt.Sprintf("💼 **Draft Paid Plan Config**\n\n"+
-		"📝 Name: %s\n"+
-		"📝 Description: %s\n"+
-		"📝 Usage Notes: %s\n"+
-		"📡 Inbounds: %s\n"+
-		"📊 Plan Type: %s\n"+
+	planTypeLabel := "نامحدود"
+	if isLimited {
+		planTypeLabel = "حجمی (محدود)"
+	}
+
+	text := fmt.Sprintf("💼 **پیکربندی پیش‌نویس طرح خرید**\n\n"+
+		"📝 نام: %s\n"+
+		"📝 توضیحات: %s\n"+
+		"📝 یادداشت‌های کاربری: %s\n"+
+		"📡 اینباندها: %s\n"+
+		"📊 نوع طرح: %s\n"+
 		"%s"+
-		"🌐 IP Limits: %s\n"+
-		"💲 Extra IP Price: %.0f\n"+
+		"🌐 محدودیت کاربران همزمان: %s\n"+
+		"💲 قیمت هر کاربر اضافی: %s تومان\n"+
 		"⚡ Flow: %s\n"+
-		"🏷️ Discounts: %s\n"+
-		"👥 Access: %s\n"+
-		"🔄 Sync Active Subscribers: %t\n",
-		nonEmpty(name, "(not set)"),
-		nonEmpty(description, "(not set)"),
-		nonEmpty(usageDescription, "(not set)"),
+		"🏷️ تخفیف‌های دوره‌ای: %s\n"+
+		"👥 سطح دسترسی: %s\n"+
+		"🔄 همگام‌سازی اشتراک‌های فعال: %t\n",
+		nonEmpty(name, "(تنظیم نشده)"),
+		nonEmpty(description, "(تنظیم نشده)"),
+		nonEmpty(usageDescription, "(تنظیم نشده)"),
 		inboundLabel,
-		map[bool]string{true: "Limited", false: "Unlimited"}[isLimited],
+		planTypeLabel,
 		priceBlock,
 		ipLimitsLabel,
-		extraIPPrice,
-		nonEmpty(flow, "(default/none)"),
+		persian.FormatMoney(int64(extraIPPrice)),
+		nonEmpty(flow, "(پیش‌فرض/خالی)"),
 		discountLabel,
 		formatAccessLabel(isGlobal, allowedUserIDs),
 		syncSubs)
 
 	menu := &telebot.ReplyMarkup{}
 	var rows []telebot.Row
-	rows = append(rows, menu.Row(menu.Data("📝 Name", "admin_draft_edit", "paid:name"), menu.Data("📝 Description", "admin_draft_edit", "paid:description"), menu.Data("📝 Usage Notes", "admin_draft_edit", "paid:usage_description")))
-	rows = append(rows, menu.Row(menu.Data("📡 Inbounds", "admin_draft_inbounds", "paid")))
+	rows = append(rows, menu.Row(menu.Data("📝 نام", "admin_draft_edit", "paid:name"), menu.Data("📝 توضیحات", "admin_draft_edit", "paid:description"), menu.Data("📝 یادداشت‌ها", "admin_draft_edit", "paid:usage_description")))
+	rows = append(rows, menu.Row(menu.Data("📡 اینباندها", "admin_draft_inbounds", "paid")))
 
-	typeLabel := "📊 Type: Unlimited"
+	typeLabel := "📊 نوع: نامحدود"
 	if isLimited {
-		typeLabel = "📊 Type: Limited"
+		typeLabel = "📊 نوع: حجمی (محدود)"
 	}
 	rows = append(rows, menu.Row(menu.Data(typeLabel, "admin_draft_toggle_limited")))
 
 	if isLimited {
-		rows = append(rows, menu.Row(menu.Data("💵 Price/GB", "admin_draft_edit", "paid:price_per_gb"), menu.Data("💾 Min Data", "admin_draft_edit", "paid:min_data_gb")))
-		rows = append(rows, menu.Row(menu.Data("⏱️ Extra Month Price", "admin_draft_edit", "paid:price_per_extra_month"), menu.Data("⚡ Flow", "admin_draft_edit", "paid:flow")))
+		rows = append(rows, menu.Row(menu.Data("💵 قیمت/گیگ", "admin_draft_edit", "paid:price_per_gb"), menu.Data("💾 حداقل حجم", "admin_draft_edit", "paid:min_data_gb")))
+		rows = append(rows, menu.Row(menu.Data("⏱️ قیمت ماه اضافی", "admin_draft_edit", "paid:price_per_extra_month"), menu.Data("⚡ Flow", "admin_draft_edit", "paid:flow")))
 	} else {
-		rows = append(rows, menu.Row(menu.Data("💵 Price", "admin_draft_edit", "paid:price"), menu.Data("⚡ Flow", "admin_draft_edit", "paid:flow")))
+		rows = append(rows, menu.Row(menu.Data("💵 قیمت پایه", "admin_draft_edit", "paid:price"), menu.Data("⚡ Flow", "admin_draft_edit", "paid:flow")))
 	}
 
-	rows = append(rows, menu.Row(menu.Data("🌐 IP Limits", "admin_draft_edit", "paid:ip_limits"), menu.Data("💲 Extra IP Price", "admin_draft_edit", "paid:extra_ip")))
-	rows = append(rows, menu.Row(menu.Data("🏷️ Discounts", "admin_draft_edit", "paid:discounts"), menu.Data("👥 Access", "admin_draft_edit", "paid:access")))
-	rows = append(rows, menu.Row(menu.Data("🔄 Sync Subs: "+toggleEmoji(syncSubs), "admin_draft_toggle_sync", "paid")))
-	rows = append(rows, menu.Row(menu.Data("💾 Save", "admin_draft_action", "paid:save"), menu.Data("❌ Cancel", "admin_draft_action", "paid:cancel")))
+	rows = append(rows, menu.Row(menu.Data("🌐 کاربران همزمان", "admin_draft_edit", "paid:ip_limits"), menu.Data("💲 قیمت کاربر اضافی", "admin_draft_edit", "paid:extra_ip")))
+	rows = append(rows, menu.Row(menu.Data("🏷️ تخفیف‌ها", "admin_draft_edit", "paid:discounts"), menu.Data("👥 دسترسی", "admin_draft_edit", "paid:access")))
+	rows = append(rows, menu.Row(menu.Data("🔄 همگام‌سازی: "+toggleEmoji(syncSubs), "admin_draft_toggle_sync", "paid")))
+	rows = append(rows, menu.Row(menu.Data("💾 ذخیره طرح", "admin_draft_action", "paid:save"), menu.Data("❌ انصراف", "admin_draft_action", "paid:cancel")))
 
 	menu.Inline(rows...)
 	return maybeEditOrSend(c, text, menu)
@@ -393,15 +399,15 @@ func showAdminDraftPaidPlanMenu(c telebot.Context, draft map[string]interface{})
 func HandleAdminDraftToggleLimited(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 	if state.Step == "awaiting_admin_draft_input" {
-		return c.Send("Please finish or cancel your current text input before using configuration buttons.")
+		return c.Send("لطفاً ابتدا ورودی متنی فعلی را تکمیل کنید یا با /cancel انصراف دهید.")
 	}
 
 	draft := state.Data
@@ -416,12 +422,12 @@ func HandleAdminDraftToggleLimited(c telebot.Context) error {
 func HandleAdminDraftEdit(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 
 	var draft map[string]interface{}
@@ -430,13 +436,13 @@ func HandleAdminDraftEdit(c telebot.Context) error {
 	} else if d, ok := state.Data["draft"].(map[string]interface{}); ok {
 		draft = d
 	} else {
-		return c.Send("Invalid state.")
+		return c.Send("وضعیت نامعتبر است.")
 	}
 
 	payload := callbackPayload(c)
 	parts := strings.Split(payload, ":")
 	if len(parts) != 2 {
-		return c.Send("Invalid action.")
+		return c.Send("عملیات نامعتبر است.")
 	}
 	editingType := parts[0]
 	editingField := parts[1]
@@ -445,12 +451,12 @@ func HandleAdminDraftEdit(c telebot.Context) error {
 		menu := &telebot.ReplyMarkup{}
 		menu.Inline(
 			menu.Row(menu.Data("⚡ xtls-rprx-vision", "admin_draft_set_flow", editingType+":xtls-rprx-vision")),
-			menu.Row(menu.Data("❌ None (Clear)", "admin_draft_set_flow", editingType+":none")),
-			menu.Row(menu.Data("✏️ Custom / Manual Input", "admin_draft_set_flow", editingType+":custom")),
-			menu.Row(menu.Data("⬅️ Back", "admin_draft_set_flow", editingType+":back")),
+			menu.Row(menu.Data("❌ بدون Flow (حذف)", "admin_draft_set_flow", editingType+":none")),
+			menu.Row(menu.Data("✏️ مقدار سفارشی دستی", "admin_draft_set_flow", editingType+":custom")),
+			menu.Row(menu.Data("⬅️ بازگشت", "admin_draft_set_flow", editingType+":back")),
 		)
 		currentFlow := draftGetString(draft, "flow")
-		prompt := fmt.Sprintf("⚡ **Select Flow Option**:\n\n**Current**: %s", nonEmpty(currentFlow, "(default/none)"))
+		prompt := fmt.Sprintf("⚡ **انتخاب نوع Flow**:\n\n**مقدار فعلی**: %s", nonEmpty(currentFlow, "(پیش‌فرض/خالی)"))
 		return maybeEditOrSend(c, prompt, menu)
 	}
 
@@ -464,59 +470,59 @@ func HandleAdminDraftEdit(c telebot.Context) error {
 	var prompt string
 	switch editingField {
 	case "name":
-		prompt = "📝 Send the plan name (e.g., 'Monthly Standard'):"
+		prompt = "📝 نام طرح را ارسال کنید (مثال: 'ماهانه استاندارد'):"
 	case "description":
-		prompt = "📝 Send the plan description (e.g., 'Fast Trial'):"
+		prompt = "📝 توضیحات طرح را ارسال کنید (مثال: 'سرعت بالا، نامحدود'):"
 	case "usage_description":
-		prompt = "📝 Send the post-purchase usage description / connection notes (e.g., VLESS configs or rules):"
+		prompt = "📝 نکات کاربری پس از خرید را ارسال کنید (مثال: راهنمای اتصال یا قوانین):"
 	case "price":
-		prompt = "💵 Send the base price (e.g., '200000'):"
+		prompt = "💵 قیمت پایه را به تومان ارسال کنید (مثال: '200000'):"
 	case "price_per_gb":
-		prompt = "💵 Send the price per GB (e.g., '10000'):"
+		prompt = "💵 قیمت هر گیگابایت را به تومان ارسال کنید (مثال: '10000'):"
 	case "min_data_gb":
-		prompt = "💾 Send the minimum dataflow in GB (e.g., '10'):"
+		prompt = "💾 حداقل حجم بر حسب گیگابایت را ارسال کنید (مثال: '10'):"
 	case "price_per_extra_month":
-		prompt = "⏱️ Send the price per extra month (e.g., '20000'):"
+		prompt = "⏱️ قیمت هر ماه اضافی را به تومان ارسال کنید (مثال: '20000'):"
 	case "ip_limits":
-		prompt = "🌐 Send the IP limits in 'base-max' format (e.g., '1-6' or '2-2'), or '0' for unlimited:"
+		prompt = "🌐 محدودیت تعداد کاربر همزمان را به صورت 'پایه-حداکثر' (مثال: '1-6' یا '2-2') یا عدد '0' برای نامحدود ارسال کنید:"
 	case "ip_limit":
-		prompt = "🌐 Send the IP limit (e.g., '1' or '2'), or '0' for unlimited:"
+		prompt = "🌐 محدودیت تعداد کاربر همزمان (مثال: '1' یا '2') یا عدد '0' برای نامحدود را ارسال کنید:"
 	case "extra_ip":
-		prompt = "💲 Send the price per extra IP (e.g., '50000'):"
+		prompt = "💲 قیمت هر کاربر اضافی را به تومان ارسال کنید (مثال: '50000'):"
 	case "discounts":
-		prompt = "🏷️ Send discounts in format 'months:percent,months:percent' (e.g., '3:10,6:20' or '-' for none):"
+		prompt = "🏷️ تخفیف‌ها را به صورت 'ماه:درصد,ماه:درصد' (مثال: '3:10,6:20') یا '-' برای بدون تخفیف ارسال کنید:"
 	case "access":
-		prompt = "👥 Send private user Telegram IDs (comma-separated), or '-' for global access:"
+		prompt = "👥 شناسه‌های عددی تلگرام کاربران مجاز را با کاما جدا کنید یا '-' را برای دسترسی عمومی بفرستید:"
 	case "duration":
-		prompt = "⏱️ Send duration in hours (e.g., '24' or '0.5' for 30 minutes):"
+		prompt = "⏱️ مدت اعتبار را بر حسب ساعت ارسال کنید (مثال: '24' یا '0.5' برای ۳۰ دقیقه):"
 	case "max_data":
-		prompt = "💾 Send max data limit in GB (e.g., '50' or '0' for unlimited):"
+		prompt = "💾 سقف حجم بر حسب گیگابایت (مثال: '50' یا '0' برای نامحدود) را ارسال کنید:"
 	case "max_per_day":
-		prompt = "📊 Send max tests allowed per user per day (e.g., '2'):"
+		prompt = "📊 سقف مجاز دریافت تست روزانه برای هر کاربر (مثال: '2') را ارسال کنید:"
 	default:
-		return c.Send("Unknown editing field.")
+		return c.Send("بخش ویرایش نامشخص است.")
 	}
 
-	prompt += "\n\nType /cancel to abort editing this field and return."
+	prompt += "\n\nبرای انصراف از ویرایش این بخش، عبارت /cancel را ارسال کنید."
 	return maybeEditOrSend(c, prompt)
 }
 
 func ProcessAdminDraftInput(c telebot.Context, text string) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("You do not have permission to use this command.")
+		return c.Send("شما دسترسی به این دستور را ندارید.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil || state.Step != "awaiting_admin_draft_input" {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 
 	editingType := state.Data["editing_type"].(string)
 	editingField := state.Data["editing_field"].(string)
 	draft, ok := state.Data["draft"].(map[string]interface{})
 	if !ok {
-		return c.Send("Failed to parse draft configuration.")
+		return c.Send("خطا در پردازش اطلاعات پیش‌نویس طرح.")
 	}
 
 	text = strings.TrimSpace(text)
@@ -531,7 +537,7 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 	switch editingField {
 	case "name":
 		if text == "" {
-			return c.Send("Name cannot be empty. Send a valid name:")
+			return c.Send("نام طرح نمی‌تواند خالی باشد. لطفاً یک نام معتبر ارسال کنید:")
 		}
 		draft["name"] = text
 	case "description":
@@ -541,25 +547,25 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 	case "price":
 		val, err := strconv.ParseFloat(text, 64)
 		if err != nil || val < 0 {
-			return c.Send("Price must be zero or a positive number. Send a valid price:")
+			return c.Send("قیمت باید عددی مثبت یا صفر باشد. لطفاً قیمت معتبری وارد کنید:")
 		}
 		draft["base_price"] = val
 	case "price_per_gb":
 		val, err := strconv.ParseFloat(text, 64)
 		if err != nil || val < 0 {
-			return c.Send("Price per GB must be zero or a positive number. Send a valid price:")
+			return c.Send("قیمت هر گیگابایت باید عددی مثبت یا صفر باشد. لطفاً قیمت معتبری وارد کنید:")
 		}
 		draft["price_per_gb"] = val
 	case "min_data_gb":
 		val, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || val <= 0 {
-			return c.Send("Minimum dataflow must be a positive integer in GB. Send a valid value:")
+			return c.Send("حداقل حجم باید یک عدد صحیح مثبت بر حسب گیگابایت باشد. لطفاً مقدار معتبری وارد کنید:")
 		}
 		draft["min_data_gb"] = val
 	case "price_per_extra_month":
 		val, err := strconv.ParseFloat(text, 64)
 		if err != nil || val < 0 {
-			return c.Send("Price per extra month must be zero or a positive number. Send a valid price:")
+			return c.Send("قیمت هر ماه اضافی باید عددی مثبت یا صفر باشد. لطفاً قیمت معتبری وارد کنید:")
 		}
 		draft["price_per_extra_month"] = val
 	case "ip_limits":
@@ -571,28 +577,28 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 		}
 		parts := strings.Split(text, "-")
 		if len(parts) != 2 {
-			return c.Send("IP limits must be in format 'base-max' (e.g. '1-6'), or '0' for unlimited. Try again:")
+			return c.Send("محدودیت تعداد کاربر باید به صورت 'پایه-حداکثر' (مثلاً '1-6') یا '0' برای نامحدود باشد. مجدداً تلاش کنید:")
 		}
 		baseIP, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
 		maxIP, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
 		if err1 != nil || err2 != nil || baseIP < 0 || maxIP < baseIP {
-			return c.Send("Invalid IP limits. Max IP must be >= Base IP >= 0. Try again:")
+			return c.Send("محدودیت تعداد کاربر نامعتبر است. حداکثر کاربر باید بزرگتر یا مساوی پایه و نامنفی باشد:")
 		}
 		if baseIP == 0 && maxIP != 0 {
-			return c.Send("If base IP is 0 (unlimited), max IP must also be 0. Try again:")
+			return c.Send("اگر حداقل کاربر ۰ (نامحدود) باشد، حداکثر کاربر نیز باید ۰ باشد. مجدداً تلاش کنید:")
 		}
 		draft["base_ip_limit"] = baseIP
 		draft["max_ip_limit"] = maxIP
 	case "ip_limit":
 		val, err := strconv.Atoi(text)
 		if err != nil || val < 0 {
-			return c.Send("IP limit must be zero (unlimited) or a positive integer. Try again:")
+			return c.Send("محدودیت تعداد کاربر باید صفر (نامحدود) یا عدد صحیح مثبت باشد. مجدداً تلاش کنید:")
 		}
 		draft["ip_limit"] = val
 	case "extra_ip":
 		val, err := strconv.ParseFloat(text, 64)
 		if err != nil || val < 0 {
-			return c.Send("Extra IP price must be zero or a positive number. Try again:")
+			return c.Send("قیمت هر کاربر اضافی باید صفر یا عددی مثبت باشد. مجدداً تلاش کنید:")
 		}
 		draft["price_per_extra_ip"] = val
 	case "flow":
@@ -607,7 +613,7 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 		} else {
 			tiers, err := parseDiscounts(text)
 			if err != nil {
-				return c.Send("Invalid discounts format. Use format 'months:percent,months:percent' (e.g. '3:10,6:20') or '-' for none:")
+				return c.Send("قالب تخفیف‌ها نامعتبر است. از فرمت 'ماه:درصد,ماه:درصد' (مثلاً '3:10,6:20') یا '-' برای بدون تخفیف استفاده کنید:")
 			}
 			draft["discount_tiers"] = tiers
 		}
@@ -618,7 +624,7 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 		} else {
 			userIDs, err := parseInternalUserIDs(text)
 			if err != nil {
-				return c.Send("Invalid user IDs. Send comma-separated internal user IDs, or '-' for global:")
+				return c.Send("شناسه‌های کاربری نامعتبر است. شناسه‌های عددی تلگرام را با کاما جدا کنید یا '-' را برای دسترسی همگانی بفرستید:")
 			}
 			draft["is_global"] = false
 			draft["allowed_user_ids"] = userIDs
@@ -626,23 +632,23 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 	case "duration":
 		hours, err := strconv.ParseFloat(text, 64)
 		if err != nil || hours <= 0 {
-			return c.Send("Duration must be a positive number of hours (e.g. '2' or '0.5'). Try again:")
+			return c.Send("مدت زمان باید عددی مثبت بر حسب ساعت باشد (مثلاً '2' یا '0.5'). مجدداً تلاش کنید:")
 		}
 		draft["expire_seconds"] = int64(hours * 3600)
 	case "max_data":
 		gb, err := strconv.ParseFloat(text, 64)
 		if err != nil || gb < 0 {
-			return c.Send("Max data must be zero or a positive number in GB. Try again:")
+			return c.Send("سقف حجم باید صفر یا عددی مثبت بر حسب گیگابایت باشد. مجدداً تلاش کنید:")
 		}
 		draft["max_data_bytes"] = int64(gb * 1073741824)
 	case "max_per_day":
 		val, err := strconv.Atoi(text)
 		if err != nil || val < 0 {
-			return c.Send("Max tests per day must be zero or a positive integer. Try again:")
+			return c.Send("سقف مجاز روزانه باید صفر یا یک عدد صحیح مثبت باشد. مجدداً تلاش کنید:")
 		}
 		draft["max_per_day"] = val
 	default:
-		return c.Send("Unknown editing field.")
+		return c.Send("بخش ویرایش نامشخص است.")
 	}
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_admin_"+editingType+"_plan_menu", draft)
@@ -655,15 +661,15 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 func HandleAdminDraftToggleSync(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 	if state.Step == "awaiting_admin_draft_input" {
-		return c.Send("Please finish or cancel your current text input before using configuration buttons.")
+		return c.Send("لطفاً ابتدا ورودی متنی فعلی را تکمیل کنید یا با /cancel انصراف دهید.")
 	}
 
 	planType := callbackPayload(c)
@@ -682,18 +688,18 @@ func HandleAdminDraftToggleSync(c telebot.Context) error {
 func HandleAdminDraftSetFlow(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 
 	payload := callbackPayload(c)
 	parts := strings.Split(payload, ":")
 	if len(parts) != 2 {
-		return c.Send("Invalid payload.")
+		return c.Send("عملیات نامعتبر است.")
 	}
 
 	planType := parts[0]
@@ -709,16 +715,16 @@ func HandleAdminDraftSetFlow(c telebot.Context) error {
 	}
 
 	if draft == nil {
-		return c.Send("Failed to load draft configuration.")
+		return c.Send("خطا در بارگذاری اطلاعات پیش‌نویس طرح.")
 	}
 
 	switch choice {
 	case "xtls-rprx-vision":
 		draft["flow"] = "xtls-rprx-vision"
-		_ = c.Respond(&telebot.CallbackResponse{Text: "⚡ Flow set to xtls-rprx-vision"})
+		_ = c.Respond(&telebot.CallbackResponse{Text: "⚡ Flow روی xtls-rprx-vision تنظیم شد."})
 	case "none":
 		draft["flow"] = ""
-		_ = c.Respond(&telebot.CallbackResponse{Text: "⚡ Flow cleared"})
+		_ = c.Respond(&telebot.CallbackResponse{Text: "⚡ Flow حذف شد."})
 	case "custom":
 		inputStateData := map[string]interface{}{
 			"editing_type":  planType,
@@ -726,7 +732,7 @@ func HandleAdminDraftSetFlow(c telebot.Context) error {
 			"draft":         draft,
 		}
 		bot.FSM.SetState(user.TelegramID, "awaiting_admin_draft_input", inputStateData)
-		prompt := "⚡ Send the custom flow value (e.g., 'xtls-rprx-vision-less'):\n\nType /cancel to abort editing this field and return."
+		prompt := "⚡ مقدار سفارشی Flow را ارسال کنید (مثال: 'xtls-rprx-vision-less'):\n\nبرای انصراف /cancel را بفرستید."
 		return maybeEditOrSend(c, prompt)
 	case "back":
 		// Do nothing
@@ -742,30 +748,30 @@ func HandleAdminDraftSetFlow(c telebot.Context) error {
 func HandleAdminDraftAction(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 
 	payload := callbackPayload(c)
 	parts := strings.Split(payload, ":")
 	if len(parts) != 2 {
-		return c.Send("Invalid action.")
+		return c.Send("عملیات نامعتبر است.")
 	}
 	planType := parts[0]
 	action := parts[1]
 
 	if action == "cancel" {
 		bot.FSM.ClearState(user.TelegramID)
-		_ = c.Respond(&telebot.CallbackResponse{Text: "❌ Plan edit cancelled."})
+		_ = c.Respond(&telebot.CallbackResponse{Text: "❌ ویرایش طرح لغو شد."})
 		return HandleAdminPlans(c)
 	}
 
 	if state.Step == "awaiting_admin_draft_input" {
-		return c.Send("Please finish or cancel your current text input before using configuration buttons.")
+		return c.Send("لطفاً ابتدا ورودی متنی فعلی را تکمیل کنید یا با /cancel انصراف دهید.")
 	}
 
 	draft := state.Data
@@ -773,14 +779,14 @@ func HandleAdminDraftAction(c telebot.Context) error {
 	if action == "save" {
 		name := draftGetString(draft, "name")
 		if name == "" {
-			_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ Plan Name is required."})
-			return c.Send("Plan Name is required. Please set it before saving.")
+			_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ وارد کردن نام طرح الزامی است."})
+			return c.Send("نام طرح الزامی است. لطفاً پیش از ذخیره آن را تنظیم کنید.")
 		}
 
 		inboundIDs := draftGetIntSlice(draft, "inbound_ids")
 		if len(inboundIDs) == 0 {
-			_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ At least one inbound is required."})
-			return c.Send("At least one inbound ID must be selected. Please select inbounds before saving.")
+			_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ حداقل یک اینباند باید انتخاب شود."})
+			return c.Send("حداقل یک شناسه اینباند باید انتخاب شود. لطفاً پیش از ذخیره اینباندها را انتخاب کنید.")
 		}
 
 		if planType == "paid" {
@@ -788,29 +794,29 @@ func HandleAdminDraftAction(c telebot.Context) error {
 			if isLimited {
 				pricePerGB := draftGetFloat64(draft, "price_per_gb")
 				if pricePerGB <= 0 {
-					_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ Price per GB must be positive."})
-					return c.Send("Price per GB must be positive. Please set it before saving.")
+					_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ قیمت هر گیگابایت باید عددی مثبت باشد."})
+					return c.Send("قیمت هر گیگابایت باید عددی مثبت باشد. لطفاً پیش از ذخیره آن را تنظیم کنید.")
 				}
 				minData := draftGetInt64(draft, "min_data_gb")
 				if minData <= 0 {
-					_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ Minimum dataflow must be positive."})
-					return c.Send("Minimum dataflow must be positive. Please set it before saving.")
+					_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ حداقل حجم باید عددی مثبت باشد."})
+					return c.Send("حداقل حجم باید عددی مثبت باشد. لطفاً پیش از ذخیره آن را تنظیم کنید.")
 				}
 			} else {
 				basePrice := draftGetFloat64(draft, "base_price")
 				if basePrice <= 0 {
-					_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ Base price must be positive."})
-					return c.Send("Base price must be positive. Please set it before saving.")
+					_ = c.Respond(&telebot.CallbackResponse{Text: "⚠️ قیمت پایه باید عددی مثبت باشد."})
+					return c.Send("قیمت پایه باید عددی مثبت باشد. لطفاً پیش از ذخیره آن را تنظیم کنید.")
 				}
 			}
 		}
 
 		bot.FSM.ClearState(user.TelegramID)
-		_ = c.Respond(&telebot.CallbackResponse{Text: "💾 Plan saved."})
+		_ = c.Respond(&telebot.CallbackResponse{Text: "💾 طرح ذخیره شد."})
 		return SaveDraftPlan(c, planType, draft)
 	}
 
-	return c.Send("Invalid action.")
+	return c.Send("عملیات نامعتبر است.")
 }
 
 func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interface{}) error {
@@ -849,17 +855,17 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 		if id > 0 {
 			orig, err := db.GetTestPlanByID(ctx, id)
 			if err != nil {
-				return c.Send("Error retrieving original plan: " + err.Error())
+				return c.Send("خطا در دریافت اطلاعات طرح قبلی: " + err.Error())
 			}
 
 			if err := db.UpdateTestPlan(ctx, plan); err != nil {
-				return c.Send("Failed to update test plan: " + err.Error())
+				return c.Send("خطا در به‌روزرسانی طرح تست: " + err.Error())
 			}
 
 			if err := db.SetPlanUserAccess(ctx, db.PlanTypeTest, id, allowedUserIDs); err != nil {
-				return c.Send("Plan updated, but failed to save private access: " + err.Error())
+				return c.Send("طرح به‌روزرسانی شد، اما ذخیره دسترسی اختصاصی ناموفق بود: " + err.Error())
 			}
-			
+
 			if orig != nil && draftGetBool(draft, "sync_subs") {
 				added, removed := diffIntSlices(orig.InboundIDs, plan.InboundIDs)
 				if len(added) > 0 || len(removed) > 0 {
@@ -867,18 +873,18 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 				}
 			}
 
-			_ = c.Send(fmt.Sprintf("✅ Updated test plan #%d: %s", id, name))
+			_ = c.Send(fmt.Sprintf("✅ طرح تست شماره %d با موفقیت به‌روزرسانی شد: %s", id, name))
 		} else {
 			if err := db.CreateTestPlan(ctx, plan); err != nil {
-				return c.Send("Failed to create test plan: " + err.Error())
+				return c.Send("خطا در ایجاد طرح تست: " + err.Error())
 			}
 
 			if err := db.SetPlanUserAccess(ctx, db.PlanTypeTest, plan.ID, allowedUserIDs); err != nil {
-				return c.Send("Plan created, but failed to save private access: " + err.Error())
+				return c.Send("طرح ایجاد شد، اما ذخیره دسترسی اختصاصی ناموفق بود: " + err.Error())
 			}
 
-			notifyApprovedUsers("🧪 New test plan available: " + plan.Name)
-			_ = c.Send(fmt.Sprintf("✅ Created test plan #%d: %s", plan.ID, name))
+			notifyApprovedUsers("🧪 طرح تست جدید در دسترس قرار گرفت: " + plan.Name)
+			_ = c.Send(fmt.Sprintf("✅ طرح تست شماره %d با موفقیت ایجاد شد: %s", plan.ID, name))
 		}
 
 	} else {
@@ -919,15 +925,15 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 		if id > 0 {
 			orig, err := db.GetPaidPlanByID(ctx, id)
 			if err != nil {
-				return c.Send("Error retrieving original plan: " + err.Error())
+				return c.Send("خطا در دریافت اطلاعات طرح قبلی: " + err.Error())
 			}
 
 			if err := db.UpdatePaidPlan(ctx, plan); err != nil {
-				return c.Send("Failed to update paid plan: " + err.Error())
+				return c.Send("خطا در به‌روزرسانی طرح خرید: " + err.Error())
 			}
 
 			if err := db.SetPlanUserAccess(ctx, db.PlanTypePaid, id, allowedUserIDs); err != nil {
-				return c.Send("Plan updated, but failed to save private access: " + err.Error())
+				return c.Send("طرح به‌روزرسانی شد، اما ذخیره دسترسی اختصاصی ناموفق بود: " + err.Error())
 			}
 
 			if orig != nil && draftGetBool(draft, "sync_subs") {
@@ -937,18 +943,18 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 				}
 			}
 
-			_ = c.Send(fmt.Sprintf("✅ Updated paid plan #%d: %s", id, name))
+			_ = c.Send(fmt.Sprintf("✅ طرح خرید شماره %d با موفقیت به‌روزرسانی شد: %s", id, name))
 		} else {
 			if err := db.CreatePaidPlan(ctx, plan); err != nil {
-				return c.Send("Failed to create paid plan: " + err.Error())
+				return c.Send("خطا در ایجاد طرح خرید: " + err.Error())
 			}
 
 			if err := db.SetPlanUserAccess(ctx, db.PlanTypePaid, plan.ID, allowedUserIDs); err != nil {
-				return c.Send("Plan created, but failed to save private access: " + err.Error())
+				return c.Send("طرح ایجاد شد، اما ذخیره دسترسی اختصاصی ناموفق بود: " + err.Error())
 			}
 
-			notifyApprovedUsers("💼 New paid plan available: " + plan.Name)
-			_ = c.Send(fmt.Sprintf("✅ Created paid plan #%d: %s", plan.ID, name))
+			notifyApprovedUsers("💼 طرح خرید جدید در دسترس قرار گرفت: " + plan.Name)
+			_ = c.Send(fmt.Sprintf("✅ طرح خرید شماره %d با موفقیت ایجاد شد: %s", plan.ID, name))
 		}
 	}
 
@@ -1033,15 +1039,15 @@ func syncPlanSubscriptions(planID int64, planType string, addedIDs, removedIDs [
 func HandleAdminDraftInboundsMenu(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 	if state.Step == "awaiting_admin_draft_input" {
-		return c.Send("Please finish or cancel your current text input before using configuration buttons.")
+		return c.Send("لطفاً ابتدا ورودی متنی فعلی را تکمیل کنید یا با /cancel انصراف دهید.")
 	}
 
 	planType := callbackPayload(c)
@@ -1052,7 +1058,7 @@ func HandleAdminDraftInboundsMenu(c telebot.Context) error {
 
 func showAdminDraftInboundsMenu(c telebot.Context, planType string, draft map[string]interface{}) error {
 	if bot.XUIClient == nil {
-		return c.Send("x-ui client is not initialized.")
+		return c.Send("ارتباط با پنل 3x-ui برقرار نیست.")
 	}
 
 	cached := bot.XUIClient.GetCachedInbounds()
@@ -1064,19 +1070,19 @@ func showAdminDraftInboundsMenu(c telebot.Context, planType string, draft map[st
 	}
 
 	var text strings.Builder
-	text.WriteString("📡 **Select Inbounds for Plan**\n\n")
-	text.WriteString("Toggle the inbounds you want to attach to this plan. You can use 'Select All' to mark all, and then uncheck any individual inbounds.\n\n")
-	text.WriteString("Current Selection:\n")
-	
+	text.WriteString("📡 **انتخاب اینباندهای طرح**\n\n")
+	text.WriteString("اینباندهایی که می‌خواهید به این طرح متصل شوند را انتخاب کنید. می‌توانید از دکمه 'انتخاب همه' استفاده کرده و سپس موارد دلخواه را تغییر دهید.\n\n")
+	text.WriteString("اینباندهای انتخاب‌شده فعلی:\n")
+
 	inboundNames := cachedInboundNames()
 	if len(selectedIDs) == 0 {
-		text.WriteString("  _(none selected)_\n")
+		text.WriteString("  _(هیچ اینباندی انتخاب نشده)_\n")
 	} else {
 		for _, id := range selectedIDs {
 			if name, ok := inboundNames[id]; ok && name != "" {
-				text.WriteString(fmt.Sprintf("  ✅ ID %d: %s\n", id, name))
+				text.WriteString(fmt.Sprintf("  ✅ شناسه %d: %s\n", id, name))
 			} else {
-				text.WriteString(fmt.Sprintf("  ✅ ID %d\n", id))
+				text.WriteString(fmt.Sprintf("  ✅ شناسه %d\n", id))
 			}
 		}
 	}
@@ -1090,7 +1096,7 @@ func showAdminDraftInboundsMenu(c telebot.Context, planType string, draft map[st
 		if isSelected {
 			mark = "✅"
 		}
-		btnText := fmt.Sprintf("%s ID %d: %s (%s:%d)", mark, inbound.ID, inbound.Remark, inbound.Protocol, inbound.Port)
+		btnText := fmt.Sprintf("%s شناسه %d: %s (%s:%d)", mark, inbound.ID, inbound.Remark, inbound.Protocol, inbound.Port)
 		rows = append(rows, menu.Row(menu.Data(btnText, "admin_draft_toggle_inbound", fmt.Sprintf("%s:%d", planType, inbound.ID))))
 	}
 
@@ -1104,12 +1110,12 @@ func showAdminDraftInboundsMenu(c telebot.Context, planType string, draft map[st
 
 	var actionRow telebot.Row
 	if allSelected && len(cached) > 0 {
-		actionRow = menu.Row(menu.Data("❌ Deselect All", "admin_draft_toggle_all", planType+":deselect"))
+		actionRow = menu.Row(menu.Data("❌ لغو انتخاب همه", "admin_draft_toggle_all", planType+":deselect"))
 	} else {
-		actionRow = menu.Row(menu.Data("✅ Select All", "admin_draft_toggle_all", planType+":select"))
+		actionRow = menu.Row(menu.Data("✅ انتخاب همه", "admin_draft_toggle_all", planType+":select"))
 	}
 	rows = append(rows, actionRow)
-	rows = append(rows, menu.Row(menu.Data("💾 Done", "admin_draft_inbounds_done", planType)))
+	rows = append(rows, menu.Row(menu.Data("💾 تایید و بازگشت", "admin_draft_inbounds_done", planType)))
 
 	menu.Inline(rows...)
 	return maybeEditOrSend(c, text.String(), menu)
@@ -1118,26 +1124,26 @@ func showAdminDraftInboundsMenu(c telebot.Context, planType string, draft map[st
 func HandleAdminDraftToggleInbound(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 	if state.Step == "awaiting_admin_draft_input" {
-		return c.Send("Please finish or cancel your current text input before using configuration buttons.")
+		return c.Send("لطفاً ابتدا ورودی متنی فعلی را تکمیل کنید یا با /cancel انصراف دهید.")
 	}
 
 	payload := callbackPayload(c)
 	parts := strings.Split(payload, ":")
 	if len(parts) != 2 {
-		return c.Send("Invalid parameter.")
+		return c.Send("پارامتر نامعتبر است.")
 	}
 	planType := parts[0]
 	inboundID, err := strconv.Atoi(parts[1])
 	if err != nil {
-		return c.Send("Invalid inbound ID.")
+		return c.Send("شناسه اینباند نامعتبر است.")
 	}
 
 	draft := state.Data
@@ -1158,28 +1164,28 @@ func HandleAdminDraftToggleInbound(c telebot.Context) error {
 	draft["inbound_ids"] = newIDs
 
 	bot.FSM.SetState(user.TelegramID, state.Step, draft)
-	_ = c.Respond(&telebot.CallbackResponse{Text: "Toggled inbound."})
+	_ = c.Respond(&telebot.CallbackResponse{Text: "وضعیت اینباند تغییر یافت."})
 	return showAdminDraftInboundsMenu(c, planType, draft)
 }
 
 func HandleAdminDraftToggleAll(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 	if state.Step == "awaiting_admin_draft_input" {
-		return c.Send("Please finish or cancel your current text input before using configuration buttons.")
+		return c.Send("لطفاً ابتدا ورودی متنی فعلی را تکمیل کنید یا با /cancel انصراف دهید.")
 	}
 
 	payload := callbackPayload(c)
 	parts := strings.Split(payload, ":")
 	if len(parts) != 2 {
-		return c.Send("Invalid parameter.")
+		return c.Send("پارامتر نامعتبر است.")
 	}
 	planType := parts[0]
 	action := parts[1]
@@ -1195,10 +1201,10 @@ func HandleAdminDraftToggleAll(c telebot.Context) error {
 			}
 			draft["inbound_ids"] = newIDs
 		}
-		_ = c.Respond(&telebot.CallbackResponse{Text: "Selected all inbounds."})
+		_ = c.Respond(&telebot.CallbackResponse{Text: "تمامی اینباندها انتخاب شدند."})
 	} else {
 		draft["inbound_ids"] = []int{}
-		_ = c.Respond(&telebot.CallbackResponse{Text: "Deselected all inbounds."})
+		_ = c.Respond(&telebot.CallbackResponse{Text: "انتخاب تمامی اینباندها لغو شد."})
 	}
 
 	bot.FSM.SetState(user.TelegramID, state.Step, draft)
@@ -1208,21 +1214,21 @@ func HandleAdminDraftToggleAll(c telebot.Context) error {
 func HandleAdminDraftInboundsDone(c telebot.Context) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("Permission denied.")
+		return c.Send("دسترسی غیرمجاز است.")
 	}
 
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No active editor flow found.")
+		return c.Send("فرآیند ویرایش فعالی یافت نشد.")
 	}
 	if state.Step == "awaiting_admin_draft_input" {
-		return c.Send("Please finish or cancel your current text input before using configuration buttons.")
+		return c.Send("لطفاً ابتدا ورودی متنی فعلی را تکمیل کنید یا با /cancel انصراف دهید.")
 	}
 
 	planType := callbackPayload(c)
 	draft := state.Data
 
-	_ = c.Respond(&telebot.CallbackResponse{Text: "Inbounds saved."})
+	_ = c.Respond(&telebot.CallbackResponse{Text: "اینباندها ذخیره شدند."})
 
 	if planType == "test" {
 		return showAdminDraftTestPlanMenu(c, draft)
@@ -1233,7 +1239,7 @@ func HandleAdminDraftInboundsDone(c telebot.Context) error {
 func HandleAdminViewPlan(c telebot.Context) error {
 	planType, planID, ok := parsePlanRef(callbackPayload(c))
 	if !ok {
-		return c.Send("Invalid plan.")
+		return c.Send("طرح نامعتبر است.")
 	}
 	return showAdminViewPlan(c, planType, planID)
 }
@@ -1257,61 +1263,62 @@ func showAdminViewPlan(c telebot.Context, planType string, planID int64) error {
 	if planType == db.PlanTypeTest {
 		plan, err := db.GetTestPlanByID(context.Background(), planID)
 		if err != nil || plan == nil {
-			return c.Send("Test plan not found.")
+			return c.Send("طرح تست یافت نشد.")
 		}
 		enabled = plan.Enabled
 		access, _ := db.GetPlanUserAccess(context.Background(), planType, planID)
-		ipLimitLabel := fmt.Sprintf("%d", plan.IPLimit)
+		ipLimitLabel := fmt.Sprintf("%d کاربر همزمان", plan.IPLimit)
 		if plan.IPLimit == 0 {
-			ipLimitLabel = "unlimited"
+			ipLimitLabel = "نامحدود"
 		}
-		text = fmt.Sprintf("🧪 **Test plan #%d**\n"+
-			"Name: %s\nDescription: %s\nUsage Notes: %s\nEnabled: %t\nGlobal: %t\n"+
-			"Inbounds: %s\nDuration: %s\nMax data: %.2f GB\n"+
-			"Flow: %s\nMax/day: %d\nIP Limit: %s\nPrivate users: %v",
+		text = fmt.Sprintf("🧪 **طرح تست شماره %d**\n"+
+			"نام: %s\nتوضیحات: %s\nنکات کاربری: %s\nوضعیت فعال: %t\nدسترسی عمومی: %t\n"+
+			"اینباندها: %s\nمدت اعتبار: %s\nسقف حجم: %.2f گیگابایت\n"+
+			"Flow: %s\nسقف روزانه: %d\nمحدودیت کاربران همزمان: %s\nکاربران اختصاصی: %s",
 			plan.ID, plan.Name, plan.Description, plan.UsageDescription, plan.Enabled, plan.IsGlobal,
 			inboundLabel(plan.InboundIDs), humanDuration(plan.ExpireSeconds),
-			float64(plan.MaxDataBytes)/1073741824, plan.Flow, plan.MaxPerDay, ipLimitLabel, access)
+			float64(plan.MaxDataBytes)/1073741824, nonEmpty(plan.Flow, "پیش‌فرض/خالی"), plan.MaxPerDay, ipLimitLabel, formatAccessLabel(plan.IsGlobal, access))
 	} else {
 		plan, err := db.GetPaidPlanByID(context.Background(), planID)
 		if err != nil || plan == nil {
-			return c.Send("Paid plan not found.")
+			return c.Send("طرح خرید یافت نشد.")
 		}
 		enabled = plan.Enabled
 		access, _ := db.GetPlanUserAccess(context.Background(), planType, planID)
 
 		var priceBlock string
 		if plan.IsLimited {
-			priceBlock = fmt.Sprintf("Type: Limited\nPrice/GB: %.0f\nMin Data: %d GB\nExtra Month Price: %.0f", plan.PricePerGB, plan.MinDataGB, plan.PricePerExtraMonth)
+			priceBlock = fmt.Sprintf("نوع طرح: حجمی (محدود)\nقیمت هر گیگابایت: %s تومان\nحداقل حجم: %d گیگابایت\nقیمت ماه اضافی: %s تومان",
+				persian.FormatMoney(int64(plan.PricePerGB)), plan.MinDataGB, persian.FormatMoney(int64(plan.PricePerExtraMonth)))
 		} else {
-			priceBlock = fmt.Sprintf("Type: Unlimited\nBase price: %.0f", plan.BasePrice)
+			priceBlock = fmt.Sprintf("نوع طرح: نامحدود\nقیمت پایه: %s تومان", persian.FormatMoney(int64(plan.BasePrice)))
 		}
 
-		ipLabel := fmt.Sprintf("%d-%d", plan.BaseIPLimit, plan.MaxIPLimit)
+		ipLabel := fmt.Sprintf("%d-%d کاربر همزمان", plan.BaseIPLimit, plan.MaxIPLimit)
 		if plan.BaseIPLimit == 0 && plan.MaxIPLimit == 0 {
-			ipLabel = "unlimited"
+			ipLabel = "کاربر همزمان نامحدود"
 		}
 
-		text = fmt.Sprintf("💼 **Paid plan #%d**\n"+
-			"Name: %s\nDescription: %s\nUsage Notes: %s\nEnabled: %t\nGlobal: %t\n"+
-			"Inbounds: %s\n%s\nIP: %s\n"+
-			"Extra IP: %.0f\nFlow: %s\nDiscounts: %+v\nPrivate users: %v",
+		text = fmt.Sprintf("💼 **طرح خرید شماره %d**\n"+
+			"نام: %s\nتوضیحات: %s\nنکات کاربری: %s\nوضعیت فعال: %t\nدسترسی عمومی: %t\n"+
+			"اینباندها: %s\n%s\nمحدودیت کاربران: %s\n"+
+			"قیمت کاربر اضافی: %s تومان\nFlow: %s\nتخفیف‌ها: %s\nکاربران اختصاصی: %s",
 			plan.ID, plan.Name, plan.Description, plan.UsageDescription, plan.Enabled, plan.IsGlobal,
 			inboundLabel(plan.InboundIDs), priceBlock, ipLabel,
-			plan.PricePerExtraIP, plan.Flow, plan.DiscountTiers, access)
+			persian.FormatMoney(int64(plan.PricePerExtraIP)), nonEmpty(plan.Flow, "پیش‌فرض/خالی"), formatDiscountLabel(plan.DiscountTiers), formatAccessLabel(plan.IsGlobal, access))
 	}
 
-	toggleText := "🔴 Disable"
+	toggleText := "🔴 غیرفعال‌سازی"
 	if !enabled {
-		toggleText = "✅ Enable"
+		toggleText = "✅ فعال‌سازی"
 	}
 	ref := fmt.Sprintf("%s:%d", planType, planID)
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
-		menu.Row(menu.Data("📝 Edit Plan", "admin_plan_edit", ref)),
-		menu.Row(menu.Data(toggleText, "admin_plan_toggle", ref), menu.Data("👥 Set private users", "admin_plan_access", ref)),
-		menu.Row(menu.Data("🗑 Delete", "admin_plan_delete", ref)),
-		menu.Row(menu.Data("« Back", "admin_plans")),
+		menu.Row(menu.Data("📝 ویرایش طرح", "admin_plan_edit", ref)),
+		menu.Row(menu.Data(toggleText, "admin_plan_toggle", ref), menu.Data("👥 تنظیم دسترسی اختصاصی", "admin_plan_access", ref)),
+		menu.Row(menu.Data("🗑 حذف طرح", "admin_plan_delete", ref)),
+		menu.Row(menu.Data("« بازگشت", "admin_plans")),
 	)
 	return maybeEditOrSend(c, text, menu)
 }
@@ -1319,42 +1326,42 @@ func showAdminViewPlan(c telebot.Context, planType string, planID int64) error {
 func HandleAdminPlanToggle(c telebot.Context) error {
 	planType, planID, ok := parsePlanRef(callbackPayload(c))
 	if !ok {
-		return c.Send("Invalid plan.")
+		return c.Send("طرح نامعتبر است.")
 	}
 	enabled := false
 	if planType == db.PlanTypeTest {
 		plan, _ := db.GetTestPlanByID(context.Background(), planID)
 		if plan == nil {
-			return c.Send("Plan not found.")
+			return c.Send("طرح یافت نشد.")
 		}
 		enabled = !plan.Enabled
 	} else {
 		plan, _ := db.GetPaidPlanByID(context.Background(), planID)
 		if plan == nil {
-			return c.Send("Plan not found.")
+			return c.Send("طرح یافت نشد.")
 		}
 		enabled = !plan.Enabled
 	}
 	if err := db.SetPlanEnabled(context.Background(), planType, planID, enabled); err != nil {
-		return c.Send("Failed to update plan.")
+		return c.Send("خطا در تغییر وضعیت طرح.")
 	}
-	status := "disabled"
+	status := "غیرفعال"
 	if enabled {
-		status = "enabled"
+		status = "فعال"
 	}
-	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ Plan %s.", status)})
+	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ طرح %s شد.", status)})
 	return showAdminViewPlan(c, planType, planID)
 }
 
 func HandleAdminPlanDelete(c telebot.Context) error {
 	planType, planID, ok := parsePlanRef(callbackPayload(c))
 	if !ok {
-		return c.Send("Invalid plan.")
+		return c.Send("طرح نامعتبر است.")
 	}
 	if err := db.DeletePlan(context.Background(), planType, planID); err != nil {
-		return c.Send("Failed to delete plan: " + err.Error())
+		return c.Send("خطا در حذف طرح: " + err.Error())
 	}
-	_ = c.Respond(&telebot.CallbackResponse{Text: "🗑 Plan deleted."})
+	_ = c.Respond(&telebot.CallbackResponse{Text: "🗑 طرح حذف شد."})
 	return HandleAdminPlans(c)
 }
 
@@ -1362,41 +1369,41 @@ func HandleAdminPlanAccessPrompt(c telebot.Context) error {
 	user := userFromContext(c)
 	planType, planID, ok := parsePlanRef(callbackPayload(c))
 	if !ok || user == nil {
-		return c.Send("Invalid plan.")
+		return c.Send("طرح نامعتبر است.")
 	}
 	bot.FSM.SetState(user.TelegramID, "awaiting_admin_plan_access", map[string]interface{}{
 		"plan_type": planType,
 		"plan_id":   fmt.Sprintf("%d", planID),
 	})
-	return maybeEditOrSend(c, "Send internal bot user IDs (comma-separated) to grant private access.\nSend empty or '-' to make this plan global.")
+	return maybeEditOrSend(c, "شناسه‌های عددی تلگرام کاربران مجاز را با کاما جدا کنید تا دسترسی اختصاصی تنظیم شود.\nبرای دسترسی عمومی و همگانی، عبارت '-' را بفرستید.")
 }
 
 func ProcessAdminPlanAccess(c telebot.Context, text string) error {
 	user := userFromContext(c)
 	if user == nil || !isConfiguredAdmin(user.TelegramID) {
-		return c.Send("You do not have permission to use this command.")
+		return c.Send("شما دسترسی به این دستور را ندارید.")
 	}
 	state := bot.FSM.GetState(user.TelegramID)
 	if state == nil {
-		return c.Send("No plan access flow is active.")
+		return c.Send("فرآیند تنظیم دسترسی فعالی یافت نشد.")
 	}
 	planType := fmt.Sprintf("%v", state.Data["plan_type"])
 	planID, _ := parseInt64(fmt.Sprintf("%v", state.Data["plan_id"]))
 	userIDs, err := parseInternalUserIDs(text)
 	if err != nil {
-		return c.Send("Invalid user IDs. Use internal bot user IDs, comma-separated.")
+		return c.Send("شناسه‌های کاربری نامعتبر است. از شناسه‌های عددی جداشده با کاما استفاده کنید.")
 	}
 	if err := db.SetPlanUserAccess(context.Background(), planType, planID, userIDs); err != nil {
-		return c.Send("Failed to save private access.")
+		return c.Send("خطا در ذخیره دسترسی اختصاصی.")
 	}
 	if err := db.SetPlanGlobal(context.Background(), planType, planID, len(userIDs) == 0); err != nil {
-		return c.Send("Private access saved, but failed to update plan visibility.")
+		return c.Send("دسترسی ذخیره شد، اما به‌روزرسانی وضعیت عمومی طرح ناموفق بود.")
 	}
 	bot.FSM.ClearState(user.TelegramID)
 	if len(userIDs) == 0 {
-		_ = c.Send("✅ Plan is now global (visible to all approved users).")
+		_ = c.Send("✅ طرح اکنون به صورت عمومی برای تمامی کاربران فعال است.")
 	} else {
-		_ = c.Send(fmt.Sprintf("✅ Private plan access updated for %d user(s).", len(userIDs)))
+		_ = c.Send(fmt.Sprintf("✅ دسترسی اختصاصی طرح برای %d کاربر با موفقیت تنظیم شد.", len(userIDs)))
 	}
 	return showAdminViewPlan(c, planType, planID)
 }
@@ -1655,22 +1662,22 @@ func cachedInboundNames() map[int]string {
 
 func humanDuration(seconds int64) string {
 	if seconds <= 0 {
-		return "unlimited"
+		return "نامحدود"
 	}
 	hours := seconds / 3600
 	if hours < 24 {
-		return fmt.Sprintf("%d hour(s)", hours)
+		return fmt.Sprintf("%d ساعت", hours)
 	}
 	days := hours / 24
 	if days < 7 {
-		return fmt.Sprintf("%d day(s)", days)
+		return fmt.Sprintf("%d روز", days)
 	}
 	weeks := days / 7
 	if weeks < 5 {
-		return fmt.Sprintf("%d week(s)", weeks)
+		return fmt.Sprintf("%d هفته", weeks)
 	}
 	months := days / 30
-	return fmt.Sprintf("%d month(s)", months)
+	return fmt.Sprintf("%d ماه", months)
 }
 
 func nonEmpty(s, fallback string) string {
@@ -1682,7 +1689,7 @@ func nonEmpty(s, fallback string) string {
 
 func formatInboundLabel(ids []int) string {
 	if len(ids) == 0 {
-		return "(none selected)"
+		return "(هیچ موردی انتخاب نشده)"
 	}
 	inboundNames := cachedInboundNames()
 	parts := make([]string, 0, len(ids))
@@ -1698,27 +1705,27 @@ func formatInboundLabel(ids []int) string {
 
 func formatDiscountLabel(tiers []db.DiscountTier) string {
 	if len(tiers) == 0 {
-		return "none"
+		return "ندارد"
 	}
 	parts := make([]string, 0, len(tiers))
 	for _, t := range tiers {
-		parts = append(parts, fmt.Sprintf("%dm:%g%%", t.Months, t.Percent))
+		parts = append(parts, fmt.Sprintf("%d ماهه: %g%%", t.Months, t.Percent))
 	}
 	return strings.Join(parts, ", ")
 }
 
 func formatAccessLabel(isGlobal bool, allowedUserIDs []int64) string {
 	if isGlobal {
-		return "Global (All Users)"
+		return "عمومی (همه کاربران)"
 	}
 	if len(allowedUserIDs) == 0 {
-		return "Private (No Users)"
+		return "اختصاصی (بدون کاربر مجاز)"
 	}
 	parts := make([]string, 0, len(allowedUserIDs))
 	for _, id := range allowedUserIDs {
 		parts = append(parts, fmt.Sprintf("%d", id))
 	}
-	return fmt.Sprintf("Private (Users: %s)", strings.Join(parts, ", "))
+	return fmt.Sprintf("اختصاصی (کاربران: %s)", strings.Join(parts, ", "))
 }
 
 func toggleEmoji(val bool) string {
@@ -1727,4 +1734,3 @@ func toggleEmoji(val bool) string {
 	}
 	return "❌"
 }
-
