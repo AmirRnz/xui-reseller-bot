@@ -242,9 +242,16 @@ func CreditWalletBalanceWithKey(ctx context.Context, userID int64, amount int64,
 }
 
 func CreditAllApprovedUsers(ctx context.Context, amount int64, description string) (int64, error) {
+	return CreditAllApprovedUsersWithKey(ctx, amount, description, "")
+}
+
+func CreditAllApprovedUsersWithKey(ctx context.Context, amount int64, description, operationKey string) (int64, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
+	if Pool == nil {
+		return 0, errors.New("database pool is not initialized")
+	}
 	if amount <= 0 {
 		return 0, errors.New("amount must be positive")
 	}
@@ -254,6 +261,40 @@ func CreditAllApprovedUsers(ctx context.Context, amount int64, description strin
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
+
+	if operationKey != "" {
+		tag, err := tx.Exec(ctx, `
+			WITH inserted_txs AS (
+				INSERT INTO transactions (user_id, amount, type, status, description, operation_key)
+				SELECT id, $1, 'credit', 'completed', $2, $3 || ':user:' || id
+				FROM bot_users
+				WHERE status IN ('active', 'approved')
+				ON CONFLICT (operation_key) DO NOTHING
+				RETURNING user_id
+			)
+			UPDATE bot_users u
+			SET wallet_balance = u.wallet_balance + $1, updated_at = NOW()
+			FROM inserted_txs i
+			WHERE u.id = i.user_id
+		`, amount, description, operationKey)
+		if err != nil {
+			return 0, err
+		}
+
+		count := tag.RowsAffected()
+		if count == 0 {
+			var existingCount int64
+			err := tx.QueryRow(ctx, `
+				SELECT COUNT(*) FROM transactions WHERE operation_key LIKE $1 || ':user:%'
+			`, operationKey).Scan(&existingCount)
+			if err == nil && existingCount > 0 {
+				_ = tx.Rollback(ctx)
+				return 0, ErrWalletOperationAlreadyApplied
+			}
+		}
+
+		return count, tx.Commit(ctx)
+	}
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE bot_users

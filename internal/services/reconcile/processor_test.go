@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"xui-reseller-bot/internal/db"
@@ -86,24 +87,24 @@ func TestHandlePendingRefund_Success(t *testing.T) {
 
 	credited := false
 	p := &Processor{
-		CreditFn: func(ctx context.Context, uID int64, amount float64, desc, key string) error {
+		CreditFn: func(ctx context.Context, uID int64, amount int64, desc, key string) error {
 			if uID != userID || amount != 50000 || key != "op_test_refund:key" {
-				t.Fatalf("unexpected credit args: uid=%d, amount=%f, key=%s", uID, amount, key)
+				t.Fatalf("unexpected credit args: uid=%d, amount=%d, key=%s", uID, amount, key)
 			}
 			credited = true
 			return nil
 		},
 	}
 
-	res, err := p.handlePendingRefund(context.Background(), rec)
-	if err != nil {
-		t.Fatalf("expected nil err, got %v", err)
+	outcome := p.handlePendingRefund(context.Background(), rec)
+	if outcome.Err != nil {
+		t.Fatalf("expected nil err, got %v", outcome.Err)
 	}
 	if !credited {
 		t.Fatal("expected CreditFn to be called")
 	}
-	if res == "" {
-		t.Fatal("expected non-empty resolution")
+	if outcome.Kind != OutcomeResolved {
+		t.Fatalf("expected resolved outcome, got %v", outcome.Kind)
 	}
 }
 
@@ -121,13 +122,13 @@ func TestHandlePendingRefund_RefundFails_ReturnsError(t *testing.T) {
 	}
 
 	p := &Processor{
-		CreditFn: func(ctx context.Context, uID int64, amount float64, desc, key string) error {
+		CreditFn: func(ctx context.Context, uID int64, amount int64, desc, key string) error {
 			return errors.New("db connection timeout during refund")
 		},
 	}
 
-	_, err := p.handlePendingRefund(context.Background(), rec)
-	if err == nil {
+	outcome := p.handlePendingRefund(context.Background(), rec)
+	if outcome.Err == nil {
 		t.Fatal("expected error when refund fails")
 	}
 }
@@ -146,17 +147,17 @@ func TestHandlePendingRefund_AlreadyApplied_Succeeds(t *testing.T) {
 	}
 
 	p := &Processor{
-		CreditFn: func(ctx context.Context, uID int64, amount float64, desc, key string) error {
+		CreditFn: func(ctx context.Context, uID int64, amount int64, desc, key string) error {
 			return db.ErrWalletOperationAlreadyApplied
 		},
 	}
 
-	res, err := p.handlePendingRefund(context.Background(), rec)
-	if err != nil {
-		t.Fatalf("expected safe success for already-applied refund, got: %v", err)
+	outcome := p.handlePendingRefund(context.Background(), rec)
+	if outcome.Err != nil {
+		t.Fatalf("expected safe success for already-applied refund, got: %v", outcome.Err)
 	}
-	if res == "" {
-		t.Fatal("expected resolution string")
+	if outcome.Kind != OutcomeResolved {
+		t.Fatalf("expected resolved outcome, got %v", outcome.Kind)
 	}
 }
 
@@ -181,14 +182,14 @@ func TestHandleDeleteReconciliation_Timeout_NoDeletionOrRefund(t *testing.T) {
 		XUI: &mockXUI{
 			err: errors.New("timeout from XUI"),
 		},
-		CreditFn: func(ctx context.Context, uID int64, amount float64, desc, key string) error {
+		CreditFn: func(ctx context.Context, uID int64, amount int64, desc, key string) error {
 			refundCalled = true
 			return nil
 		},
 	}
 
-	_, err := p.handleDeleteReconciliation(context.Background(), rec)
-	if err == nil {
+	outcome := p.handleDeleteReconciliation(context.Background(), rec)
+	if outcome.Err == nil {
 		t.Fatal("expected error when XUI check times out")
 	}
 	if refundCalled {
@@ -215,21 +216,21 @@ func TestHandleDeleteReconciliation_NotFound_Refunds(t *testing.T) {
 		XUI: &mockXUI{
 			client: nil, // 404
 		},
-		CreditFn: func(ctx context.Context, uID int64, amount float64, desc, key string) error {
+		CreditFn: func(ctx context.Context, uID int64, amount int64, desc, key string) error {
 			refundCalled = true
 			return nil
 		},
 	}
 
-	res, err := p.handleDeleteReconciliation(context.Background(), rec)
-	if err != nil {
-		t.Fatalf("expected nil err, got %v", err)
+	outcome := p.handleDeleteReconciliation(context.Background(), rec)
+	if outcome.Err != nil {
+		t.Fatalf("expected nil err, got %v", outcome.Err)
 	}
 	if !refundCalled {
 		t.Fatal("expected refund when remote client is confirmed absent")
 	}
-	if res == "" {
-		t.Fatal("expected resolution")
+	if outcome.Kind != OutcomeResolved {
+		t.Fatalf("expected resolved outcome, got %v", outcome.Kind)
 	}
 }
 
@@ -251,13 +252,13 @@ func TestHandleDeleteReconciliation_RefundFails_ReturnsError(t *testing.T) {
 		XUI: &mockXUI{
 			client: nil, // 404
 		},
-		CreditFn: func(ctx context.Context, uID int64, amount float64, desc, key string) error {
+		CreditFn: func(ctx context.Context, uID int64, amount int64, desc, key string) error {
 			return errors.New("wallet credit db failure")
 		},
 	}
 
-	_, err := p.handleDeleteReconciliation(context.Background(), rec)
-	if err == nil {
+	outcome := p.handleDeleteReconciliation(context.Background(), rec)
+	if outcome.Err == nil {
 		t.Fatal("expected error when refund fails during deletion reconciliation")
 	}
 }
@@ -281,24 +282,34 @@ func TestHandlePurchaseReconciliation_RemoteAbsent_Refunds(t *testing.T) {
 		XUI: &mockXUI{
 			client: nil, // 404
 		},
-		CreditFn: func(ctx context.Context, uID int64, amount float64, desc, key string) error {
+		DebitTxFn: func(ctx context.Context, uID int64, opKey string) (*db.WalletTransaction, error) {
+			return &db.WalletTransaction{
+				ID:           1,
+				UserID:       uID,
+				Amount:       -60000,
+				Type:         "debit",
+				Status:       "completed",
+				OperationKey: opKey,
+			}, nil
+		},
+		CreditFn: func(ctx context.Context, uID int64, amount int64, desc, key string) error {
 			if uID != userID || amount != 60000 {
-				t.Fatalf("unexpected refund args: uid=%d, amount=%f", uID, amount)
+				t.Fatalf("unexpected refund args: uid=%d, amount=%d", uID, amount)
 			}
 			refunded = true
 			return nil
 		},
 	}
 
-	res, err := p.handlePurchaseReconciliation(context.Background(), rec)
-	if err != nil {
-		t.Fatalf("expected nil err, got %v", err)
+	outcome := p.handlePurchaseReconciliation(context.Background(), rec)
+	if outcome.Err != nil {
+		t.Fatalf("expected nil err, got %v", outcome.Err)
 	}
 	if !refunded {
 		t.Fatal("expected refund for absent remote client")
 	}
-	if res == "" {
-		t.Fatal("expected resolution string")
+	if outcome.Kind != OutcomeResolved {
+		t.Fatalf("expected resolved outcome, got %v", outcome.Kind)
 	}
 }
 
@@ -320,14 +331,14 @@ func TestHandlePurchaseReconciliation_Inconclusive_NoRefund(t *testing.T) {
 		XUI: &mockXUI{
 			err: errors.New("timeout connecting to master"),
 		},
-		CreditFn: func(ctx context.Context, uID int64, amount float64, desc, key string) error {
+		CreditFn: func(ctx context.Context, uID int64, amount int64, desc, key string) error {
 			refunded = true
 			return nil
 		},
 	}
 
-	_, err := p.handlePurchaseReconciliation(context.Background(), rec)
-	if err == nil {
+	outcome := p.handlePurchaseReconciliation(context.Background(), rec)
+	if outcome.Err == nil {
 		t.Fatal("expected error on inconclusive check")
 	}
 	if refunded {
@@ -358,12 +369,15 @@ func TestHandlePurchaseReconciliation_MismatchedUUID_MovesToManualReview(t *test
 		},
 	}
 
-	res, err := p.handlePurchaseReconciliation(context.Background(), rec)
-	if err != nil {
-		t.Fatalf("expected manual review resolution, got error: %v", err)
+	outcome := p.handlePurchaseReconciliation(context.Background(), rec)
+	if outcome.Err != nil {
+		t.Fatalf("expected manual review resolution, got error: %v", outcome.Err)
 	}
-	if res != "manual review: remote client identity mismatch" {
-		t.Fatalf("expected manual review for identity mismatch, got: %q", res)
+	if outcome.Kind != OutcomeManualReview {
+		t.Fatalf("expected manual review, got: %v", outcome.Kind)
+	}
+	if !strings.Contains(outcome.Reason, "identity verification failed") {
+		t.Fatalf("expected identity verification failure reason, got: %q", outcome.Reason)
 	}
 }
 
@@ -390,8 +404,8 @@ func TestHandleUpdateReconciliation_DivergentState_MovesToManualReview(t *testin
 		},
 	}
 
-	_, err := p.handleUpdateReconciliation(context.Background(), rec)
-	if err == nil {
+	outcome := p.handleUpdateReconciliation(context.Background(), rec)
+	if outcome.Err == nil {
 		t.Fatal("expected error when DB subscription lookup fails")
 	}
 }

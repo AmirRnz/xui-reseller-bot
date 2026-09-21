@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -10,8 +11,10 @@ import (
 
 	"gopkg.in/telebot.v3"
 	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/config"
 	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/services/reconcile"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -374,6 +377,7 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 	}
 
 	var activationErr error
+	var plan *db.PaidPlan
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
 		currency = "تومان"
@@ -381,7 +385,8 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 
 	switch req.Type {
 	case "buy":
-		plan, err := db.GetPaidPlanByID(context.Background(), *req.PlanID)
+		var err error
+		plan, err = db.GetPaidPlanByID(context.Background(), *req.PlanID)
 		if err != nil || plan == nil {
 			activationErr = fmt.Errorf("طرح خرید یافت نشد")
 			break
@@ -415,21 +420,43 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 			log.Printf("[CRITICAL] failed to persist provisioning status for purchase request #%d: %v", reqID, statusErr)
 		}
 		if provisioningStatus == db.PurchaseProvisioningRetryable {
-			record := &db.ReconciliationRecord{
-				OperationKey:      fmt.Sprintf("direct_payment:%d:provisioning", reqID),
-				Kind:              "direct_payment_provisioning_retry",
-				UserID:            &user.ID,
-				PurchaseRequestID: &reqID,
-				DesiredState: map[string]any{
-					"purchase_request_id": reqID,
-					"email":               req.ClientEmail,
-				},
-				ObservedState: map[string]any{
-					"outcome": "activation_failed",
-					"error":   activationErr.Error(),
-				},
-				ErrorMessage: activationErr.Error(),
+			var expectedUUID, expectedSubID string
+			var inboundIDs []int
+			var unknownCreate *paidSubscriptionCreateUnknownError
+			if errors.As(activationErr, &unknownCreate) && unknownCreate.Request.Client.ID != "" {
+				expectedUUID = unknownCreate.Request.Client.ID
+				expectedSubID = unknownCreate.Request.Client.SubID
+				inboundIDs = unknownCreate.Request.InboundIDs
 			}
+			if len(inboundIDs) == 0 && plan != nil {
+				inboundIDs = validInboundIDs(plan.InboundIDs)
+			}
+			var planID *int
+			if req.PlanID != nil {
+				id := int(*req.PlanID)
+				planID = &id
+			}
+			payload := &reconcile.DirectPaymentProvisioningPayload{
+				PurchaseRequestID: reqID,
+				UserID:            user.ID,
+				QuoteID:           req.QuoteID,
+				OperationKey:      fmt.Sprintf("direct_payment:%d:provisioning", reqID),
+				ClientEmail:       req.ClientEmail,
+				ExpectedUUID:      expectedUUID,
+				ExpectedSubID:     expectedSubID,
+				PlanID:            planID,
+				InboundIDs:        inboundIDs,
+				Months:            req.Months,
+				IPLimit:           req.IPLimit,
+				DataGB:            req.DataGB,
+				CustomName:        req.CustomName,
+			}
+			record := reconcile.NewDirectPaymentProvisioningRecord(payload)
+			record.ObservedState = map[string]any{
+				"outcome": "activation_failed",
+				"error":   activationErr.Error(),
+			}
+			record.ErrorMessage = activationErr.Error()
 			if recErr := db.CreateReconciliationRecord(context.Background(), record); recErr != nil {
 				log.Printf("[CRITICAL] failed to persist provisioning reconciliation for purchase request #%d: %v", reqID, recErr)
 			}
@@ -579,6 +606,9 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 		}
 	}
 	if err != nil {
+		if xui.IsUnknownOutcome(err) {
+			return &paidSubscriptionCreateUnknownError{cause: err, Request: xui.AddClientRequest{Client: client, InboundIDs: inboundIDs}}
+		}
 		return err
 	}
 
@@ -631,7 +661,7 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 
 		if resolution == deleteConfirmed {
 			observed["remote_deleted"] = true
-			_ = db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
+			if recErr := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
 				OperationKey:      fmt.Sprintf("purchase_request_comp:%d", req.ID),
 				Kind:              "purchase_request_db_failed_compensated",
 				UserID:            &user.ID,
@@ -640,7 +670,9 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 				ObservedState:     observed,
 				Status:            "compensated",
 				ErrorMessage:      fmt.Sprintf("DB save failed: %v; remote client deleted", err),
-			})
+			}); recErr != nil {
+				log.Printf("[CRITICAL] failed to persist purchase request compensation record for #%d: %v", req.ID, recErr)
+			}
 			return fmt.Errorf("failed to save subscription in database (remote client cancelled): %w", err)
 		}
 
@@ -648,7 +680,7 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 		if resolution == deleteStillPresent {
 			observed["client_present"] = true
 		}
-		_ = db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
+		if recErr := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
 			OperationKey:      fmt.Sprintf("purchase_request_comp:%d", req.ID),
 			Kind:              "purchase_request_db_failed_reconciliation",
 			UserID:            &user.ID,
@@ -657,7 +689,9 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 			ObservedState:     observed,
 			Status:            "reconciliation_required",
 			ErrorMessage:      fmt.Sprintf("DB save failed: %v; remote delete outcome: %s", err, resolution),
-		})
+		}); recErr != nil {
+			log.Printf("[CRITICAL] failed to persist purchase request reconciliation record for #%d: %v", req.ID, recErr)
+		}
 		return &xui.WriteError{Outcome: xui.WriteUnknown, Err: fmt.Errorf("DB save failed (%v) and remote client deletion is %s", err, resolution)}
 	}
 
@@ -807,20 +841,23 @@ func ProcessManualCreditAmount(c telebot.Context, amountText string) error {
 	if operationKey == "" {
 		operationKey = fmt.Sprintf("manual_admin_credit:%d:%d", admin.TelegramID, targetID)
 	}
-	amount, err := parseFloat(amountText)
+	amount, err := strconv.ParseInt(strings.TrimSpace(amountText), 10, 64)
 	if err != nil || amount <= 0 {
-		return c.Send("مبلغ نامعتبر است. یک عدد مثبت وارد کنید:")
+		return c.Send("مبلغ نامعتبر است. یک عدد صحیح مثبت به تومان وارد کنید:")
 	}
 	target, err := db.GetUserByID(context.Background(), targetID)
 	if err != nil || target == nil {
 		return c.Send("کاربر یافت نشد.")
 	}
 	if err := db.CreditWalletBalanceWithKey(context.Background(), target.ID, amount, "manual admin credit", operationKey); err != nil {
+		if errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
+			return c.Send("این عملیات قبلاً اعمال شده است.")
+		}
 		return c.Send("خطا در افزایش موجودی کاربر.")
 	}
 	bot.FSM.ClearState(admin.TelegramID)
-	_, _ = bot.Bot.Send(&telebot.User{ID: target.TelegramID}, fmt.Sprintf("کیف پول شما به مبلغ %.0f شارژ شد.", amount))
-	_ = c.Send(fmt.Sprintf("✅ کیف پول کاربر #%d به مبلغ %.0f شارژ شد.", target.ID, amount))
+	_, _ = bot.Bot.Send(&telebot.User{ID: target.TelegramID}, fmt.Sprintf("کیف پول شما به مبلغ %s شارژ شد.", persian.FormatMoney(amount)))
+	_ = c.Send(fmt.Sprintf("✅ کیف پول کاربر #%d به مبلغ %s شارژ شد.", target.ID, persian.FormatMoney(amount)))
 	target, _ = db.GetUserByID(context.Background(), targetID)
 	if target != nil {
 		return showAdminViewUser(c, target)

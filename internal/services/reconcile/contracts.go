@@ -161,6 +161,7 @@ type DirectPaymentProvisioningPayload struct {
 	ExpectedUUID      string `json:"expected_uuid,omitempty"`
 	ExpectedSubID     string `json:"expected_sub_id,omitempty"`
 	PlanID            *int   `json:"plan_id,omitempty"`
+	InboundIDs        []int  `json:"inbound_ids,omitempty"`
 	Months            int    `json:"months,omitempty"`
 	IPLimit           int    `json:"ip_limit,omitempty"`
 	DataGB            int    `json:"data_gb,omitempty"`
@@ -252,6 +253,10 @@ func NewSubscriptionUpdateRecord(p *SubscriptionUpdateDbFailedPayload) *db.Recon
 		DesiredState:   p.ToMap(),
 		Status:         "pending",
 	}
+}
+
+func NewSubscriptionUpdateDbFailedRecord(p *SubscriptionUpdateDbFailedPayload) *db.ReconciliationRecord {
+	return NewSubscriptionUpdateRecord(p)
 }
 
 func NewSubscriptionDeleteRecord(p *SubscriptionDeletePayload) *db.ReconciliationRecord {
@@ -625,6 +630,14 @@ func DecodeDirectPaymentProvisioning(raw map[string]any, fallbackReqID *int64, f
 	if planIDVal, ok := coerceInt64(raw["plan_id"]); ok {
 		id := int(planIDVal)
 		p.PlanID = &id
+	}
+
+	if inboundsRaw, ok := raw["inbound_ids"].([]any); ok {
+		for _, item := range inboundsRaw {
+			if id, ok := coerceInt64(item); ok {
+				p.InboundIDs = append(p.InboundIDs, int(id))
+			}
+		}
 	}
 
 	if months, ok := coerceInt64(raw["months"]); ok {

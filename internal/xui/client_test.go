@@ -399,3 +399,97 @@ func TestBulkCreate(t *testing.T) {
 		t.Fatalf("expected 2 created, got %d", resp.Created)
 	}
 }
+
+func TestMergeClientConfigPreservesUnmanagedMetadata(t *testing.T) {
+	current := XUIClientInfo{
+		ID:         42,
+		UUID:       "current-uuid-42",
+		Email:      "user@example.com",
+		SubID:      "sub-abc",
+		TgID:       987654321,
+		TotalGB:    50 * 1024 * 1024 * 1024,
+		Flow:       "xtls-rprx-vision",
+		Group:      "vip-group",
+		Comment:    "vip customer",
+		LimitIP:    2,
+		LimitHWID:  3,
+		Enable:     true,
+		ExpiryTime: 1700000000000,
+		Password:   "pwd-123",
+		Auth:       "auth-456",
+		Reset:      1,
+		ResetDay:   5,
+		ResetMax:   10,
+	}
+
+	// 1. IP-only update: desired only changes LimitIP, leaving other metadata empty/zero
+	desiredIPOnly := ClientConfig{
+		Email:      "user@example.com",
+		LimitIP:    5,
+		Enable:     true,
+		ExpiryTime: 1700000000000,
+	}
+	mergedIP := mergeClientConfig(current, desiredIPOnly)
+	if mergedIP.LimitIP != 5 {
+		t.Errorf("expected LimitIP 5, got %d", mergedIP.LimitIP)
+	}
+	if mergedIP.SubID != "sub-abc" || mergedIP.TgID != 987654321 || mergedIP.TotalGB != 50*1024*1024*1024 {
+		t.Errorf("metadata overwritten in IP-only update: %+v", mergedIP)
+	}
+	if mergedIP.Flow != "xtls-rprx-vision" || mergedIP.Group != "vip-group" || mergedIP.Comment != "vip customer" {
+		t.Errorf("flow/group/comment overwritten in IP-only update: %+v", mergedIP)
+	}
+	if mergedIP.LimitHWID != 3 || mergedIP.ID != "current-uuid-42" || mergedIP.Password != "pwd-123" || mergedIP.Auth != "auth-456" {
+		t.Errorf("hwid/id/credentials overwritten in IP-only update: %+v", mergedIP)
+	}
+
+	// 2. Expiry-only update
+	desiredExpiryOnly := ClientConfig{
+		Email:      "user@example.com",
+		ExpiryTime: 1800000000000,
+		Enable:     true,
+		LimitIP:    2,
+	}
+	mergedExpiry := mergeClientConfig(current, desiredExpiryOnly)
+	if mergedExpiry.ExpiryTime != 1800000000000 {
+		t.Errorf("expected ExpiryTime 1800000000000, got %d", mergedExpiry.ExpiryTime)
+	}
+	if mergedExpiry.SubID != "sub-abc" || mergedExpiry.TotalGB != 50*1024*1024*1024 || mergedExpiry.LimitHWID != 3 {
+		t.Errorf("metadata overwritten in expiry-only update: %+v", mergedExpiry)
+	}
+
+	// 3. Enable-only update
+	desiredEnableOnly := ClientConfig{
+		Email:      "user@example.com",
+		Enable:     false,
+		ExpiryTime: 1700000000000,
+		LimitIP:    2,
+	}
+	mergedEnable := mergeClientConfig(current, desiredEnableOnly)
+	if mergedEnable.Enable != false {
+		t.Errorf("expected Enable false, got %v", mergedEnable.Enable)
+	}
+	if mergedEnable.SubID != "sub-abc" || mergedEnable.TgID != 987654321 || mergedEnable.Group != "vip-group" {
+		t.Errorf("metadata overwritten in enable-only update: %+v", mergedEnable)
+	}
+
+	// 4. Desired explicit overrides
+	desiredOverrides := ClientConfig{
+		Email:     "new@example.com",
+		SubID:     "new-sub",
+		TgID:      111222,
+		TotalGB:   100,
+		Flow:      "new-flow",
+		LimitHWID: 10,
+		Group:     "new-group",
+		Comment:   "new-comment",
+		ID:        "custom-uuid",
+	}
+	mergedOverrides := mergeClientConfig(current, desiredOverrides)
+	if mergedOverrides.Email != "new@example.com" || mergedOverrides.SubID != "new-sub" || mergedOverrides.TgID != 111222 {
+		t.Errorf("explicit overrides not applied: %+v", mergedOverrides)
+	}
+	if mergedOverrides.TotalGB != 100 || mergedOverrides.Flow != "new-flow" || mergedOverrides.LimitHWID != 10 || mergedOverrides.Group != "new-group" || mergedOverrides.Comment != "new-comment" || mergedOverrides.ID != "custom-uuid" {
+		t.Errorf("explicit overrides not applied: %+v", mergedOverrides)
+	}
+}

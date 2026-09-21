@@ -2,11 +2,11 @@ package sync
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
 	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/services/reconcile"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -112,17 +112,10 @@ func (w *SyncWorker) RunSync(ctx context.Context) {
 		remote, err := w.XUI.GetClientByEmail(sub.email)
 		if xui.IsNotFound(err) {
 			log.Printf("[DRIFT: %s] Subscription %d (%s) absent on 3x-ui panel", DriftRemoteMissing, sub.id, sub.email)
-			_ = db.MarkSubscriptionReconciliationRequired(ctx, sub.id, nil, nil, nil, "remote client missing on panel")
-			subIDVal := int64(sub.id)
-			record := &db.ReconciliationRecord{
-				OperationKey:   fmt.Sprintf("drift:missing:%d", sub.id),
-				Kind:           "subscription_remote_missing",
-				UserID:         &sub.userID,
-				SubscriptionID: &subIDVal,
-				DesiredState:   map[string]any{"subscription_id": sub.id, "email": sub.email},
-				ObservedState:  map[string]any{"status": "not_found"},
-				ErrorMessage:   "remote client absent on panel during sync",
+			if markErr := db.MarkSubscriptionReconciliationRequired(ctx, sub.id, nil, nil, nil, "remote client missing on panel"); markErr != nil {
+				log.Printf("[SYNC] Failed to mark subscription %d reconciliation required: %v", sub.id, markErr)
 			}
+			record := reconcile.NewSubscriptionRemoteMissingRecord(int64(sub.id), sub.userID, sub.email, "remote client absent on panel during sync")
 			if recErr := db.CreateReconciliationRecord(ctx, record); recErr != nil {
 				log.Printf("[SYNC] Failed to create reconciliation record for missing sub %d: %v", sub.id, recErr)
 			}
@@ -149,20 +142,24 @@ func (w *SyncWorker) RunSync(ctx context.Context) {
 					sub.email, sub.id, newEndDate.Format("2006-01-02 15:04:05"))
 			} else {
 				log.Printf("[SYNC] Failed to update DB on activation for sub %d: %v", sub.id, updateErr)
-				subIDVal := int64(sub.id)
-				record := &db.ReconciliationRecord{
-					OperationKey:   fmt.Sprintf("drift:db_failed:%d", sub.id),
-					Kind:           "subscription_update_db_failed",
-					UserID:         &sub.userID,
-					SubscriptionID: &subIDVal,
-					DesiredState:   map[string]any{"subscription_id": sub.id, "email": sub.email, "expire_time": newExp, "end_date": newEndDate.Format(time.RFC3339), "is_active": remote.Enable},
-					ObservedState:  map[string]any{"db_error": updateErr.Error()},
-					ErrorMessage:   updateErr.Error(),
+				record := reconcile.NewSubscriptionUpdateDbFailedRecord(&reconcile.SubscriptionUpdateDbFailedPayload{
+					SubscriptionID:    int64(sub.id),
+					UserID:            sub.userID,
+					ClientEmail:       sub.email,
+					DesiredExpireTime: &newExp,
+					DesiredIsActive:   &remote.Enable,
+					PreviousIsActive:  sub.isActive,
+				})
+				record.ObservedState = map[string]any{"db_error": updateErr.Error()}
+				record.ErrorMessage = updateErr.Error()
+				if recErr := db.CreateReconciliationRecord(ctx, record); recErr != nil {
+					log.Printf("[SYNC] Failed to create reconciliation record for activation failure sub %d: %v", sub.id, recErr)
 				}
-				_ = db.CreateReconciliationRecord(ctx, record)
 			}
 		} else {
-			_, _ = db.Pool.Exec(ctx, `UPDATE subscriptions SET updated_at = NOW() WHERE id = $1`, sub.id)
+			if _, touchErr := db.Pool.Exec(ctx, `UPDATE subscriptions SET updated_at = NOW() WHERE id = $1`, sub.id); touchErr != nil {
+				log.Printf("[SYNC] Failed to touch unactivated subscription %d: %v", sub.id, touchErr)
+			}
 		}
 	}
 }

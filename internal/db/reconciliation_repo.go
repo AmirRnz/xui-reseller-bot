@@ -67,13 +67,33 @@ func CreateReconciliationRecord(ctx context.Context, record *ReconciliationRecor
 			(operation_key, kind, user_id, subscription_id, purchase_request_id, desired_state, observed_state, status, error_message, next_attempt_at)
 		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, NOW())
 		ON CONFLICT (operation_key) DO UPDATE SET
-			desired_state = EXCLUDED.desired_state,
-			observed_state = EXCLUDED.observed_state,
-			status = EXCLUDED.status,
-			error_message = EXCLUDED.error_message,
-			updated_at = NOW()
-		RETURNING id
-	`, record.OperationKey, record.Kind, record.UserID, record.SubscriptionID, record.PurchaseRequestID, desired, observed, record.Status, record.ErrorMessage).Scan(&record.ID)
+			desired_state = CASE
+				WHEN reconciliation_records.status IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+				THEN reconciliation_records.desired_state
+				ELSE EXCLUDED.desired_state
+			END,
+			observed_state = CASE
+				WHEN reconciliation_records.status IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+				THEN reconciliation_records.observed_state
+				ELSE EXCLUDED.observed_state
+			END,
+			status = CASE
+				WHEN reconciliation_records.status IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+				THEN reconciliation_records.status
+				ELSE EXCLUDED.status
+			END,
+			error_message = CASE
+				WHEN reconciliation_records.status IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+				THEN reconciliation_records.error_message
+				ELSE EXCLUDED.error_message
+			END,
+			updated_at = CASE
+				WHEN reconciliation_records.status IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+				THEN reconciliation_records.updated_at
+				ELSE NOW()
+			END
+		RETURNING id, status
+	`, record.OperationKey, record.Kind, record.UserID, record.SubscriptionID, record.PurchaseRequestID, desired, observed, record.Status, record.ErrorMessage).Scan(&record.ID, &record.Status)
 }
 
 // ClaimPendingReconciliationRecords claims pending records using FOR UPDATE SKIP LOCKED.
@@ -333,6 +353,8 @@ func GetReconciliationRecordByID(ctx context.Context, id int64) (*Reconciliation
 	return r, nil
 }
 
+var ErrReconciliationNotRetryable = errors.New("reconciliation record is not in a retryable state")
+
 func ResetReconciliationForRetry(ctx context.Context, id int64) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
@@ -340,10 +362,16 @@ func ResetReconciliationForRetry(ctx context.Context, id int64) error {
 	if Pool == nil {
 		return errors.New("database pool is not initialized")
 	}
-	_, err := Pool.Exec(ctx, `
+	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
 		SET status = 'pending', next_attempt_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
-		WHERE id = $1
+		WHERE id = $1 AND status IN ('retryable', 'manual_review')
 	`, id)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrReconciliationNotRetryable
+	}
+	return nil
 }

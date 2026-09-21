@@ -206,10 +206,17 @@ func TestContract_UpdatePreservesNonBotFields(t *testing.T) {
 				"success": true,
 				"obj": map[string]any{
 					"id":         1,
+					"uuid":       "uuid-test-1",
 					"email":      "test@example.com",
+					"subId":      "sub-test-1",
+					"tgId":       12345678,
+					"totalGB":    107374182400,
+					"flow":       "xtls-rprx-vision",
+					"group":      "test-group",
 					"enable":     true,
+					"expiryTime": 1700000000000,
 					"limitIp":    1,
-					"limitHwid":  2, // Custom non-bot field!
+					"limitHwid":  2,
 					"comment":    "preserved comment",
 					"inboundIds": []int{1, 2},
 				},
@@ -234,23 +241,60 @@ func TestContract_UpdatePreservesNonBotFields(t *testing.T) {
 		t.Fatalf("NewClient failed: %v", err)
 	}
 
-	// Update only LimitIP to 3
+	// 1. IP-only update
 	err = client.UpdateClient("test@example.com", ClientConfig{
-		Email:   "test@example.com",
-		LimitIP: 3,
+		Email:      "test@example.com",
+		LimitIP:    3,
+		Enable:     true,
+		ExpiryTime: 1700000000000,
 	})
 	if err != nil {
-		t.Fatalf("UpdateClient failed: %v", err)
-	}
-
-	// Verify that limitHwid and comment were preserved
-	if receivedClient["limitHwid"] != float64(2) && receivedClient["limitHwid"] != 2 {
-		t.Fatalf("expected limitHwid to be preserved as 2, got %v", receivedClient["limitHwid"])
-	}
-	if receivedClient["comment"] != "preserved comment" {
-		t.Fatalf("expected comment to be preserved, got %v", receivedClient["comment"])
+		t.Fatalf("UpdateClient IP-only failed: %v", err)
 	}
 	if receivedClient["limitIp"] != float64(3) && receivedClient["limitIp"] != 3 {
 		t.Fatalf("expected limitIp to be updated to 3, got %v", receivedClient["limitIp"])
+	}
+	if receivedClient["subId"] != "sub-test-1" || receivedClient["group"] != "test-group" || receivedClient["comment"] != "preserved comment" {
+		t.Fatalf("unmanaged string metadata overwritten in IP-only update: %+v", receivedClient)
+	}
+	if receivedClient["limitHwid"] != float64(2) && receivedClient["limitHwid"] != 2 {
+		t.Fatalf("expected limitHwid to be preserved as 2, got %v", receivedClient["limitHwid"])
+	}
+	if receivedClient["totalGB"] != float64(107374182400) && receivedClient["totalGB"] != int64(107374182400) {
+		t.Fatalf("expected totalGB to be preserved, got %v", receivedClient["totalGB"])
+	}
+	if receivedClient["id"] != "uuid-test-1" {
+		t.Fatalf("expected id to be preserved as uuid-test-1, got %v", receivedClient["id"])
+	}
+
+	// 2. Expiry-only update
+	err = client.UpdateClient("test@example.com", ClientConfig{
+		Email:      "test@example.com",
+		ExpiryTime: 1800000000000,
+		Enable:     true,
+		LimitIP:    1,
+	})
+	if err != nil {
+		t.Fatalf("UpdateClient expiry-only failed: %v", err)
+	}
+	if receivedClient["subId"] != "sub-test-1" || receivedClient["flow"] != "xtls-rprx-vision" || receivedClient["group"] != "test-group" {
+		t.Fatalf("unmanaged metadata overwritten in expiry-only update: %+v", receivedClient)
+	}
+
+	// 3. Enable-only update
+	err = client.UpdateClient("test@example.com", ClientConfig{
+		Email:      "test@example.com",
+		Enable:     false,
+		ExpiryTime: 1700000000000,
+		LimitIP:    1,
+	})
+	if err != nil {
+		t.Fatalf("UpdateClient enable-only failed: %v", err)
+	}
+	if receivedClient["enable"] != false {
+		t.Fatalf("expected enable to be false, got %v", receivedClient["enable"])
+	}
+	if receivedClient["subId"] != "sub-test-1" || receivedClient["comment"] != "preserved comment" || receivedClient["limitHwid"] != float64(2) {
+		t.Fatalf("unmanaged metadata overwritten in enable-only update: %+v", receivedClient)
 	}
 }

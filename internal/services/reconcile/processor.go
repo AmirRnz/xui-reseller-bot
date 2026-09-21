@@ -66,6 +66,7 @@ type Processor struct {
 	WorkerID  string
 	XUI       XUIClient
 	CreditFn  func(ctx context.Context, userID int64, amount int64, description, operationKey string) error
+	DebitTxFn func(ctx context.Context, userID int64, operationKey string) (*db.WalletTransaction, error)
 	BatchSize int
 	MaxRetry  int
 }
@@ -268,6 +269,13 @@ func verifyClientIdentity(remote *xui.XUIClientInfo, expectedEmail, expectedUUID
 	return nil
 }
 
+func (p *Processor) getCompletedDebitTransaction(ctx context.Context, userID int64, operationKey string) (*db.WalletTransaction, error) {
+	if p.DebitTxFn != nil {
+		return p.DebitTxFn(ctx, userID, operationKey)
+	}
+	return db.GetCompletedDebitTransaction(ctx, userID, operationKey)
+}
+
 func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
 	payload, err := DecodePurchaseProvisioning(rec.DesiredState, rec.UserID, rec.OperationKey)
 	if err != nil {
@@ -359,55 +367,57 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 
 	case RemoteConfirmedAbsent:
 		// Remote client is confirmed absent!
-		// Derive exact refund amount from immutable quote or ledger transaction.
+		// Check completed debit ledger transaction before refunding; do not assume quote proves debit.
+		debitKey := payload.DebitOperationKey
+		if debitKey == "" {
+			debitKey = payload.OperationKey
+		}
+
 		var refundAmount int64
 		var amountProven bool
 
-		if payload.QuoteID != nil && *payload.QuoteID > 0 {
-			quote, qErr := pricing.GetQuoteByID(ctx, *payload.QuoteID)
-			if qErr == nil && quote != nil {
-				refundAmount = quote.FinalPriceToman
+		if debitKey != "" {
+			tx, txErr := p.getCompletedDebitTransaction(ctx, payload.UserID, debitKey)
+			if txErr != nil {
+				return ProcessOutcome{
+					Kind: OutcomeRetry,
+					Err:  fmt.Errorf("failed to check ledger debit for %s (key %s): %w", payload.Email, debitKey, txErr),
+				}
+			}
+			if tx != nil {
+				refundAmount = tx.Amount
+				if refundAmount < 0 {
+					refundAmount = -refundAmount
+				}
 				amountProven = true
-			} else {
-				// Quote was specified but could not be loaded from DB!
+
+				// If quote was also specified, verify it matches
+				if payload.QuoteID != nil && *payload.QuoteID > 0 {
+					quote, qErr := pricing.GetQuoteByID(ctx, *payload.QuoteID)
+					if qErr == nil && quote != nil {
+						if quote.FinalPriceToman != refundAmount {
+							return ProcessOutcome{
+								Kind:   OutcomeManualReview,
+								Reason: fmt.Sprintf("quote %d price (%d) does not match debited transaction amount (%d) for %s; manual review required", *payload.QuoteID, quote.FinalPriceToman, refundAmount, payload.Email),
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if !amountProven {
+			// No completed debit transaction exists. Do not refund!
+			if payload.Price > 0 {
 				return ProcessOutcome{
 					Kind:   OutcomeManualReview,
-					Reason: fmt.Sprintf("quote %d could not be verified for absent client %s; manual review required", *payload.QuoteID, payload.Email),
+					Reason: fmt.Sprintf("no completed debit transaction found in ledger for %s (debit key: %s, payload price: %d); manual review required", payload.Email, debitKey, payload.Price),
 				}
 			}
-		}
-
-		if !amountProven {
-			// Check ledger for debit transaction by debit operation key
-			debitKey := payload.DebitOperationKey
-			if debitKey == "" {
-				debitKey = payload.OperationKey
-			}
-			if debitKey != "" {
-				tx, txErr := db.GetCompletedDebitTransaction(ctx, payload.UserID, debitKey)
-				if txErr == nil && tx != nil {
-					refundAmount = tx.Amount
-					if refundAmount < 0 {
-						refundAmount = -refundAmount
-					}
-					amountProven = true
-				}
-			}
-		}
-
-		if !amountProven && payload.Price > 0 {
-			// If payload has a positive price but no quote or transaction proves debit, move to manual review
+			// Zero price and no debit: safely resolve without refund
 			return ProcessOutcome{
-				Kind:   OutcomeManualReview,
-				Reason: fmt.Sprintf("unproven debit amount (%d Toman) for remote absent client %s; manual review required", payload.Price, payload.Email),
-			}
-		}
-
-		if !amountProven {
-			// Cannot prove any debit occurred
-			return ProcessOutcome{
-				Kind:   OutcomeManualReview,
-				Reason: fmt.Sprintf("cannot prove debit amount for remote absent client %s; manual review required", payload.Email),
+				Kind:       OutcomeResolved,
+				Resolution: fmt.Sprintf("remote client %s absent, zero price and no debit recorded; resolved without refund", payload.Email),
 			}
 		}
 
@@ -786,10 +796,19 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 	case RemoteConfirmedAbsent:
 		// Client absent remotely. Create client in XUI first.
 		var inbounds []int
-		if payload.PlanID != nil {
+		if len(payload.InboundIDs) > 0 {
+			inbounds = payload.InboundIDs
+		} else if payload.PlanID != nil {
 			paidPlan, pErr := db.GetPaidPlanByID(ctx, int64(*payload.PlanID))
 			if pErr == nil && paidPlan != nil {
 				inbounds = paidPlan.InboundIDs
+			}
+		}
+
+		if len(inbounds) == 0 {
+			return ProcessOutcome{
+				Kind:   OutcomeManualReview,
+				Reason: fmt.Sprintf("inbound snapshot is missing for direct payment client %s (plan_id=%v); manual review required", payload.ClientEmail, payload.PlanID),
 			}
 		}
 

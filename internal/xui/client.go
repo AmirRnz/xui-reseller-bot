@@ -166,7 +166,8 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 	status.MasterReachable = true
 	status.TokenValid = true
 	status.Version = updateInfo.CurrentVersion
-	status.VersionOK = strings.Contains(updateInfo.CurrentVersion, "3.8") || strings.HasPrefix(updateInfo.CurrentVersion, "v3.")
+	normalizedVersion := strings.TrimPrefix(strings.TrimSpace(updateInfo.CurrentVersion), "v")
+	status.VersionOK = strings.HasPrefix(normalizedVersion, "3.8.5")
 
 	inbounds, err := c.GetInbounds()
 	if err != nil {
@@ -356,31 +357,78 @@ func clientMatchesUpdate(remote XUIClientInfo, desired ClientConfig) bool {
 }
 
 func mergeClientConfig(current XUIClientInfo, desired ClientConfig) ClientConfig {
-	merged := ClientConfig{
-		ID: strconv.Itoa(current.ID), Email: current.Email, Enable: current.Enable,
-		ExpiryTime: current.ExpiryTime, Flow: current.Flow, Group: current.Group,
-		LimitIP: current.LimitIP, Reset: current.Reset, Security: current.Security,
-		SubID: current.SubID, TgID: current.TgID, TotalGB: current.TotalGB,
-		Comment: current.Comment, Password: current.Password, Auth: current.Auth,
-		LimitHWID: current.LimitHWID, ResetDay: current.ResetDay, ResetMax: current.ResetMax,
-		KeepAlive: current.KeepAlive, ForwardedPorts: current.ForwardedPorts,
-		PrivateKey: current.PrivateKey, PublicKey: current.PublicKey, PreSharedKey: current.PreSharedKey,
-		AllowedIPs: current.AllowedIPs, AllowedIPsByInbound: current.AllowedIPsByInbound,
-		Secret: current.Secret, AdTag: current.AdTag, TrafficReset: current.TrafficReset,
-		TrafficResetDay: current.TrafficResetDay, Reverse: current.Reverse,
+	currentID := current.UUID
+	if currentID == "" && current.ID != 0 {
+		currentID = strconv.Itoa(current.ID)
 	}
-	// These are the fields controlled by the bot. Metadata and newer panel
-	// fields remain from the full current record.
-	merged.Email = desired.Email
-	merged.Enable = desired.Enable
-	merged.ExpiryTime = desired.ExpiryTime
-	merged.LimitIP = desired.LimitIP
-	merged.SubID = desired.SubID
-	merged.TgID = desired.TgID
-	merged.TotalGB = desired.TotalGB
+
+	merged := ClientConfig{
+		ID:                  currentID,
+		Email:               current.Email,
+		Enable:              desired.Enable,
+		ExpiryTime:          desired.ExpiryTime,
+		Flow:                current.Flow,
+		Group:               current.Group,
+		LimitIP:             desired.LimitIP,
+		Reset:               current.Reset,
+		ResetDay:            current.ResetDay,
+		ResetMax:            current.ResetMax,
+		Security:            current.Security,
+		SubID:               current.SubID,
+		TgID:                current.TgID,
+		TotalGB:             current.TotalGB,
+		Comment:             current.Comment,
+		Password:            current.Password,
+		Auth:                current.Auth,
+		LimitHWID:           current.LimitHWID,
+		KeepAlive:           current.KeepAlive,
+		PrivateKey:          current.PrivateKey,
+		PublicKey:           current.PublicKey,
+		PreSharedKey:        current.PreSharedKey,
+		AllowedIPs:          current.AllowedIPs,
+		AllowedIPsByInbound: current.AllowedIPsByInbound,
+		Secret:              current.Secret,
+		AdTag:               current.AdTag,
+		ForwardedPorts:      current.ForwardedPorts,
+		TrafficReset:        current.TrafficReset,
+		TrafficResetDay:     current.TrafficResetDay,
+		Reverse:             current.Reverse,
+	}
+
+	if desired.ID != "" {
+		merged.ID = desired.ID
+	}
+	if desired.Email != "" {
+		merged.Email = desired.Email
+	}
+	if desired.SubID != "" {
+		merged.SubID = desired.SubID
+	}
+	if desired.TgID != 0 {
+		merged.TgID = desired.TgID
+	}
+	if desired.TotalGB != 0 {
+		merged.TotalGB = desired.TotalGB
+	}
 	if desired.Flow != "" {
 		merged.Flow = desired.Flow
 	}
+	if desired.LimitHWID != 0 {
+		merged.LimitHWID = desired.LimitHWID
+	}
+	if desired.Group != "" {
+		merged.Group = desired.Group
+	}
+	if desired.Comment != "" {
+		merged.Comment = desired.Comment
+	}
+	if desired.Password != "" {
+		merged.Password = desired.Password
+	}
+	if desired.Auth != "" {
+		merged.Auth = desired.Auth
+	}
+
 	return merged
 }
 
@@ -598,4 +646,43 @@ func (c *Client) GetClientByEmail(email string) (*XUIClientInfo, error) {
 		return nil, err
 	}
 	return &client, nil
+}
+
+// FindClientBySubID searches for a client by subId using targeted paged search (/panel/api/clients/list/paged?search={subId}&pageSize=10).
+// If found, it fetches the full client details via GetClientByEmail.
+func (c *Client) FindClientBySubID(subID string) (*XUIClientInfo, error) {
+	subID = strings.TrimSpace(subID)
+	if subID == "" {
+		return nil, ErrNotFound
+	}
+	endpoint := fmt.Sprintf("/panel/api/clients/list/paged?search=%s&pageSize=10", url.QueryEscape(subID))
+	var pageResp struct {
+		Filtered int             `json:"filtered"`
+		Items    []XUIClientInfo `json:"items"`
+	}
+	err := c.doRequest("GET", endpoint, nil, &pageResp)
+	if err == nil {
+		for _, item := range pageResp.Items {
+			if item.SubID == subID {
+				fullClient, fullErr := c.GetClientByEmail(item.Email)
+				if fullErr == nil && fullClient != nil {
+					return fullClient, nil
+				}
+				return &item, nil
+			}
+		}
+		return nil, ErrNotFound
+	}
+
+	// Fallback to ListClients if paged endpoint fails or is unsupported
+	clients, listErr := c.ListClients()
+	if listErr != nil {
+		return nil, err
+	}
+	for _, client := range clients {
+		if client.SubID == subID {
+			return &client, nil
+		}
+	}
+	return nil, ErrNotFound
 }

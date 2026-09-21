@@ -13,6 +13,7 @@ const (
 	PlanTypePaid = "paid"
 
 	SubscriptionStatusActive         = "active"
+	SubscriptionStatusExpired        = "expired"
 	SubscriptionStatusCancelled      = "cancelled"
 	SubscriptionStatusDeleted        = "deleted"
 	SubscriptionStatusReconciliation = "reconciliation_required"
@@ -46,6 +47,19 @@ func (u *User) ServiceNameValue() string {
 
 func (u *User) IsApproved() bool {
 	return u != nil && (u.Status == UserStatusActive || u.Status == UserStatusApproved)
+}
+
+func IsValidSubscriptionStatus(status string) bool {
+	switch status {
+	case SubscriptionStatusActive,
+		SubscriptionStatusExpired,
+		SubscriptionStatusCancelled,
+		SubscriptionStatusDeleted,
+		SubscriptionStatusReconciliation:
+		return true
+	default:
+		return false
+	}
 }
 
 type WalletTransaction struct {

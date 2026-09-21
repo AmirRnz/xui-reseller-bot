@@ -95,13 +95,13 @@ type SafeRefundResult struct {
 func safeRefundWalletWithDeps(
 	ctx context.Context,
 	userID int64,
-	amount float64,
+	amount int64,
 	description string,
 	originalOpKey string,
 	refundOpKey string,
 	subID *int64,
 	extra map[string]any,
-	creditFn func(ctx context.Context, userID int64, amount float64, description, operationKey string) error,
+	creditFn func(ctx context.Context, userID int64, amount int64, description, operationKey string) error,
 	persistReconFn func(ctx context.Context, record *db.ReconciliationRecord) error,
 ) SafeRefundResult {
 	if creditFn == nil {
@@ -168,7 +168,7 @@ func safeRefundWalletWithDeps(
 func safeRefundWallet(
 	ctx context.Context,
 	userID int64,
-	amount float64,
+	amount int64,
 	description string,
 	originalOpKey string,
 	refundOpKey string,
@@ -239,12 +239,12 @@ func compensateRemoteCreateDbFailure(
 	client xui.ClientConfig,
 	inboundIDs []int,
 	displayName string,
-	price float64,
+	price int64,
 	operationKey string,
 	dbErr error,
 	deleteFn func(email string) error,
 	verifyFn func(email string) (*xui.XUIClientInfo, error),
-	refundFn func(ctx context.Context, userID int64, amount float64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult,
+	refundFn func(ctx context.Context, userID int64, amount int64, desc, origKey, refKey string, subID *int64, extra map[string]any) SafeRefundResult,
 	persistReconFn func(ctx context.Context, rec *db.ReconciliationRecord) error,
 ) RemoteCreateCompensationResult {
 	if deleteFn == nil {

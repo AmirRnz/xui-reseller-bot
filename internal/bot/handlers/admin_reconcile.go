@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -168,6 +169,9 @@ func HandleAdminReconcileRetry(c telebot.Context) error {
 
 	if err := db.ResetReconciliationForRetry(context.Background(), id); err != nil {
 		log.Printf("[ERROR] Failed to reset reconciliation record %d for retry: %v", id, err)
+		if errors.Is(err, db.ErrReconciliationNotRetryable) {
+			return maybeEditOrSend(c, "این رکورد در وضعیت قابل تلاش مجدد نیست یا قبلا نهایی شده است.")
+		}
 		return maybeEditOrSend(c, "خطا در تنظیم مجدد رکورد برای تلاش دوباره.")
 	}
 
