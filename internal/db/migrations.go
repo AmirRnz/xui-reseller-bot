@@ -60,7 +60,12 @@ CREATE INDEX IF NOT EXISTS idx_purchase_quotes_key ON purchase_quotes (quote_key
 
 ALTER TABLE purchase_requests
     ADD COLUMN IF NOT EXISTS quote_id BIGINT REFERENCES purchase_quotes(id) ON DELETE SET NULL,
-    ADD COLUMN IF NOT EXISTS price_toman BIGINT;
+    ADD COLUMN IF NOT EXISTS price_toman BIGINT,
+    ADD COLUMN IF NOT EXISTS operation_key TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_requests_operation_key_uq
+    ON purchase_requests (operation_key)
+    WHERE operation_key IS NOT NULL;
 
 UPDATE purchase_requests SET price_toman = ROUND(price) WHERE price_toman IS NULL AND price IS NOT NULL;
 
@@ -114,6 +119,12 @@ func runMigrations(ctx context.Context) error {
 	if Pool == nil {
 		return fmt.Errorf("database pool is not initialized")
 	}
+
+	// Serialize concurrent migration runs during parallel testing
+	_, _ = Pool.Exec(ctx, `SELECT pg_advisory_lock(742948214)`)
+	defer func() {
+		_, _ = Pool.Exec(ctx, `SELECT pg_advisory_unlock(742948214)`)
+	}()
 
 	_, err := Pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (

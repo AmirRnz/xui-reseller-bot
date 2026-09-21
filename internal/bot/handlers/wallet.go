@@ -299,13 +299,13 @@ func ProcessTopupApprovalAmount(c telebot.Context, amountText string) error {
 		return c.Send("فرآیند تایید شارژ فعالی وجود ندارد.")
 	}
 	reqID, _ := parseInt64(fmt.Sprintf("%v", state.Data["req_id"]))
-	amount, err := parseFloat(amountText)
+	amount, err := parseInt64(amountText)
 	if err != nil || amount <= 0 {
 		return c.Send("مبلغ نامعتبر است. یک عدد مثبت وارد کنید:")
 	}
 	minAmountStr, _ := db.GetSetting(context.Background(), "min_topup_amount")
-	if minAmount, err := strconv.ParseFloat(strings.TrimSpace(minAmountStr), 64); err == nil && minAmount > 0 && amount < minAmount {
-		return c.Send(fmt.Sprintf("مبلغ وارد شده کمتر از حداقل شارژ مجاز %.0f است.", minAmount))
+	if minAmount, err := strconv.ParseInt(strings.TrimSpace(minAmountStr), 10, 64); err == nil && minAmount > 0 && amount < minAmount {
+		return c.Send(fmt.Sprintf("مبلغ وارد شده کمتر از حداقل شارژ مجاز %s است.", persian.FormatMoney(minAmount)))
 	}
 
 	req, err := db.ApproveTopupRequest(context.Background(), reqID, admin.TelegramID, amount)
@@ -316,9 +316,9 @@ func ProcessTopupApprovalAmount(c telebot.Context, amountText string) error {
 
 	target, _ := db.GetUserByID(context.Background(), req.UserID)
 	if target != nil {
-		_, _ = bot.Bot.Send(&telebot.User{ID: target.TelegramID}, fmt.Sprintf("کیف پول شما با موفقیت به مبلغ %.0f شارژ شد.", amount))
+		_, _ = bot.Bot.Send(&telebot.User{ID: target.TelegramID}, fmt.Sprintf("کیف پول شما با موفقیت به مبلغ %s شارژ شد.", persian.FormatMoney(amount)))
 	}
-	_ = c.Send(fmt.Sprintf("✅ درخواست شارژ شماره #%d با مبلغ %.0f تایید شد.", reqID, amount))
+	_ = c.Send(fmt.Sprintf("✅ درخواست شارژ شماره #%d با مبلغ %s تایید شد.", reqID, persian.FormatMoney(amount)))
 	return HandleAdminMenu(c)
 }
 

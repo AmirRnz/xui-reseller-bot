@@ -270,6 +270,7 @@ CREATE TABLE IF NOT EXISTS purchase_requests (
     telegram_file_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
     provisioning_status TEXT NOT NULL DEFAULT 'pending',
+    operation_key TEXT,
     admin_id BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -289,7 +290,12 @@ CREATE TABLE IF NOT EXISTS refund_requests (
 );
 
 ALTER TABLE IF EXISTS purchase_requests
-    ADD COLUMN IF NOT EXISTS provisioning_status TEXT NOT NULL DEFAULT 'pending';
+    ADD COLUMN IF NOT EXISTS provisioning_status TEXT NOT NULL DEFAULT 'pending',
+    ADD COLUMN IF NOT EXISTS operation_key TEXT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_requests_operation_key_uq
+    ON purchase_requests (operation_key)
+    WHERE operation_key IS NOT NULL;
 
 ALTER TABLE IF EXISTS refund_requests
     ADD COLUMN IF NOT EXISTS operation_key TEXT;

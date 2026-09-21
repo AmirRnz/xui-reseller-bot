@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -42,12 +41,11 @@ func GetTopupRequestByID(ctx context.Context, id int64) (*TopupRequest, error) {
 	return r, nil
 }
 
-func ApproveTopupRequest(ctx context.Context, id int64, adminID int64, amount float64) (*TopupRequest, error) {
+func ApproveTopupRequest(ctx context.Context, id int64, adminID int64, amount int64) (*TopupRequest, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
-	amountInt := int64(math.Round(amount))
-	if amountInt <= 0 {
+	if amount <= 0 {
 		return nil, errors.New("amount must be positive")
 	}
 
@@ -63,12 +61,12 @@ func ApproveTopupRequest(ctx context.Context, id int64, adminID int64, amount fl
 		SET status = 'approved', amount = $1, admin_id = $2, updated_at = NOW()
 		WHERE id = $3 AND status = 'pending'
 		RETURNING id, user_id, telegram_file_id, status, amount, admin_id, created_at, updated_at
-	`, amountInt, adminID, id).Scan(&r.ID, &r.UserID, &r.TelegramFileID, &r.Status, &r.Amount, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+	`, amount, adminID, id).Scan(&r.ID, &r.UserID, &r.TelegramFileID, &r.Status, &r.Amount, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 
-	tag, err := tx.Exec(ctx, `UPDATE bot_users SET wallet_balance = wallet_balance + $1, updated_at = NOW() WHERE id = $2`, amountInt, r.UserID)
+	tag, err := tx.Exec(ctx, `UPDATE bot_users SET wallet_balance = wallet_balance + $1, updated_at = NOW() WHERE id = $2`, amount, r.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +78,7 @@ func ApproveTopupRequest(ctx context.Context, id int64, adminID int64, amount fl
 		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id, operation_key)
 		VALUES ($1, $2, 'credit', 'completed', 'top-up approved', 'topup_request', $3, $4)
 		ON CONFLICT (operation_key) DO NOTHING
-	`, r.UserID, amountInt, r.ID, fmt.Sprintf("topup_approval:%d", r.ID))
+	`, r.UserID, amount, r.ID, fmt.Sprintf("topup_approval:%d", r.ID))
 	if err != nil {
 		return nil, err
 	}

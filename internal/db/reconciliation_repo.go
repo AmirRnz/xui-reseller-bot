@@ -133,6 +133,17 @@ func ClaimPendingReconciliationRecords(ctx context.Context, lockedBy string, lim
 	return records, rows.Err()
 }
 
+const (
+	ReconciliationStatusPending          = "pending"
+	ReconciliationStatusPendingRefund    = "pending_refund"
+	ReconciliationStatusRequired         = "reconciliation_required"
+	ReconciliationStatusManualReview     = "manual_review"
+	ReconciliationStatusResolvedVerified = "resolved_verified"
+	ReconciliationStatusManuallyClosed   = "manually_closed"
+	ReconciliationStatusManualWaiver     = "manual_waiver"
+	ReconciliationStatusSuperseded       = "superseded"
+)
+
 func ResolveReconciliationRecord(ctx context.Context, id int64, resolution string) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
@@ -142,9 +153,41 @@ func ResolveReconciliationRecord(ctx context.Context, id int64, resolution strin
 	}
 	_, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'resolved', resolution = $1, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		SET status = 'resolved_verified', resolution = $1, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
 		WHERE id = $2
 	`, resolution, id)
+	return err
+}
+
+func ManuallyCloseReconciliationRecord(ctx context.Context, id int64, adminID int64, reason string) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return errors.New("database pool is not initialized")
+	}
+	resolution := fmt.Sprintf("manually closed by admin %d: %s", adminID, reason)
+	_, err := Pool.Exec(ctx, `
+		UPDATE reconciliation_records
+		SET status = 'manually_closed', manual_review_reason = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		WHERE id = $3
+	`, reason, resolution, id)
+	return err
+}
+
+func ManuallyWaiveReconciliationRecord(ctx context.Context, id int64, adminID int64, reason string) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return errors.New("database pool is not initialized")
+	}
+	resolution := fmt.Sprintf("manually waived by admin %d: %s", adminID, reason)
+	_, err := Pool.Exec(ctx, `
+		UPDATE reconciliation_records
+		SET status = 'manual_waiver', manual_review_reason = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW()
+		WHERE id = $3
+	`, reason, resolution, id)
 	return err
 }
 

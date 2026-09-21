@@ -409,7 +409,9 @@ func setupE2E(t *testing.T) (*TestEnv, func()) {
 
 	// Load config
 	if err := config.Load("../../config.yaml"); err != nil {
-		t.Fatalf("Failed to load config: %v", err)
+		if errEx := config.Load("../../config.example.yaml"); errEx != nil {
+			t.Fatalf("Failed to load config: %v (example: %v)", err, errEx)
+		}
 	}
 
 	// Setup mock servers

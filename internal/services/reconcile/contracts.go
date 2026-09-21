@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"xui-reseller-bot/internal/db"
 )
 
 // Supported reconciliation kinds
@@ -19,6 +21,18 @@ const (
 	KindDirectPaymentProvisioningRetry   = "direct_payment_provisioning_retry"
 	KindSubscriptionRemoteMissing        = "subscription_remote_missing"
 )
+
+func toMap(v any) map[string]any {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return map[string]any{}
+	}
+	var res map[string]any
+	if err := json.Unmarshal(b, &res); err != nil {
+		return map[string]any{}
+	}
+	return res
+}
 
 // PendingRefundPayload specifies the strict contract for pending wallet refunds.
 type PendingRefundPayload struct {
@@ -42,12 +56,17 @@ func (p *PendingRefundPayload) Validate() error {
 	return nil
 }
 
+func (p *PendingRefundPayload) ToMap() map[string]any {
+	return toMap(p)
+}
+
 // PurchaseProvisioningPayload defines the contract for resolving uncertain purchases or remote-create DB failures.
 type PurchaseProvisioningPayload struct {
 	UserID             int64  `json:"user_id"`
 	PurchaseRequestID  *int64 `json:"purchase_request_id,omitempty"`
 	QuoteID            *int64 `json:"quote_id,omitempty"`
 	OperationKey       string `json:"operation_key"`
+	DebitOperationKey  string `json:"debit_operation_key,omitempty"`
 	Email              string `json:"email"`
 	ExpectedUUID       string `json:"expected_uuid,omitempty"`
 	ExpectedSubID      string `json:"expected_sub_id,omitempty"`
@@ -72,6 +91,10 @@ func (p *PurchaseProvisioningPayload) Validate() error {
 		return errors.New("operation_key is required")
 	}
 	return nil
+}
+
+func (p *PurchaseProvisioningPayload) ToMap() map[string]any {
+	return toMap(p)
 }
 
 // SubscriptionUpdateDbFailedPayload defines the contract for reconciling mutations where XUI state was changed but DB update was uncertain.
@@ -100,6 +123,10 @@ func (p *SubscriptionUpdateDbFailedPayload) Validate() error {
 	return nil
 }
 
+func (p *SubscriptionUpdateDbFailedPayload) ToMap() map[string]any {
+	return toMap(p)
+}
+
 // SubscriptionDeletePayload defines the contract for uncertain deletion or cancellation.
 type SubscriptionDeletePayload struct {
 	SubscriptionID     *int64 `json:"subscription_id,omitempty"`
@@ -118,6 +145,10 @@ func (p *SubscriptionDeletePayload) Validate() error {
 		return errors.New("user_id is required when refund_amount is greater than 0")
 	}
 	return nil
+}
+
+func (p *SubscriptionDeletePayload) ToMap() map[string]any {
+	return toMap(p)
 }
 
 // DirectPaymentProvisioningPayload defines the contract for direct payment provisioning retries.
@@ -147,6 +178,136 @@ func (p *DirectPaymentProvisioningPayload) Validate() error {
 		return errors.New("client_email is required")
 	}
 	return nil
+}
+
+func (p *DirectPaymentProvisioningPayload) ToMap() map[string]any {
+	return toMap(p)
+}
+
+// SubscriptionRemoteMissingPayload defines the contract for when a subscription is absent on the panel.
+type SubscriptionRemoteMissingPayload struct {
+	SubscriptionID int64  `json:"subscription_id"`
+	UserID         int64  `json:"user_id"`
+	ClientEmail    string `json:"client_email"`
+	Reason         string `json:"reason,omitempty"`
+}
+
+func (p *SubscriptionRemoteMissingPayload) Validate() error {
+	if p.SubscriptionID <= 0 {
+		return errors.New("subscription_id must be greater than 0")
+	}
+	if strings.TrimSpace(p.ClientEmail) == "" {
+		return errors.New("client_email is required")
+	}
+	return nil
+}
+
+func (p *SubscriptionRemoteMissingPayload) ToMap() map[string]any {
+	return toMap(p)
+}
+
+// Typed Constructors for creating ReconciliationRecord instances
+
+func NewPendingRefundRecord(userID int64, subID *int64, amount int64, operationKey, description, reason string) *db.ReconciliationRecord {
+	p := &PendingRefundPayload{
+		UserID:       userID,
+		Amount:       amount,
+		OperationKey: operationKey,
+		Description:  description,
+		Reason:       reason,
+	}
+	return &db.ReconciliationRecord{
+		OperationKey:   operationKey,
+		Kind:           KindPendingRefund,
+		UserID:         &userID,
+		SubscriptionID: subID,
+		DesiredState:   p.ToMap(),
+		Status:         "pending_refund",
+	}
+}
+
+func NewPurchaseProvisioningRecord(p *PurchaseProvisioningPayload) *db.ReconciliationRecord {
+	opKey := p.OperationKey
+	if !strings.HasSuffix(opKey, ":provisioning") && !strings.Contains(opKey, "prov") {
+		opKey = opKey + ":provisioning"
+	}
+	return &db.ReconciliationRecord{
+		OperationKey:      opKey,
+		Kind:              KindPurchaseProvisioningUnknown,
+		UserID:            &p.UserID,
+		PurchaseRequestID: p.PurchaseRequestID,
+		DesiredState:      p.ToMap(),
+		ObservedState:     map[string]any{"outcome": "unknown"},
+		Status:            "pending",
+	}
+}
+
+func NewSubscriptionUpdateRecord(p *SubscriptionUpdateDbFailedPayload) *db.ReconciliationRecord {
+	subID := p.SubscriptionID
+	return &db.ReconciliationRecord{
+		OperationKey:   fmt.Sprintf("drift:db_failed:%d", p.SubscriptionID),
+		Kind:           KindSubscriptionUpdateDbFailed,
+		UserID:         &p.UserID,
+		SubscriptionID: &subID,
+		DesiredState:   p.ToMap(),
+		Status:         "pending",
+	}
+}
+
+func NewSubscriptionDeleteRecord(p *SubscriptionDeletePayload) *db.ReconciliationRecord {
+	opKey := p.RefundOperationKey
+	if opKey == "" {
+		if p.SubscriptionID != nil {
+			opKey = fmt.Sprintf("sub:delete:%d", *p.SubscriptionID)
+		} else {
+			opKey = fmt.Sprintf("sub:delete:%s", p.ClientEmail)
+		}
+	}
+	return &db.ReconciliationRecord{
+		OperationKey:   opKey,
+		Kind:           KindSubscriptionDeleteUnknown,
+		UserID:         p.UserID,
+		SubscriptionID: p.SubscriptionID,
+		DesiredState:   p.ToMap(),
+		ObservedState:  map[string]any{"outcome": "unknown"},
+		Status:         "pending",
+	}
+}
+
+func NewDirectPaymentProvisioningRecord(p *DirectPaymentProvisioningPayload) *db.ReconciliationRecord {
+	reqID := p.PurchaseRequestID
+	opKey := p.OperationKey
+	if opKey == "" {
+		opKey = fmt.Sprintf("direct_payment:%d:provisioning", reqID)
+	}
+	return &db.ReconciliationRecord{
+		OperationKey:      opKey,
+		Kind:              KindDirectPaymentProvisioningRetry,
+		UserID:            &p.UserID,
+		PurchaseRequestID: &reqID,
+		DesiredState:      p.ToMap(),
+		ObservedState:     map[string]any{"outcome": "activation_failed"},
+		Status:            "pending",
+	}
+}
+
+func NewSubscriptionRemoteMissingRecord(subscriptionID int64, userID int64, email string, reason string) *db.ReconciliationRecord {
+	p := &SubscriptionRemoteMissingPayload{
+		SubscriptionID: subscriptionID,
+		UserID:         userID,
+		ClientEmail:    email,
+		Reason:         reason,
+	}
+	return &db.ReconciliationRecord{
+		OperationKey:   fmt.Sprintf("drift:missing:%d", subscriptionID),
+		Kind:           KindSubscriptionRemoteMissing,
+		UserID:         &userID,
+		SubscriptionID: &subscriptionID,
+		DesiredState:   p.ToMap(),
+		ObservedState:  map[string]any{"status": "not_found"},
+		Status:         "pending",
+		ErrorMessage:   reason,
+	}
 }
 
 // Helper to coerce an untyped value from a map into an int64 safely.
@@ -256,6 +417,10 @@ func DecodePurchaseProvisioning(raw map[string]any, fallbackUserID *int64, fallb
 	if p.OperationKey == "" {
 		p.OperationKey = fallbackOpKey
 	}
+	p.DebitOperationKey = coerceString(raw["debit_operation_key"])
+	if p.DebitOperationKey == "" {
+		p.DebitOperationKey = p.OperationKey
+	}
 
 	p.Email = coerceString(raw["email"])
 	if p.Email == "" {
@@ -268,6 +433,9 @@ func DecodePurchaseProvisioning(raw map[string]any, fallbackUserID *int64, fallb
 	}
 	if p.ExpectedUUID == "" {
 		p.ExpectedUUID = coerceString(raw["client_uuid"])
+	}
+	if p.ExpectedUUID == "" {
+		p.ExpectedUUID = coerceString(raw["client_id"])
 	}
 
 	p.ExpectedSubID = coerceString(raw["expected_sub_id"])
@@ -375,11 +543,20 @@ func DecodeSubscriptionUpdate(raw map[string]any, fallbackSubID *int64) (*Subscr
 	if v, ok := coerceInt64(raw["desired_ip_limit"]); ok {
 		ip := int(v)
 		p.DesiredIPLimit = &ip
+	} else if v, ok := coerceInt64(raw["ip_limit"]); ok {
+		ip := int(v)
+		p.DesiredIPLimit = &ip
 	}
+
 	if v, ok := coerceInt64(raw["desired_expire_time"]); ok {
 		p.DesiredExpireTime = &v
+	} else if v, ok := coerceInt64(raw["expire_time"]); ok {
+		p.DesiredExpireTime = &v
 	}
+
 	if v, ok := raw["desired_is_active"].(bool); ok {
+		p.DesiredIsActive = &v
+	} else if v, ok := raw["is_active"].(bool); ok {
 		p.DesiredIsActive = &v
 	}
 
@@ -395,6 +572,108 @@ func DecodeSubscriptionUpdate(raw map[string]any, fallbackSubID *int64) (*Subscr
 
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid subscription update payload: %w", err)
+	}
+	return p, nil
+}
+
+// DecodeDirectPaymentProvisioning decodes raw desired_state into DirectPaymentProvisioningPayload.
+func DecodeDirectPaymentProvisioning(raw map[string]any, fallbackReqID *int64, fallbackUserID *int64, fallbackOpKey string) (*DirectPaymentProvisioningPayload, error) {
+	if raw == nil {
+		raw = make(map[string]any)
+	}
+	p := &DirectPaymentProvisioningPayload{}
+
+	if reqID, ok := coerceInt64(raw["purchase_request_id"]); ok && reqID > 0 {
+		p.PurchaseRequestID = reqID
+	} else if fallbackReqID != nil && *fallbackReqID > 0 {
+		p.PurchaseRequestID = *fallbackReqID
+	}
+
+	if uid, ok := coerceInt64(raw["user_id"]); ok && uid > 0 {
+		p.UserID = uid
+	} else if fallbackUserID != nil && *fallbackUserID > 0 {
+		p.UserID = *fallbackUserID
+	}
+
+	if qID, ok := coerceInt64(raw["quote_id"]); ok && qID > 0 {
+		p.QuoteID = &qID
+	}
+
+	p.OperationKey = coerceString(raw["operation_key"])
+	if p.OperationKey == "" {
+		p.OperationKey = fallbackOpKey
+	}
+
+	p.ClientEmail = coerceString(raw["client_email"])
+	if p.ClientEmail == "" {
+		p.ClientEmail = coerceString(raw["email"])
+	}
+
+	p.ExpectedUUID = coerceString(raw["expected_uuid"])
+	if p.ExpectedUUID == "" {
+		p.ExpectedUUID = coerceString(raw["uuid"])
+	}
+	if p.ExpectedUUID == "" {
+		p.ExpectedUUID = coerceString(raw["client_uuid"])
+	}
+
+	p.ExpectedSubID = coerceString(raw["expected_sub_id"])
+	if p.ExpectedSubID == "" {
+		p.ExpectedSubID = coerceString(raw["sub_id"])
+	}
+
+	if planIDVal, ok := coerceInt64(raw["plan_id"]); ok {
+		id := int(planIDVal)
+		p.PlanID = &id
+	}
+
+	if months, ok := coerceInt64(raw["months"]); ok {
+		p.Months = int(months)
+	}
+	if ipLimit, ok := coerceInt64(raw["ip_limit"]); ok {
+		p.IPLimit = int(ipLimit)
+	}
+	if dataGB, ok := coerceInt64(raw["data_gb"]); ok {
+		p.DataGB = int(dataGB)
+	}
+	p.CustomName = coerceString(raw["custom_name"])
+	if p.CustomName == "" {
+		p.CustomName = coerceString(raw["display_name"])
+	}
+
+	if err := p.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid direct payment provisioning payload: %w", err)
+	}
+	return p, nil
+}
+
+// DecodeSubscriptionRemoteMissing decodes raw desired_state into SubscriptionRemoteMissingPayload.
+func DecodeSubscriptionRemoteMissing(raw map[string]any, fallbackSubID *int64, fallbackUserID *int64) (*SubscriptionRemoteMissingPayload, error) {
+	if raw == nil {
+		raw = make(map[string]any)
+	}
+	p := &SubscriptionRemoteMissingPayload{}
+
+	if subID, ok := coerceInt64(raw["subscription_id"]); ok && subID > 0 {
+		p.SubscriptionID = subID
+	} else if fallbackSubID != nil && *fallbackSubID > 0 {
+		p.SubscriptionID = *fallbackSubID
+	}
+
+	if uid, ok := coerceInt64(raw["user_id"]); ok && uid > 0 {
+		p.UserID = uid
+	} else if fallbackUserID != nil && *fallbackUserID > 0 {
+		p.UserID = *fallbackUserID
+	}
+
+	p.ClientEmail = coerceString(raw["client_email"])
+	if p.ClientEmail == "" {
+		p.ClientEmail = coerceString(raw["email"])
+	}
+	p.Reason = coerceString(raw["reason"])
+
+	if err := p.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid subscription remote missing payload: %w", err)
 	}
 	return p, nil
 }

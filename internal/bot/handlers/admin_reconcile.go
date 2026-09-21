@@ -248,9 +248,9 @@ func ProcessAdminReconcileCloseReason(c telebot.Context, text string) error {
 
 	bot.FSM.ClearState(user.TelegramID)
 
-	resolution := fmt.Sprintf("manually closed by admin %d (%s): %s", user.TelegramID, user.Username, reason)
-	if err := db.ResolveReconciliationRecord(context.Background(), recordID, resolution); err != nil {
-		log.Printf("[ERROR] Failed to resolve reconciliation record %d: %v", recordID, err)
+	reasonWithUser := fmt.Sprintf("(%s): %s", user.Username, reason)
+	if err := db.ManuallyCloseReconciliationRecord(context.Background(), recordID, user.TelegramID, reasonWithUser); err != nil {
+		log.Printf("[ERROR] Failed to manually close reconciliation record %d: %v", recordID, err)
 		return c.Send("خطا در بستن دستی رکورد.")
 	}
 
