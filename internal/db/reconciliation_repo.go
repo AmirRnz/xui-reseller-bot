@@ -118,7 +118,7 @@ func ClaimPendingReconciliationRecords(ctx context.Context, lockedBy string, lim
 		WITH claimable AS (
 			SELECT id
 			FROM reconciliation_records
-			WHERE status IN ('pending', 'pending_refund', 'reconciliation_required')
+			WHERE status IN ('pending', 'pending_refund', 'reconciliation_required', 'retryable')
 			  AND (next_attempt_at <= NOW() OR next_attempt_at IS NULL)
 			  AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL '5 minutes')
 			ORDER BY next_attempt_at ASC NULLS FIRST, id ASC
@@ -192,7 +192,7 @@ func IsTerminalReconciliationStatus(status string) bool {
 	}
 }
 
-func checkReconciliationRecordTransitionFailure(ctx context.Context, id int64, lockedBy string, expectedStatus string) error {
+func checkReconciliationRecordTransitionFailure(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int) error {
 	current, err := GetReconciliationRecordByID(ctx, id)
 	if err != nil {
 		return err
@@ -209,14 +209,17 @@ func checkReconciliationRecordTransitionFailure(ctx context.Context, id int64, l
 	if lockedBy != "" && (current.LockedBy == nil || *current.LockedBy != lockedBy) {
 		return ErrReconciliationLeaseLost
 	}
+	if expectedVersion != 0 && current.Version != expectedVersion {
+		return ErrReconciliationLeaseLost
+	}
 	return ErrReconciliationTransitionNotAllowed
 }
 
-func ResolveReconciliationRecord(ctx context.Context, id int64, lockedBy string, expectedStatus string, resolution string) error {
-	return ResolveReconciliationRecordWithStatus(ctx, id, lockedBy, expectedStatus, ReconciliationStatusResolvedVerified, resolution)
+func ResolveReconciliationRecord(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int, resolution string) error {
+	return ResolveReconciliationRecordWithStatus(ctx, id, lockedBy, expectedStatus, expectedVersion, ReconciliationStatusResolvedVerified, resolution)
 }
 
-func ResolveReconciliationRecordWithStatus(ctx context.Context, id int64, lockedBy string, expectedStatus string, targetStatus string, resolution string) error {
+func ResolveReconciliationRecordWithStatus(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int, targetStatus string, resolution string) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
@@ -232,14 +235,15 @@ func ResolveReconciliationRecordWithStatus(ctx context.Context, id int64, locked
 		WHERE id = $3
 		  AND ($4 = '' OR locked_by = $4)
 		  AND ($5 = '' OR status = $5)
-		  AND status IN ('pending', 'pending_refund', 'reconciliation_required')
+		  AND ($6 = 0 OR version = $6)
+		  AND status IN ('pending', 'pending_refund', 'reconciliation_required', 'retryable')
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
-	`, targetStatus, resolution, id, lockedBy, expectedStatus)
+	`, targetStatus, resolution, id, lockedBy, expectedStatus, expectedVersion)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus)
+		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus, expectedVersion)
 	}
 	return nil
 }
@@ -262,7 +266,7 @@ func ManuallyCloseReconciliationRecord(ctx context.Context, id int64, adminID in
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return checkReconciliationRecordTransitionFailure(ctx, id, "", "")
+		return checkReconciliationRecordTransitionFailure(ctx, id, "", "", 0)
 	}
 	return nil
 }
@@ -285,12 +289,12 @@ func ManuallyWaiveReconciliationRecord(ctx context.Context, id int64, adminID in
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return checkReconciliationRecordTransitionFailure(ctx, id, "", "")
+		return checkReconciliationRecordTransitionFailure(ctx, id, "", "", 0)
 	}
 	return nil
 }
 
-func FailAndScheduleRetry(ctx context.Context, id int64, lockedBy string, expectedStatus string, errMessage string, retryAfter time.Duration) error {
+func FailAndScheduleRetry(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int, errMessage string, retryAfter time.Duration) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
@@ -300,23 +304,24 @@ func FailAndScheduleRetry(ctx context.Context, id int64, lockedBy string, expect
 	intervalStr := fmt.Sprintf("%d seconds", int(retryAfter.Seconds()))
 	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET error_message = $1, next_attempt_at = NOW() + $2::interval, locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
+		SET status = 'retryable', error_message = $1, next_attempt_at = NOW() + $2::interval, locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
 		WHERE id = $3
 		  AND ($4 = '' OR locked_by = $4)
 		  AND ($5 = '' OR status = $5)
-		  AND status IN ('pending', 'pending_refund', 'reconciliation_required')
+		  AND ($6 = 0 OR version = $6)
+		  AND status IN ('pending', 'pending_refund', 'reconciliation_required', 'retryable')
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
-	`, errMessage, intervalStr, id, lockedBy, expectedStatus)
+	`, errMessage, intervalStr, id, lockedBy, expectedStatus, expectedVersion)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus)
+		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus, expectedVersion)
 	}
 	return nil
 }
 
-func MarkReconciliationManualReview(ctx context.Context, id int64, lockedBy string, expectedStatus string, reason string) error {
+func MarkReconciliationManualReview(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int, reason string) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
@@ -329,19 +334,20 @@ func MarkReconciliationManualReview(ctx context.Context, id int64, lockedBy stri
 		WHERE id = $2
 		  AND ($3 = '' OR locked_by = $3)
 		  AND ($4 = '' OR status = $4)
+		  AND ($5 = 0 OR version = $5)
 		  AND status IN ('pending', 'pending_refund', 'reconciliation_required', 'retryable')
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
-	`, reason, id, lockedBy, expectedStatus)
+	`, reason, id, lockedBy, expectedStatus, expectedVersion)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus)
+		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus, expectedVersion)
 	}
 	return nil
 }
 
-func FailReconciliationTerminal(ctx context.Context, id int64, lockedBy string, expectedStatus string, reason string) error {
+func FailReconciliationTerminal(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int, reason string) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
@@ -354,14 +360,15 @@ func FailReconciliationTerminal(ctx context.Context, id int64, lockedBy string, 
 		WHERE id = $2
 		  AND ($3 = '' OR locked_by = $3)
 		  AND ($4 = '' OR status = $4)
+		  AND ($5 = 0 OR version = $5)
 		  AND status IN ('pending', 'pending_refund', 'reconciliation_required', 'manual_review', 'retryable')
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
-	`, reason, id, lockedBy, expectedStatus)
+	`, reason, id, lockedBy, expectedStatus, expectedVersion)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus)
+		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus, expectedVersion)
 	}
 	return nil
 }
@@ -377,11 +384,11 @@ func GetReconciliationStats(ctx context.Context) (*ReconciliationStats, error) {
 	stats := &ReconciliationStats{}
 	row := Pool.QueryRow(ctx, `
 		SELECT
-			COALESCE(COUNT(*) FILTER (WHERE status IN ('pending', 'pending_refund', 'reconciliation_required')), 0) AS pending_count,
+			COALESCE(COUNT(*) FILTER (WHERE status IN ('pending', 'pending_refund', 'reconciliation_required', 'retryable')), 0) AS pending_count,
 			COALESCE(COUNT(*) FILTER (WHERE status = 'pending_refund' OR kind = 'pending_refund'), 0) AS pending_refund_count,
 			COALESCE(COUNT(*) FILTER (WHERE kind LIKE '%provisioning%'), 0) AS provisioning_unknown_count,
 			COALESCE(COUNT(*) FILTER (WHERE status = 'manual_review'), 0) AS manual_review_count,
-			COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) FILTER (WHERE status IN ('pending', 'pending_refund', 'reconciliation_required')), 0)::BIGINT AS oldest_pending_age_seconds
+			COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))) FILTER (WHERE status IN ('pending', 'pending_refund', 'reconciliation_required', 'retryable')), 0)::BIGINT AS oldest_pending_age_seconds
 		FROM reconciliation_records
 	`)
 	err := row.Scan(

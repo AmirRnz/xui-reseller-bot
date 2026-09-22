@@ -240,6 +240,10 @@ func ApproveRefundRequest(ctx context.Context, id int64, adminID int64, approved
 // ApproveRefundRequestAndCredit makes the approval state transition and wallet
 // credit one durable idempotent database operation.
 func ApproveRefundRequestAndCredit(ctx context.Context, id int64, adminID int64, approvedAmount int64) (*RefundRequest, error) {
+	if approvedAmount <= 0 {
+		return nil, errors.New("approvedAmount must be greater than 0")
+	}
+
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 

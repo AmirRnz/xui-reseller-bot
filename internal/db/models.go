@@ -16,6 +16,7 @@ const (
 	PlanTypePaid = "paid"
 
 	SubscriptionStatusActive         = "active"
+	SubscriptionStatusDisabled       = "disabled"
 	SubscriptionStatusExpired        = "expired"
 	SubscriptionStatusCancelled      = "cancelled"
 	SubscriptionStatusDeleted        = "deleted"
@@ -55,6 +56,7 @@ func (u *User) IsApproved() bool {
 func IsValidSubscriptionStatus(status string) bool {
 	switch status {
 	case SubscriptionStatusActive,
+		SubscriptionStatusDisabled,
 		SubscriptionStatusExpired,
 		SubscriptionStatusCancelled,
 		SubscriptionStatusDeleted,
@@ -182,6 +184,7 @@ type TopupRequest struct {
 	Status         string    `json:"status"`
 	Amount         *int64    `json:"amount"`
 	AdminID        *int64    `json:"admin_id"`
+	OperationKey   *string   `json:"operation_key,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }

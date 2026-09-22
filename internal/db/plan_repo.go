@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -104,7 +105,7 @@ func GetPaidPlansForUser(ctx context.Context, userID int64, includeDisabled bool
 	defer cancel()
 
 	query := `
-		SELECT p.id, p.name, p.description, p.usage_description, p.inbound_ids, p.base_price, p.base_ip_limit, p.max_ip_limit, p.price_per_extra_ip, p.flow, p.discount_tiers, p.is_global, p.enabled, p.sync_subs, p.is_limited, p.price_per_gb, p.min_data_gb, p.price_per_extra_month, p.created_at, p.updated_at
+		SELECT p.id, p.name, p.description, p.usage_description, p.inbound_ids, p.base_price, p.base_price_toman, p.base_ip_limit, p.max_ip_limit, p.price_per_extra_ip, p.price_per_extra_ip_toman, p.flow, p.discount_tiers, p.is_global, p.enabled, p.sync_subs, p.is_limited, p.price_per_gb, p.price_per_gb_toman, p.min_data_gb, p.price_per_extra_month, p.price_per_extra_month_toman, p.created_at, p.updated_at
 		FROM paid_plans p
 		WHERE ($2 OR p.enabled)
 		  AND (
@@ -142,8 +143,8 @@ func GetPaidPlanByID(ctx context.Context, id int64) (*PaidPlan, error) {
 	defer cancel()
 
 	row := Pool.QueryRow(ctx, `
-		SELECT id, name, description, usage_description, inbound_ids, base_price, base_ip_limit, max_ip_limit, price_per_extra_ip, flow, discount_tiers, is_global, enabled, sync_subs, is_limited, price_per_gb, min_data_gb, price_per_extra_month, created_at, updated_at
-		FROM paid_plans WHERE id = $1
+		SELECT id, name, description, usage_description, inbound_ids, base_price, base_price_toman, base_ip_limit, max_ip_limit, p.price_per_extra_ip, p.price_per_extra_ip_toman, flow, discount_tiers, is_global, enabled, sync_subs, is_limited, price_per_gb, price_per_gb_toman, min_data_gb, price_per_extra_month, price_per_extra_month_toman, created_at, updated_at
+		FROM paid_plans p WHERE id = $1
 	`, id)
 	p, err := scanPaidPlanRow(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -164,13 +165,48 @@ func CreatePaidPlan(ctx context.Context, p *PaidPlan) error {
 	if err != nil {
 		return err
 	}
+
+	if p.BasePriceToman == 0 && p.BasePrice > 0 {
+		p.BasePriceToman = int64(math.Round(p.BasePrice))
+	} else if p.BasePrice == 0 && p.BasePriceToman > 0 {
+		p.BasePrice = float64(p.BasePriceToman)
+	}
+	if p.PricePerExtraIPToman == 0 && p.PricePerExtraIP > 0 {
+		p.PricePerExtraIPToman = int64(math.Round(p.PricePerExtraIP))
+	} else if p.PricePerExtraIP == 0 && p.PricePerExtraIPToman > 0 {
+		p.PricePerExtraIP = float64(p.PricePerExtraIPToman)
+	}
+	if p.PricePerGBToman == 0 && p.PricePerGB > 0 {
+		p.PricePerGBToman = int64(math.Round(p.PricePerGB))
+	} else if p.PricePerGB == 0 && p.PricePerGBToman > 0 {
+		p.PricePerGB = float64(p.PricePerGBToman)
+	}
+	if p.PricePerExtraMonthToman == 0 && p.PricePerExtraMonth > 0 {
+		p.PricePerExtraMonthToman = int64(math.Round(p.PricePerExtraMonth))
+	} else if p.PricePerExtraMonth == 0 && p.PricePerExtraMonthToman > 0 {
+		p.PricePerExtraMonth = float64(p.PricePerExtraMonthToman)
+	}
+
 	query := `
-		INSERT INTO paid_plans (name, description, usage_description, inbound_ids, base_price, base_ip_limit, max_ip_limit, price_per_extra_ip, flow, discount_tiers, is_global, enabled, sync_subs, is_limited, price_per_gb, min_data_gb, price_per_extra_month)
-		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15, $16, $17)
+		INSERT INTO paid_plans (
+			name, description, usage_description, inbound_ids,
+			base_price, base_price_toman, base_ip_limit, max_ip_limit,
+			price_per_extra_ip, price_per_extra_ip_toman, flow, discount_tiers,
+			is_global, enabled, sync_subs, is_limited,
+			price_per_gb, price_per_gb_toman, min_data_gb,
+			price_per_extra_month, price_per_extra_month_toman
+		)
+		VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 		RETURNING id, created_at, updated_at
 	`
-	return Pool.QueryRow(ctx, query, p.Name, p.Description, p.UsageDescription, string(inboundJSON), p.BasePrice, p.BaseIPLimit, p.MaxIPLimit, p.PricePerExtraIP, p.Flow, string(tierJSON), p.IsGlobal, p.Enabled, p.SyncSubs, p.IsLimited, p.PricePerGB, p.MinDataGB, p.PricePerExtraMonth).
-		Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
+	return Pool.QueryRow(ctx, query,
+		p.Name, p.Description, p.UsageDescription, string(inboundJSON),
+		p.BasePrice, p.BasePriceToman, p.BaseIPLimit, p.MaxIPLimit,
+		p.PricePerExtraIP, p.PricePerExtraIPToman, p.Flow, string(tierJSON),
+		p.IsGlobal, p.Enabled, p.SyncSubs, p.IsLimited,
+		p.PricePerGB, p.PricePerGBToman, p.MinDataGB,
+		p.PricePerExtraMonth, p.PricePerExtraMonthToman,
+	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 }
 
 func UpdatePaidPlan(ctx context.Context, p *PaidPlan) error {
@@ -185,13 +221,45 @@ func UpdatePaidPlan(ctx context.Context, p *PaidPlan) error {
 	if err != nil {
 		return err
 	}
+
+	if p.BasePriceToman == 0 && p.BasePrice > 0 {
+		p.BasePriceToman = int64(math.Round(p.BasePrice))
+	} else if p.BasePrice == 0 && p.BasePriceToman > 0 {
+		p.BasePrice = float64(p.BasePriceToman)
+	}
+	if p.PricePerExtraIPToman == 0 && p.PricePerExtraIP > 0 {
+		p.PricePerExtraIPToman = int64(math.Round(p.PricePerExtraIP))
+	} else if p.PricePerExtraIP == 0 && p.PricePerExtraIPToman > 0 {
+		p.PricePerExtraIP = float64(p.PricePerExtraIPToman)
+	}
+	if p.PricePerGBToman == 0 && p.PricePerGB > 0 {
+		p.PricePerGBToman = int64(math.Round(p.PricePerGB))
+	} else if p.PricePerGB == 0 && p.PricePerGBToman > 0 {
+		p.PricePerGB = float64(p.PricePerGBToman)
+	}
+	if p.PricePerExtraMonthToman == 0 && p.PricePerExtraMonth > 0 {
+		p.PricePerExtraMonthToman = int64(math.Round(p.PricePerExtraMonth))
+	} else if p.PricePerExtraMonth == 0 && p.PricePerExtraMonthToman > 0 {
+		p.PricePerExtraMonth = float64(p.PricePerExtraMonthToman)
+	}
+
 	_, err = Pool.Exec(ctx, `
 		UPDATE paid_plans
-		SET name = $1, description = $2, usage_description = $3, inbound_ids = $4::jsonb, base_price = $5, base_ip_limit = $6, max_ip_limit = $7,
-			price_per_extra_ip = $8, flow = $9, discount_tiers = $10::jsonb, is_global = $11, enabled = $12, sync_subs = $13,
-			is_limited = $14, price_per_gb = $15, min_data_gb = $16, price_per_extra_month = $17, updated_at = NOW()
-		WHERE id = $18
-	`, p.Name, p.Description, p.UsageDescription, string(inboundJSON), p.BasePrice, p.BaseIPLimit, p.MaxIPLimit, p.PricePerExtraIP, p.Flow, string(tierJSON), p.IsGlobal, p.Enabled, p.SyncSubs, p.IsLimited, p.PricePerGB, p.MinDataGB, p.PricePerExtraMonth, p.ID)
+		SET name = $1, description = $2, usage_description = $3, inbound_ids = $4::jsonb,
+			base_price = $5, base_price_toman = $6, base_ip_limit = $7, max_ip_limit = $8,
+			price_per_extra_ip = $9, price_per_extra_ip_toman = $10, flow = $11, discount_tiers = $12::jsonb,
+			is_global = $13, enabled = $14, sync_subs = $15,
+			is_limited = $16, price_per_gb = $17, price_per_gb_toman = $18, min_data_gb = $19,
+			price_per_extra_month = $20, price_per_extra_month_toman = $21, updated_at = NOW()
+		WHERE id = $22
+	`,
+		p.Name, p.Description, p.UsageDescription, string(inboundJSON),
+		p.BasePrice, p.BasePriceToman, p.BaseIPLimit, p.MaxIPLimit,
+		p.PricePerExtraIP, p.PricePerExtraIPToman, p.Flow, string(tierJSON),
+		p.IsGlobal, p.Enabled, p.SyncSubs,
+		p.IsLimited, p.PricePerGB, p.PricePerGBToman, p.MinDataGB,
+		p.PricePerExtraMonth, p.PricePerExtraMonthToman, p.ID,
+	)
 	return err
 }
 
@@ -443,7 +511,15 @@ func scanTestPlanRow(row pgx.Row) (*TestPlan, error) {
 func scanPaidPlanRows(rows pgx.Rows) (*PaidPlan, error) {
 	var inboundJSON, tierJSON []byte
 	p := &PaidPlan{}
-	err := rows.Scan(&p.ID, &p.Name, &p.Description, &p.UsageDescription, &inboundJSON, &p.BasePrice, &p.BaseIPLimit, &p.MaxIPLimit, &p.PricePerExtraIP, &p.Flow, &tierJSON, &p.IsGlobal, &p.Enabled, &p.SyncSubs, &p.IsLimited, &p.PricePerGB, &p.MinDataGB, &p.PricePerExtraMonth, &p.CreatedAt, &p.UpdatedAt)
+	err := rows.Scan(
+		&p.ID, &p.Name, &p.Description, &p.UsageDescription, &inboundJSON,
+		&p.BasePrice, &p.BasePriceToman, &p.BaseIPLimit, &p.MaxIPLimit,
+		&p.PricePerExtraIP, &p.PricePerExtraIPToman, &p.Flow, &tierJSON,
+		&p.IsGlobal, &p.Enabled, &p.SyncSubs,
+		&p.IsLimited, &p.PricePerGB, &p.PricePerGBToman, &p.MinDataGB,
+		&p.PricePerExtraMonth, &p.PricePerExtraMonthToman,
+		&p.CreatedAt, &p.UpdatedAt,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -453,13 +529,43 @@ func scanPaidPlanRows(rows pgx.Rows) (*PaidPlan, error) {
 	if len(tierJSON) > 0 {
 		_ = json.Unmarshal(tierJSON, &p.DiscountTiers)
 	}
+
+	if p.BasePriceToman == 0 && p.BasePrice > 0 {
+		p.BasePriceToman = int64(math.Round(p.BasePrice))
+	} else if p.BasePrice == 0 && p.BasePriceToman > 0 {
+		p.BasePrice = float64(p.BasePriceToman)
+	}
+	if p.PricePerExtraIPToman == 0 && p.PricePerExtraIP > 0 {
+		p.PricePerExtraIPToman = int64(math.Round(p.PricePerExtraIP))
+	} else if p.PricePerExtraIP == 0 && p.PricePerExtraIPToman > 0 {
+		p.PricePerExtraIP = float64(p.PricePerExtraIPToman)
+	}
+	if p.PricePerGBToman == 0 && p.PricePerGB > 0 {
+		p.PricePerGBToman = int64(math.Round(p.PricePerGB))
+	} else if p.PricePerGB == 0 && p.PricePerGBToman > 0 {
+		p.PricePerGB = float64(p.PricePerGBToman)
+	}
+	if p.PricePerExtraMonthToman == 0 && p.PricePerExtraMonth > 0 {
+		p.PricePerExtraMonthToman = int64(math.Round(p.PricePerExtraMonth))
+	} else if p.PricePerExtraMonth == 0 && p.PricePerExtraMonthToman > 0 {
+		p.PricePerExtraMonth = float64(p.PricePerExtraMonthToman)
+	}
+
 	return p, nil
 }
 
 func scanPaidPlanRow(row pgx.Row) (*PaidPlan, error) {
 	var inboundJSON, tierJSON []byte
 	p := &PaidPlan{}
-	err := row.Scan(&p.ID, &p.Name, &p.Description, &p.UsageDescription, &inboundJSON, &p.BasePrice, &p.BaseIPLimit, &p.MaxIPLimit, &p.PricePerExtraIP, &p.Flow, &tierJSON, &p.IsGlobal, &p.Enabled, &p.SyncSubs, &p.IsLimited, &p.PricePerGB, &p.MinDataGB, &p.PricePerExtraMonth, &p.CreatedAt, &p.UpdatedAt)
+	err := row.Scan(
+		&p.ID, &p.Name, &p.Description, &p.UsageDescription, &inboundJSON,
+		&p.BasePrice, &p.BasePriceToman, &p.BaseIPLimit, &p.MaxIPLimit,
+		&p.PricePerExtraIP, &p.PricePerExtraIPToman, &p.Flow, &tierJSON,
+		&p.IsGlobal, &p.Enabled, &p.SyncSubs,
+		&p.IsLimited, &p.PricePerGB, &p.PricePerGBToman, &p.MinDataGB,
+		&p.PricePerExtraMonth, &p.PricePerExtraMonthToman,
+		&p.CreatedAt, &p.UpdatedAt,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -469,5 +575,27 @@ func scanPaidPlanRow(row pgx.Row) (*PaidPlan, error) {
 	if len(tierJSON) > 0 {
 		_ = json.Unmarshal(tierJSON, &p.DiscountTiers)
 	}
+
+	if p.BasePriceToman == 0 && p.BasePrice > 0 {
+		p.BasePriceToman = int64(math.Round(p.BasePrice))
+	} else if p.BasePrice == 0 && p.BasePriceToman > 0 {
+		p.BasePrice = float64(p.BasePriceToman)
+	}
+	if p.PricePerExtraIPToman == 0 && p.PricePerExtraIP > 0 {
+		p.PricePerExtraIPToman = int64(math.Round(p.PricePerExtraIP))
+	} else if p.PricePerExtraIP == 0 && p.PricePerExtraIPToman > 0 {
+		p.PricePerExtraIP = float64(p.PricePerExtraIPToman)
+	}
+	if p.PricePerGBToman == 0 && p.PricePerGB > 0 {
+		p.PricePerGBToman = int64(math.Round(p.PricePerGB))
+	} else if p.PricePerGB == 0 && p.PricePerGBToman > 0 {
+		p.PricePerGB = float64(p.PricePerGBToman)
+	}
+	if p.PricePerExtraMonthToman == 0 && p.PricePerExtraMonth > 0 {
+		p.PricePerExtraMonthToman = int64(math.Round(p.PricePerExtraMonth))
+	} else if p.PricePerExtraMonth == 0 && p.PricePerExtraMonthToman > 0 {
+		p.PricePerExtraMonth = float64(p.PricePerExtraMonthToman)
+	}
+
 	return p, nil
 }

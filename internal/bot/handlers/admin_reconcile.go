@@ -191,7 +191,7 @@ func HandleAdminReconcileMarkManual(c telebot.Context) error {
 	}
 
 	reason := fmt.Sprintf("marked for manual review by admin %d", adminID)
-	if err := db.MarkReconciliationManualReview(context.Background(), id, "", "", reason); err != nil {
+	if err := db.MarkReconciliationManualReview(context.Background(), id, "", "", 0, reason); err != nil {
 		log.Printf("[ERROR] Failed to mark reconciliation record %d as manual review: %v", id, err)
 		return maybeEditOrSend(c, "خطا در انتقال رکورد به بازبینی دستی.")
 	}

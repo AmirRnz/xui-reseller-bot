@@ -37,10 +37,6 @@ func main() {
 		log.Fatalf("Migration error: %v", err)
 	}
 
-	if err := db.NormalizeIPLimits(ctx); err != nil {
-		log.Printf("Warning: failed to normalize database IP limits: %v", err)
-	}
-
 	xuiClient, err := xui.NewClient(&cfg.XUI)
 	if err != nil {
 		log.Fatalf("XUI Client initialization error: %v", err)

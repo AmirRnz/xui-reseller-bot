@@ -132,6 +132,9 @@ func showServicesPage(c telebot.Context, page int) error {
 	if user == nil {
 		return c.Send("خطا در بارگذاری حساب کاربری.")
 	}
+	if !user.IsApproved() {
+		return c.Send("برای دسترسی به این بخش، ابتدا باید حساب نمایندگی شما تایید شود.")
+	}
 	subs, err := db.GetManageableSubscriptionsByUserID(context.Background(), user.ID)
 	if err != nil {
 		return c.Send("خطا در بارگذاری اشتراک‌ها.")
@@ -418,18 +421,28 @@ func HandleDeleteSubscriptionConfirm(c telebot.Context) error {
 		return nil
 	}
 
+	if sub.Status == db.SubscriptionStatusCancelled || sub.Status == db.SubscriptionStatusDeleted {
+		return c.Send("این اشتراک قبلاً لغو یا حذف شده است.")
+	}
+
 	var text strings.Builder
 	text.WriteString(fmt.Sprintf("⚠️ **تایید حذف سرویس %s**\n\nآیا از حذف این سرویس اطمینان دارید؟", sub.DisplayName))
 
 	var refundAmount int64 = 0
 	var refundReason = ""
 	if sub.PlanType == db.PlanTypePaid {
-		var quote *pricing.PurchaseQuote
 		if sub.QuoteID != nil {
-			quote, _ = pricing.GetQuoteByID(context.Background(), *sub.QuoteID)
-		}
-		if quote != nil {
-			refundAmount, refundReason = pricing.CalculateRefund(quote, sub, nowUTC())
+			quote, err := pricing.GetQuoteByID(context.Background(), *sub.QuoteID)
+			if err != nil {
+				log.Printf("[ERROR] failed to fetch quote %d for sub %d: %v", *sub.QuoteID, sub.ID, err)
+				return c.Send("خطای موقت در بارگذاری فاکتور خرید. لطفاً دقایقی دیگر تلاش کنید.")
+			}
+			if quote != nil {
+				refundAmount, refundReason = pricing.CalculateRefund(quote, sub, nowUTC())
+			} else {
+				refundAmount = 0
+				refundReason = "فاکتور خرید در سیستم یافت نشد؛ در صورت نیاز پس از حذف توسط مدیریت بررسی می‌شود."
+			}
 		} else {
 			refundAmount = 0
 			refundReason = "سرویس قدیمی فاقد فاکتور سیستمی است؛ استرداد خودکار غیرفعال بوده و در صورت نیاز پس از حذف توسط مدیریت بررسی می‌شود."
@@ -444,8 +457,7 @@ func HandleDeleteSubscriptionConfirm(c telebot.Context) error {
 	}
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_delete_sub_confirm", map[string]interface{}{
-		"sub_id":        fmt.Sprintf("%d", sub.ID),
-		"refund_amount": fmt.Sprintf("%d", refundAmount),
+		"sub_id": fmt.Sprintf("%d", sub.ID),
 	})
 
 	menu := &telebot.ReplyMarkup{}
@@ -467,12 +479,28 @@ func HandleDeleteSubscription(c telebot.Context) error {
 		return c.Send("درخواست حذف معتبر نیست.")
 	}
 	subID, _ := parseInt64(fmt.Sprintf("%v", state.Data["sub_id"]))
-	refundAmountStr := fmt.Sprintf("%v", state.Data["refund_amount"])
-	refundAmount, _ := strconv.ParseInt(refundAmountStr, 10, 64)
 
 	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
 	if err != nil || sub == nil || sub.UserID != user.ID {
 		return c.Send("اشتراک یافت نشد.")
+	}
+	if sub.Status == db.SubscriptionStatusCancelled || sub.Status == db.SubscriptionStatusDeleted {
+		return c.Send("این اشتراک قبلاً لغو یا حذف شده است.")
+	}
+
+	// Revalidate and recalculate refund from durable state
+	var refundAmount int64 = 0
+	if sub.PlanType == db.PlanTypePaid {
+		if sub.QuoteID != nil {
+			quote, err := pricing.GetQuoteByID(context.Background(), *sub.QuoteID)
+			if err != nil {
+				log.Printf("[ERROR] failed to fetch quote %d for sub %d during delete: %v", *sub.QuoteID, sub.ID, err)
+				return c.Send("خطای موقت در بارگذاری فاکتور خرید. لطفاً دقایقی دیگر تلاش کنید.")
+			}
+			if quote != nil {
+				refundAmount, _ = pricing.CalculateRefund(quote, sub, nowUTC())
+			}
+		}
 	}
 
 	// Delete from panel
@@ -692,6 +720,9 @@ func HandleSubscriptionLimitConfirmPrompt(c telebot.Context) error {
 	sub, user, ok := loadOwnedSubscriptionFromPair(c)
 	if !ok {
 		return nil
+	}
+	if sub.PlanType != db.PlanTypePaid {
+		return c.Send("تغییر سقف کاربر همزمان فقط برای سرویس‌های خریداری شده امکان‌پذیر است.")
 	}
 
 	plan, err := paidPlanForSub(sub)
@@ -997,6 +1028,9 @@ func showExtendConfirmation(c telebot.Context, user *db.User, subID int, months 
 	sub, err := db.GetSubscriptionByID(context.Background(), subID)
 	if err != nil || sub == nil || sub.UserID != user.ID {
 		return c.Send("اشتراک یافت نشد.")
+	}
+	if sub.PlanType != db.PlanTypePaid {
+		return c.Send("تمدید فقط برای سرویس‌های خریداری شده امکان‌پذیر است.")
 	}
 	plan, err := paidPlanForSub(sub)
 	if err != nil || plan == nil {

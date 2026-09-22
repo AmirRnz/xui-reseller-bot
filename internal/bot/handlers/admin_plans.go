@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -545,17 +546,19 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 	case "usage_description":
 		draft["usage_description"] = text
 	case "price":
-		val, err := strconv.ParseFloat(text, 64)
+		val, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || val < 0 {
 			return c.Send("قیمت باید عددی مثبت یا صفر باشد. لطفاً قیمت معتبری وارد کنید:")
 		}
-		draft["base_price"] = val
+		draft["base_price_toman"] = val
+		draft["base_price"] = float64(val)
 	case "price_per_gb":
-		val, err := strconv.ParseFloat(text, 64)
+		val, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || val < 0 {
 			return c.Send("قیمت هر گیگابایت باید عددی مثبت یا صفر باشد. لطفاً قیمت معتبری وارد کنید:")
 		}
-		draft["price_per_gb"] = val
+		draft["price_per_gb_toman"] = val
+		draft["price_per_gb"] = float64(val)
 	case "min_data_gb":
 		val, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || val <= 0 {
@@ -563,11 +566,12 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 		}
 		draft["min_data_gb"] = val
 	case "price_per_extra_month":
-		val, err := strconv.ParseFloat(text, 64)
+		val, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || val < 0 {
 			return c.Send("قیمت هر ماه اضافی باید عددی مثبت یا صفر باشد. لطفاً قیمت معتبری وارد کنید:")
 		}
-		draft["price_per_extra_month"] = val
+		draft["price_per_extra_month_toman"] = val
+		draft["price_per_extra_month"] = float64(val)
 	case "ip_limits":
 		textLower := strings.ToLower(strings.TrimSpace(text))
 		if textLower == "0" || textLower == "0-0" || textLower == "unlimited" || textLower == "-" {
@@ -596,11 +600,12 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 		}
 		draft["ip_limit"] = val
 	case "extra_ip":
-		val, err := strconv.ParseFloat(text, 64)
+		val, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || val < 0 {
 			return c.Send("قیمت هر کاربر اضافی باید صفر یا عددی مثبت باشد. مجدداً تلاش کنید:")
 		}
-		draft["price_per_extra_ip"] = val
+		draft["price_per_extra_ip_toman"] = val
+		draft["price_per_extra_ip"] = float64(val)
 	case "flow":
 		if text == "-" {
 			draft["flow"] = ""
@@ -906,25 +911,46 @@ func SaveDraftPlan(c telebot.Context, planType string, draft map[string]interfac
 		minData := draftGetInt64(draft, "min_data_gb")
 		priceExtraMonth := draftGetFloat64(draft, "price_per_extra_month")
 
+		basePriceToman := draftGetInt64(draft, "base_price_toman")
+		if basePriceToman == 0 && basePrice > 0 {
+			basePriceToman = int64(math.Round(basePrice))
+		}
+		extraIPToman := draftGetInt64(draft, "price_per_extra_ip_toman")
+		if extraIPToman == 0 && extraIP > 0 {
+			extraIPToman = int64(math.Round(extraIP))
+		}
+		pricePerGBToman := draftGetInt64(draft, "price_per_gb_toman")
+		if pricePerGBToman == 0 && pricePerGB > 0 {
+			pricePerGBToman = int64(math.Round(pricePerGB))
+		}
+		priceExtraMonthToman := draftGetInt64(draft, "price_per_extra_month_toman")
+		if priceExtraMonthToman == 0 && priceExtraMonth > 0 {
+			priceExtraMonthToman = int64(math.Round(priceExtraMonth))
+		}
+
 		plan := &db.PaidPlan{
-			ID:                 id,
-			Name:               name,
-			Description:        description,
-			UsageDescription:   usageDescription,
-			InboundIDs:         inboundIDs,
-			BasePrice:          basePrice,
-			BaseIPLimit:        baseIP,
-			MaxIPLimit:         maxIP,
-			PricePerExtraIP:    extraIP,
-			Flow:               flow,
-			DiscountTiers:      discounts,
-			IsGlobal:           isGlobal,
-			Enabled:            true,
-			SyncSubs:           draftGetBool(draft, "sync_subs"),
-			IsLimited:          isLimited,
-			PricePerGB:         pricePerGB,
-			MinDataGB:          minData,
-			PricePerExtraMonth: priceExtraMonth,
+			ID:                      id,
+			Name:                    name,
+			Description:             description,
+			UsageDescription:        usageDescription,
+			InboundIDs:              inboundIDs,
+			BasePrice:               basePrice,
+			BasePriceToman:          basePriceToman,
+			BaseIPLimit:             baseIP,
+			MaxIPLimit:              maxIP,
+			PricePerExtraIP:         extraIP,
+			PricePerExtraIPToman:    extraIPToman,
+			Flow:                    flow,
+			DiscountTiers:           discounts,
+			IsGlobal:                isGlobal,
+			Enabled:                 true,
+			SyncSubs:                draftGetBool(draft, "sync_subs"),
+			IsLimited:               isLimited,
+			PricePerGB:              pricePerGB,
+			PricePerGBToman:         pricePerGBToman,
+			MinDataGB:               minData,
+			PricePerExtraMonth:      priceExtraMonth,
+			PricePerExtraMonthToman: priceExtraMonthToman,
 		}
 
 		if id > 0 {
@@ -1656,7 +1682,11 @@ func parseDiscounts(text string) ([]db.DiscountTier, error) {
 		if err != nil || percent < 0 || percent > 100 {
 			return nil, err
 		}
-		tiers = append(tiers, db.DiscountTier{Months: months, Percent: percent})
+		tiers = append(tiers, db.DiscountTier{
+			Months:      months,
+			Percent:     percent,
+			BasisPoints: int64(math.Round(percent * 100)),
+		})
 	}
 	return tiers, nil
 }

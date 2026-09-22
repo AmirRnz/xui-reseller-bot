@@ -1,10 +1,10 @@
 # Current Architecture — `xui-resell-bot`
 
-Updated 2026-09-22 after fixing production blockers, reconciliation CAS & terminal-state protection, durable payment intents, integer pricing, reseller cancellation recovery, and release hardening pass.
+Updated 2026-09-22 after final legacy safety freeze, fixing reconciliation CAS & terminal-state protection, durable payment intents, integer pricing, reseller cancellation recovery, 3x-ui readiness gating, and release hardening pass.
 
 ## Supported 3x-ui pin
 
-**3x-ui panel: `v3.8.5` (stable).** The configured panel reported `currentVersion=3.8.5`, `latestVersion=v3.8.5`, and `updateAvailable=false` from the read-only `GET /panel/api/server/getPanelUpdateInfo` endpoint. The checked-in OpenAPI document describes the API compatibility line as `3.x`.
+**3x-ui panel: `v3.8.5` (stable).** The configured panel reported `currentVersion=3.8.5`, `latestVersion=v3.8.5`, and `updateAvailable=false` from the read-only `GET /panel/api/server/getPanelUpdateInfo` endpoint. The checked-in OpenAPI document describes the API compatibility line as `3.x`. On bot startup, the client verifies panel readiness and version pinning.
 
 ## Persian-Only Presentation Layer
 
@@ -25,9 +25,10 @@ Both bots are Persian-only (`internal/bot/persian`).
 - **Auditable Lifecycle**: The `quote_id` is linked to `purchase_requests.quote_id` and `subscriptions.quote_id`.
 - **Checkout Integrity**: Purchases charge exact stored `quote.FinalPriceToman` rather than recalculating from live plan catalog. Quote equality verification strictly asserts user and plan identity.
 
-## Database Migrations (Version 6)
+## Database Migrations (Version 7)
 
-- **Payment Intents**: `payment_intents` table tracks durable checkout intents (`card_number`, `amount_toman`, `intent_type`, `status`) before presenting bank/card details, ensuring receipt submission survives bot restarts.
+- **Migration 7**: `20260922_07_payment_intent_durable_fields.sql` adds `card_owner`, `created_by`, `pricing_quote_id`, and `metadata` to `payment_intents`.
+- **Payment Intents**: `payment_intents` table tracks durable checkout intents (`card_number`, `card_owner`, `amount_toman`, `intent_type`, `status`, `pricing_quote_id`) before presenting bank/card details, ensuring receipt submission survives bot restarts. Receipt intake fail-closes if no active durable payment intent is present.
 - **Bulk Credit Operations**: `bulk_credit_operations` table tracks atomic bulk credit batches (`operation_key`, `amount_toman`, `recipient_count`, `recipient_user_ids`) with idempotency guards.
 - **Reconciliation CAS & Terminal Protection**: State transition CAS ensures reconciliation records can only transition from active pending/retryable states (`pending`, `pending_refund`, `reconciliation_required`). Updates to terminal records (`resolved`, `resolved_verified`, `superseded`, `failed_terminal`, `manually_closed`, `manual_waiver`) are rejected.
 
@@ -65,14 +66,14 @@ Both bots are Persian-only (`internal/bot/persian`).
   - `internal/bot`: **PASS**
   - `internal/bot/handlers`: **PASS** (100% pass)
   - `internal/bot/persian`: **PASS** (100% pass)
-  - `internal/db`: **PASS** (100% pass including concurrency, migration v6, wallet credit idempotency, and payment intents)
+  - `internal/db`: **PASS** (100% pass including concurrency, migration v7, wallet credit idempotency, and payment intents)
   - `internal/fsm`: **PASS**
   - `internal/services/outbox`: **PASS** (100% pass)
   - `internal/services/pricing`: **PASS** (100% pass including integer pricing and basis points)
   - `internal/services/reconcile`: **PASS** (100% pass including contracts, identity checks, and ProcessOnce integration)
   - `internal/services/sync`: **PASS** (100% pass)
   - `internal/xui`: **PASS** (100% pass including contract tests, ClientPatch, and bounded pagination)
-  - `tests/e2e`: **PASS** (100% pass with JSON mock telegram server and Postgres sequence resets)
+  - `tests/e2e`: **PASS** (100% pass with JSON mock telegram server, Tier 1-4 tests, and Postgres sequence resets)
 - `go vet ./...` — **PASS**, zero diagnostics.
 - `gofmt -l .` — **PASS**, zero unformatted files.
 - `.github/workflows/ci.yml` — Automated CI with PostgreSQL service container running gofmt, go vet, isolated unit/DB/e2e tests with race detection (`go test -v -race -count=1 -p 1 ./...`), and binary compilation.

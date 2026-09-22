@@ -40,6 +40,9 @@ func HandleWalletFlow(c telebot.Context) error {
 	if user == nil {
 		return c.Send("خطا در بارگذاری اطلاعات حساب کاربری.")
 	}
+	if !user.IsApproved() {
+		return c.Send("برای دسترسی به این بخش، ابتدا باید حساب نمایندگی شما تایید شود.")
+	}
 
 	currency, _ := db.GetSetting(context.Background(), "currency_name")
 	if currency == "" {
@@ -66,7 +69,25 @@ func HandleTopupInstructions(c telebot.Context) error {
 	desc, _ := db.GetSetting(context.Background(), "topup_description")
 	minAmount, _ := db.GetSetting(context.Background(), "min_topup_amount")
 
-	bot.FSM.SetState(user.TelegramID, "awaiting_receipt", nil)
+	// P0-1 & P0-2: Create durable topup payment intent before showing card details
+	topupToken := fmt.Sprintf("topup_%d_%d", user.ID, time.Now().UnixNano())
+	intent := &db.PaymentIntent{
+		UserID:      user.ID,
+		IntentToken: topupToken,
+		ActionType:  "topup",
+		Status:      db.IntentStatusAwaitingReceipt,
+	}
+	createdIntent, err := db.CreatePaymentIntent(context.Background(), intent)
+	if err != nil {
+		log.Printf("[INTENT] Failed to create topup payment intent for user %d: %v", user.ID, err)
+		return maybeEditOrSend(c, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.")
+	}
+
+	bot.FSM.SetState(user.TelegramID, "awaiting_receipt", map[string]interface{}{
+		"intent_id":       createdIntent.ID,
+		"operation_token": createdIntent.IntentToken,
+	})
+
 	text := "لطفا پس از واریز مبلغ مورد نظر، تصویر رسید پرداخت (فیش واریزی) خود را در قالب عکس ارسال کنید."
 	if card != "" {
 		text += "\n\nشماره کارت جهت واریز:\n`" + card + "`"
@@ -92,202 +113,189 @@ func HandleReceiptPhoto(c telebot.Context) error {
 	unlock := bot.Locker.Lock(fmt.Sprintf("user_receipt:%d", user.ID))
 	defer unlock()
 
-	state := bot.FSM.GetState(user.TelegramID)
-	var activeIntent *db.PaymentIntent
-	if state == nil {
-		if recovered, err := db.GetLatestActivePaymentIntent(context.Background(), user.ID); err == nil && recovered != nil {
-			activeIntent = recovered
-			stateData := make(map[string]interface{})
-			for k, v := range recovered.ProvisioningSnapshot {
-				stateData[k] = v
-			}
-			stateData["type"] = recovered.ActionType
-			stateData["price"] = fmt.Sprintf("%d", recovered.AmountToman)
-			stateData["price_toman"] = fmt.Sprintf("%d", recovered.AmountToman)
-			if recovered.PlanID != nil {
-				stateData["plan_id"] = fmt.Sprintf("%d", *recovered.PlanID)
-			}
-			if recovered.SubscriptionID != nil {
-				stateData["subscription_id"] = fmt.Sprintf("%d", *recovered.SubscriptionID)
-			}
-			if recovered.QuoteID != nil {
-				stateData["quote_id"] = fmt.Sprintf("%d", *recovered.QuoteID)
-			}
-			stateData["months"] = fmt.Sprintf("%d", recovered.Months)
-			stateData["ip_limit"] = fmt.Sprintf("%d", recovered.IPLimit)
-			stateData["data_gb"] = fmt.Sprintf("%d", recovered.DataGB)
-			stateData["custom_name"] = recovered.DisplayName
-			stateData["email"] = recovered.ClientEmail
-			stateData["operation_token"] = recovered.IntentToken
-			stateData["operation_key"] = operationKeyFromToken("direct_payment", recovered.IntentToken)
-
-			bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", stateData)
-			state = bot.FSM.GetState(user.TelegramID)
-		}
-	}
-	if state == nil {
-		return c.Send("هیچ فرآیند فعالی برای ارسال رسید وجود ندارد. لطفا ابتدا درخواست پرداخت خود را ثبت کنید.")
-	}
-
 	if c.Message() == nil || c.Message().Photo == nil {
 		return c.Send("لطفا رسید پرداخت را به صورت تصویر (عکس) ارسال کنید.")
 	}
 	fileID := c.Message().Photo.FileID
 
-	if state.Step == "awaiting_receipt" {
-		req := &db.TopupRequest{
-			UserID:         user.ID,
-			TelegramFileID: fileID,
-			Status:         "pending",
+	state := bot.FSM.GetState(user.TelegramID)
+	var activeIntent *db.PaymentIntent
+	if state != nil && state.Data != nil {
+		if intentIDVal, ok := state.Data["intent_id"]; ok && intentIDVal != nil {
+			var iID int64
+			switch v := intentIDVal.(type) {
+			case int64:
+				iID = v
+			case int:
+				iID = int64(v)
+			case float64:
+				iID = int64(v)
+			case string:
+				iID, _ = strconv.ParseInt(v, 10, 64)
+			}
+			if iID > 0 {
+				if in, err := db.GetPaymentIntentByID(context.Background(), iID); err == nil && in != nil && in.UserID == user.ID {
+					activeIntent = in
+				}
+			}
 		}
-		if err := db.CreateTopupRequest(context.Background(), req); err != nil {
-			return c.Send("خطا در ثبت درخواست افزایش موجودی.")
+	}
+	if activeIntent == nil {
+		if recovered, err := db.GetLatestActivePaymentIntent(context.Background(), user.ID); err == nil && recovered != nil {
+			activeIntent = recovered
+		}
+	}
+	if activeIntent == nil {
+		return c.Send("هیچ فرآیند فعالی برای ارسال رسید وجود ندارد. لطفا ابتدا درخواست پرداخت خود را ثبت کنید.")
+	}
+
+	// Transactional and idempotent submission (P0-3)
+	if activeIntent.ActionType == "topup" {
+		res, err := db.SubmitReceiptForActiveIntent(context.Background(), activeIntent.ID, user.ID, fileID, nil)
+		if err != nil {
+			log.Printf("[RECEIPT] Failed to submit topup receipt for intent %d: %v", activeIntent.ID, err)
+			return c.Send("خطا در ثبت رسید پرداخت. لطفا مجددا تلاش کنید.")
 		}
 		bot.FSM.ClearState(user.TelegramID)
+		if res.IsDuplicate {
+			_ = c.Send("رسید شما قبلاً دریافت شده است و در انتظار بررسی ادمین می‌باشد.")
+			return showMainMenu(c, user)
+		}
 
 		if walletAdminCfg != nil {
 			for _, adminID := range walletAdminCfg.AdminIDs {
 				menu := &telebot.ReplyMarkup{}
 				menu.Inline(menu.Row(
-					menu.Data("تایید", "admin_approve_topup", fmt.Sprintf("%d", req.ID)),
-					menu.Data("رد", "admin_reject_topup", fmt.Sprintf("%d", req.ID)),
+					menu.Data("تایید", "admin_approve_topup", fmt.Sprintf("%d", res.TopupRequest.ID)),
+					menu.Data("رد", "admin_reject_topup", fmt.Sprintf("%d", res.TopupRequest.ID)),
 				))
-				_, _ = bot.Bot.Send(&telebot.User{ID: adminID}, &telebot.Photo{File: telebot.File{FileID: fileID}, Caption: fmt.Sprintf("درخواست افزایش موجودی کیف پول #%d\nکاربر: @%s\nشناسه تلگرام: %d", req.ID, user.Username, user.TelegramID)}, menu)
+				_, _ = bot.Bot.Send(&telebot.User{ID: adminID}, &telebot.Photo{File: telebot.File{FileID: fileID}, Caption: fmt.Sprintf("درخواست افزایش موجودی کیف پول #%d\nکاربر: @%s\nشناسه تلگرام: %d", res.TopupRequest.ID, user.Username, user.TelegramID)}, menu)
 			}
 		}
 		_ = c.Send("رسید شما دریافت شد. لطفا منتظر بررسی و تایید ادمین بمانید.")
 		return showMainMenu(c, user)
+	}
 
-	} else if state.Step == "awaiting_purchase_receipt" {
-		pType := fmt.Sprintf("%v", state.Data["type"])
-		priceStr := fmt.Sprintf("%v", state.Data["price"])
-		price, _ := strconv.ParseFloat(priceStr, 64)
-
-		var planIDPtr *int64
-		if pidStr, ok := state.Data["plan_id"]; ok && pidStr != "" {
-			pid, _ := parseInt64(fmt.Sprintf("%v", pidStr))
-			planIDPtr = &pid
+	// Purchase flow
+	pType := activeIntent.ActionType
+	if state != nil && state.Data != nil {
+		if tVal, ok := state.Data["type"]; ok && tVal != nil && fmt.Sprintf("%v", tVal) != "" {
+			pType = fmt.Sprintf("%v", tVal)
 		}
+	}
+	priceToman := activeIntent.AmountToman
+	var planIDPtr *int64 = activeIntent.PlanID
+	var subIDPtr *int64 = activeIntent.SubscriptionID
+	var quoteIDPtr *int64 = activeIntent.QuoteID
+	months := activeIntent.Months
+	ipLimit := activeIntent.IPLimit
+	dataGB := activeIntent.DataGB
+	customName := activeIntent.DisplayName
+	email := activeIntent.ClientEmail
 
-		var subIDPtr *int64
-		if sidStr, ok := state.Data["subscription_id"]; ok && sidStr != "" {
-			sid, _ := parseInt64(fmt.Sprintf("%v", sidStr))
-			subIDPtr = &sid
+	if state != nil && state.Data != nil {
+		if pidStr, ok := state.Data["plan_id"]; ok && pidStr != "" && planIDPtr == nil {
+			if pid, err := parseInt64(fmt.Sprintf("%v", pidStr)); err == nil {
+				planIDPtr = &pid
+			}
 		}
-
-		var months int
-		if mStr, ok := state.Data["months"]; ok && mStr != "" {
-			months, _ = strconv.Atoi(fmt.Sprintf("%v", mStr))
+		if sidStr, ok := state.Data["subscription_id"]; ok && sidStr != "" && subIDPtr == nil {
+			if sid, err := parseInt64(fmt.Sprintf("%v", sidStr)); err == nil {
+				subIDPtr = &sid
+			}
 		}
-
-		var ipLimit int
-		if ipStr, ok := state.Data["ip_limit"]; ok && ipStr != "" {
-			ipLimit, _ = strconv.Atoi(fmt.Sprintf("%v", ipStr))
-		}
-
-		var dataGB int
-		if gbStr, ok := state.Data["data_gb"]; ok && gbStr != "" {
-			dataGB, _ = strconv.Atoi(fmt.Sprintf("%v", gbStr))
-		}
-
-		customName := ""
-		if cn, ok := state.Data["custom_name"]; ok {
-			customName = fmt.Sprintf("%v", cn)
-		}
-
-		email := ""
-		if em, ok := state.Data["email"]; ok {
-			email = fmt.Sprintf("%v", em)
-		}
-
-		operationKey := ""
-		if op, ok := state.Data["operation_key"]; ok {
-			operationKey = strings.TrimSpace(fmt.Sprintf("%v", op))
-		}
-
-		var quoteIDPtr *int64
-		if qIDStr, ok := state.Data["quote_id"]; ok && qIDStr != "" {
+		if qIDStr, ok := state.Data["quote_id"]; ok && qIDStr != "" && quoteIDPtr == nil {
 			if qID, err := strconv.ParseInt(fmt.Sprintf("%v", qIDStr), 10, 64); err == nil && qID > 0 {
 				quoteIDPtr = &qID
 			}
 		}
-		var priceTomanPtr *int64
 		if ptStr, ok := state.Data["price_toman"]; ok && ptStr != "" {
 			if pt, err := strconv.ParseInt(fmt.Sprintf("%v", ptStr), 10, 64); err == nil && pt > 0 {
-				priceTomanPtr = &pt
+				priceToman = pt
 			}
 		}
-		if priceTomanPtr == nil && price > 0 {
-			pt := int64(price)
-			priceTomanPtr = &pt
+		if mStr, ok := state.Data["months"]; ok && mStr != "" && months == 0 {
+			months, _ = strconv.Atoi(fmt.Sprintf("%v", mStr))
 		}
-
-		req := &db.PurchaseRequest{
-			UserID:         user.ID,
-			Type:           pType,
-			PlanID:         planIDPtr,
-			SubscriptionID: subIDPtr,
-			Price:          price,
-			PriceToman:     priceTomanPtr,
-			QuoteID:        quoteIDPtr,
-			Months:         months,
-			IPLimit:        ipLimit,
-			DataGB:         dataGB,
-			CustomName:     customName,
-			ClientEmail:    email,
-			TelegramFileID: fileID,
-			Status:         "pending",
-			OperationKey:   operationKey,
+		if ipStr, ok := state.Data["ip_limit"]; ok && ipStr != "" && ipLimit == 0 {
+			ipLimit, _ = strconv.Atoi(fmt.Sprintf("%v", ipStr))
 		}
-
-		if err := db.CreatePurchaseRequest(context.Background(), req); err != nil {
-			log.Printf("Failed to create purchase request: %v", err)
-			return c.Send("خطا در ثبت درخواست خرید مستقیم.")
+		if gbStr, ok := state.Data["data_gb"]; ok && gbStr != "" && dataGB == 0 {
+			dataGB, _ = strconv.Atoi(fmt.Sprintf("%v", gbStr))
 		}
-		if activeIntent != nil {
-			_ = db.MarkPaymentIntentStatus(context.Background(), activeIntent.ID, db.IntentStatusReceiptSubmitted)
-		} else if opToken, ok := state.Data["operation_token"]; ok && opToken != nil && opToken != "" {
-			if intentByToken, err := db.GetPaymentIntentByToken(context.Background(), fmt.Sprintf("%v", opToken)); err == nil && intentByToken != nil {
-				_ = db.MarkPaymentIntentStatus(context.Background(), intentByToken.ID, db.IntentStatusReceiptSubmitted)
-			}
+		if cn, ok := state.Data["custom_name"]; ok && customName == "" {
+			customName = fmt.Sprintf("%v", cn)
 		}
-		bot.FSM.ClearState(user.TelegramID)
-
-		currency, _ := db.GetSetting(context.Background(), "currency_name")
-		if currency == "" {
-			currency = "تومان"
+		if em, ok := state.Data["email"]; ok && email == "" {
+			email = fmt.Sprintf("%v", em)
 		}
+	}
 
-		if walletAdminCfg != nil {
-			for _, adminID := range walletAdminCfg.AdminIDs {
-				menu := &telebot.ReplyMarkup{}
-				menu.Inline(menu.Row(
-					menu.Data("تایید خرید", "admin_approve_purchase", fmt.Sprintf("%d", req.ID)),
-					menu.Data("رد خرید", "admin_reject_purchase", fmt.Sprintf("%d", req.ID)),
-				))
+	purchaseDetails := &db.PurchaseRequest{
+		UserID:         user.ID,
+		Type:           pType,
+		PlanID:         planIDPtr,
+		SubscriptionID: subIDPtr,
+		Price:          float64(priceToman),
+		PriceToman:     &priceToman,
+		QuoteID:        quoteIDPtr,
+		Months:         months,
+		IPLimit:        ipLimit,
+		DataGB:         dataGB,
+		CustomName:     customName,
+		ClientEmail:    email,
+		TelegramFileID: fileID,
+		Status:         "pending",
+	}
 
-				var details string
-				switch pType {
-				case "buy":
-					details = fmt.Sprintf("خرید سرویس جدید\nطرح: %s\nایمیل: %s\nمدت: %d ماه\nکاربر همزمان: %d\nحجم: %d گیگابایت", customName, email, months, ipLimit, dataGB)
-				case "extend":
-					details = fmt.Sprintf("تمدید سرویس\nشناسه اشتراک: %d\nمدت تمدید: %d ماه", *subIDPtr, months)
-				case "upgrade_ip":
-					details = fmt.Sprintf("ارتقای تعداد کاربر همزمان\nشناسه اشتراک: %d\nتعداد کاربر جدید: %d", *subIDPtr, ipLimit)
-				}
+	res, err := db.SubmitReceiptForActiveIntent(context.Background(), activeIntent.ID, user.ID, fileID, purchaseDetails)
+	if err != nil {
+		log.Printf("[RECEIPT] Failed to submit purchase receipt for intent %d: %v", activeIntent.ID, err)
+		return c.Send("خطا در ثبت درخواست خرید مستقیم.")
+	}
+	bot.FSM.ClearState(user.TelegramID)
 
-				caption := fmt.Sprintf("📥 درخواست خرید مستقیم #%d\nکاربر: @%s (%d)\nنوع: %s\nمبلغ: %.0f %s\n\nجزئیات:\n%s",
-					req.ID, user.Username, user.TelegramID, pType, price, currency, details)
-
-				_, _ = bot.Bot.Send(&telebot.User{ID: adminID}, &telebot.Photo{File: telebot.File{FileID: fileID}, Caption: caption}, menu)
-			}
-		}
-
-		_ = c.Send("رسید پرداخت شما دریافت شد. پس از بررسی ادمین، سرویس شما فعال شده و مشخصات آن برایتان ارسال خواهد شد.")
+	if res.IsDuplicate {
+		_ = c.Send("رسید پرداخت شما قبلاً دریافت شده است و در انتظار تایید ادمین می‌باشد.")
 		return showMainMenu(c, user)
 	}
 
-	return c.Send("مرحله نامعتبر است. لطفا مجددا تلاش کنید.")
+	req := res.PurchaseRequest
+	if walletAdminCfg != nil {
+		for _, adminID := range walletAdminCfg.AdminIDs {
+			menu := &telebot.ReplyMarkup{}
+			menu.Inline(menu.Row(
+				menu.Data("تایید خرید", "admin_approve_purchase", fmt.Sprintf("%d", req.ID)),
+				menu.Data("رد خرید", "admin_reject_purchase", fmt.Sprintf("%d", req.ID)),
+			))
+
+			var details string
+			switch pType {
+			case "buy", "new_subscription":
+				details = fmt.Sprintf("خرید سرویس جدید\nطرح: %s\nایمیل: %s\nمدت: %d ماه\nکاربر همزمان: %d\nحجم: %d گیگابایت", customName, email, months, ipLimit, dataGB)
+			case "extend":
+				subDisplay := int64(0)
+				if subIDPtr != nil {
+					subDisplay = *subIDPtr
+				}
+				details = fmt.Sprintf("تمدید سرویس\nشناسه اشتراک: %d\nمدت تمدید: %d ماه", subDisplay, months)
+			case "upgrade_ip":
+				subDisplay := int64(0)
+				if subIDPtr != nil {
+					subDisplay = *subIDPtr
+				}
+				details = fmt.Sprintf("ارتقای تعداد کاربر همزمان\nشناسه اشتراک: %d\nتعداد کاربر جدید: %d", subDisplay, ipLimit)
+			}
+
+			caption := fmt.Sprintf("📥 درخواست خرید مستقیم #%d\nکاربر: @%s (%d)\nنوع: %s\nمبلغ: %s\n\nجزئیات:\n%s",
+				req.ID, user.Username, user.TelegramID, pType, persian.FormatMoney(priceToman), details)
+
+			_, _ = bot.Bot.Send(&telebot.User{ID: adminID}, &telebot.Photo{File: telebot.File{FileID: fileID}, Caption: caption}, menu)
+		}
+	}
+
+	_ = c.Send("رسید پرداخت شما دریافت شد. پس از بررسی ادمین، سرویس شما فعال شده و مشخصات آن برایتان ارسال خواهد شد.")
+	return showMainMenu(c, user)
 }
 
 func HandleAdminPendingTopups(c telebot.Context) error {
@@ -459,12 +467,13 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 			log.Printf("[CRITICAL] failed to persist provisioning status for purchase request #%d: %v", reqID, statusErr)
 		}
 		if provisioningStatus == db.PurchaseProvisioningRetryable {
-			var expectedUUID, expectedSubID string
+			var expectedUUID, expectedSubID, expectedFlow string
 			var inboundIDs []int
 			var unknownCreate *paidSubscriptionCreateUnknownError
 			if errors.As(activationErr, &unknownCreate) && unknownCreate.Request.Client.ID != "" {
 				expectedUUID = unknownCreate.Request.Client.ID
 				expectedSubID = unknownCreate.Request.Client.SubID
+				expectedFlow = unknownCreate.Request.Client.Flow
 				inboundIDs = unknownCreate.Request.InboundIDs
 			}
 			if len(inboundIDs) == 0 && plan != nil {
@@ -489,6 +498,7 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 				IPLimit:           req.IPLimit,
 				DataGB:            req.DataGB,
 				CustomName:        req.CustomName,
+				Flow:              expectedFlow,
 			}
 			record := reconcile.NewDirectPaymentProvisioningRecord(payload)
 			record.ObservedState = map[string]any{

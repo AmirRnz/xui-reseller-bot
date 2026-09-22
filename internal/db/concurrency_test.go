@@ -195,7 +195,7 @@ func TestReconciliationConcurrencyAndTerminalStates(t *testing.T) {
 		}
 
 		// Stale worker_1 tries to resolve
-		resErr := ResolveReconciliationRecord(ctx, myRec.ID, "worker_1", myRec.Status, "worker resolution")
+		resErr := ResolveReconciliationRecord(ctx, myRec.ID, "worker_1", myRec.Status, myRec.Version, "worker resolution")
 		if resErr == nil {
 			t.Fatalf("expected error when stale worker resolves manually closed record, got nil")
 		}
@@ -239,12 +239,12 @@ func TestReconciliationConcurrencyAndTerminalStates(t *testing.T) {
 		}
 
 		// Admin moves to manual review
-		if err := MarkReconciliationManualReview(ctx, myRec.ID, "", "", "admin flagged for manual review"); err != nil {
+		if err := MarkReconciliationManualReview(ctx, myRec.ID, "", "", 0, "admin flagged for manual review"); err != nil {
 			t.Fatalf("failed to mark manual review: %v", err)
 		}
 
 		// Stale worker_1 tries to resolve
-		resErr := ResolveReconciliationRecord(ctx, myRec.ID, "worker_1", myRec.Status, "worker resolution")
+		resErr := ResolveReconciliationRecord(ctx, myRec.ID, "worker_1", myRec.Status, myRec.Version, "worker resolution")
 		if resErr == nil {
 			t.Fatalf("expected error when stale worker resolves record moved to manual review, got nil")
 		}
@@ -288,19 +288,19 @@ func TestReconciliationConcurrencyAndTerminalStates(t *testing.T) {
 		}
 
 		// worker_B tries to resolve worker_A's lease
-		errB := ResolveReconciliationRecord(ctx, myRec.ID, "worker_B", myRec.Status, "resolved by B")
+		errB := ResolveReconciliationRecord(ctx, myRec.ID, "worker_B", myRec.Status, myRec.Version, "resolved by B")
 		if errB == nil {
 			t.Fatalf("worker_B should not be able to resolve record claimed by worker_A")
 		}
 
 		// worker_A successfully resolves
-		errA := ResolveReconciliationRecord(ctx, myRec.ID, "worker_A", myRec.Status, "resolved by A")
+		errA := ResolveReconciliationRecord(ctx, myRec.ID, "worker_A", myRec.Status, myRec.Version, "resolved by A")
 		if errA != nil {
 			t.Fatalf("worker_A should be able to resolve own lease, got: %v", errA)
 		}
 
 		// worker_A tries to resolve again (now terminal)
-		errA2 := ResolveReconciliationRecord(ctx, myRec.ID, "worker_A", myRec.Status, "resolved by A again")
+		errA2 := ResolveReconciliationRecord(ctx, myRec.ID, "worker_A", myRec.Status, myRec.Version, "resolved by A again")
 		if errA2 == nil {
 			t.Fatalf("worker_A should not be able to resolve an already terminal record")
 		}

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"xui-reseller-bot/internal/config"
@@ -22,6 +23,26 @@ type Client struct {
 	apiToken            string
 	httpClient          *http.Client
 	Cache               *InboundCache
+	readyMu             sync.RWMutex
+	isReady             bool
+}
+
+func (c *Client) IsReady() bool {
+	if c == nil {
+		return false
+	}
+	c.readyMu.RLock()
+	defer c.readyMu.RUnlock()
+	return c.isReady
+}
+
+func (c *Client) SetReady(ready bool) {
+	if c == nil {
+		return
+	}
+	c.readyMu.Lock()
+	defer c.readyMu.Unlock()
+	c.isReady = ready
 }
 
 type WriteOutcome string
@@ -154,6 +175,7 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 	status := &ReadinessStatus{}
 	if c == nil || c.apiToken == "" {
 		status.Error = errors.New("API token is empty or client uninitialized")
+		c.SetReady(false)
 		return status, status.Error
 	}
 
@@ -161,6 +183,7 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 	err := c.doRequest("GET", "/panel/api/server/getPanelUpdateInfo", nil, &updateInfo)
 	if err != nil {
 		status.Error = fmt.Errorf("master server unreachable or token invalid: %w", err)
+		c.SetReady(false)
 		return status, status.Error
 	}
 	status.MasterReachable = true
@@ -168,13 +191,20 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 	status.Version = updateInfo.CurrentVersion
 	normalizedVersion := strings.TrimPrefix(strings.TrimSpace(updateInfo.CurrentVersion), "v")
 	status.VersionOK = strings.HasPrefix(normalizedVersion, "3.8.5")
+	if !status.VersionOK {
+		status.Error = fmt.Errorf("unsupported 3x-ui version %s (expected 3.8.5)", status.Version)
+		c.SetReady(false)
+		return status, status.Error
+	}
 
 	inbounds, err := c.GetInbounds()
 	if err != nil {
 		status.Error = fmt.Errorf("failed to fetch panel inbounds: %w", err)
+		c.SetReady(false)
 		return status, status.Error
 	}
 	status.InboundsCount = len(inbounds)
+	c.SetReady(true)
 	return status, nil
 }
 

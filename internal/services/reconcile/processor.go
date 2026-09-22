@@ -80,7 +80,10 @@ type Processor struct {
 
 func NewProcessor(workerID string, xuiClient XUIClient) *Processor {
 	if workerID == "" {
-		workerID = fmt.Sprintf("worker_%d", time.Now().UnixNano())
+		workerID = "reconcile_worker"
+	}
+	if !strings.Contains(workerID, ":") {
+		workerID = fmt.Sprintf("%s:%s", workerID, generateSubID()[:8])
 	}
 	return &Processor{
 		WorkerID:                       workerID,
@@ -213,14 +216,14 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 		if targetStatus == "" {
 			targetStatus = db.ReconciliationStatusResolvedVerified
 		}
-		if err := db.ResolveReconciliationRecordWithStatus(ctx, rec.ID, p.WorkerID, rec.Status, targetStatus, outcome.Resolution); err != nil {
+		if err := db.ResolveReconciliationRecordWithStatus(ctx, rec.ID, p.WorkerID, rec.Status, rec.Version, targetStatus, outcome.Resolution); err != nil {
 			log.Printf("[RECONCILE] Failed to mark record %d %s: %v", rec.ID, targetStatus, err)
 		} else {
 			log.Printf("[RECONCILE] Resolved record %d (op=%s, kind=%s) -> %s: %s", rec.ID, rec.OperationKey, rec.Kind, targetStatus, outcome.Resolution)
 		}
 
 	case OutcomeManualReview:
-		if err := db.MarkReconciliationManualReview(ctx, rec.ID, p.WorkerID, rec.Status, outcome.Reason); err != nil {
+		if err := db.MarkReconciliationManualReview(ctx, rec.ID, p.WorkerID, rec.Status, rec.Version, outcome.Reason); err != nil {
 			log.Printf("[RECONCILE] Failed to mark record %d manual review: %v", rec.ID, err)
 		} else {
 			log.Printf("[RECONCILE] Record %d (op=%s, kind=%s) moved to manual review: %s", rec.ID, rec.OperationKey, rec.Kind, outcome.Reason)
@@ -229,7 +232,7 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 	case OutcomeRetry:
 		if rec.AttemptCount >= p.MaxRetry {
 			reason := fmt.Sprintf("exceeded %d attempts; last error: %v", p.MaxRetry, outcome.Err)
-			if err := db.MarkReconciliationManualReview(ctx, rec.ID, p.WorkerID, rec.Status, reason); err != nil {
+			if err := db.MarkReconciliationManualReview(ctx, rec.ID, p.WorkerID, rec.Status, rec.Version, reason); err != nil {
 				log.Printf("[RECONCILE] Failed to mark record %d manual review after max retries: %v", rec.ID, err)
 			} else {
 				log.Printf("[RECONCILE] Record %d moved to manual review after %d retries: %v", rec.ID, p.MaxRetry, outcome.Err)
@@ -240,7 +243,7 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 			if outcome.Err != nil {
 				errMsg = outcome.Err.Error()
 			}
-			if err := db.FailAndScheduleRetry(ctx, rec.ID, p.WorkerID, rec.Status, errMsg, backoff); err != nil {
+			if err := db.FailAndScheduleRetry(ctx, rec.ID, p.WorkerID, rec.Status, rec.Version, errMsg, backoff); err != nil {
 				log.Printf("[RECONCILE] Failed to schedule retry for record %d: %v", rec.ID, err)
 			} else {
 				log.Printf("[RECONCILE] Record %d failed (attempt %d/%d), retry in %v: %v", rec.ID, rec.AttemptCount, p.MaxRetry, backoff, errMsg)
@@ -824,8 +827,16 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 		sub.ExpireTime = &desiredExpiry
 		if desiredExpiry > 0 {
 			sub.EndDate = time.UnixMilli(desiredExpiry)
+		} else {
+			sub.EndDate = time.Time{}
 		}
-		sub.Status = db.SubscriptionStatusActive
+		if !desiredActive {
+			sub.Status = db.SubscriptionStatusDisabled
+		} else if desiredExpiry > 0 && time.Now().After(time.UnixMilli(desiredExpiry)) {
+			sub.Status = db.SubscriptionStatusExpired
+		} else {
+			sub.Status = db.SubscriptionStatusActive
+		}
 		sub.DesiredIPLimit = nil
 		sub.DesiredExpireTime = nil
 		sub.DesiredIsActive = nil
@@ -872,8 +883,16 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 				sub.ExpireTime = &desiredExpiry
 				if desiredExpiry > 0 {
 					sub.EndDate = time.UnixMilli(desiredExpiry)
+				} else {
+					sub.EndDate = time.Time{}
 				}
-				sub.Status = db.SubscriptionStatusActive
+				if !desiredActive {
+					sub.Status = db.SubscriptionStatusDisabled
+				} else if desiredExpiry > 0 && time.Now().After(time.UnixMilli(desiredExpiry)) {
+					sub.Status = db.SubscriptionStatusExpired
+				} else {
+					sub.Status = db.SubscriptionStatusActive
+				}
 				sub.DesiredIPLimit = nil
 				sub.DesiredExpireTime = nil
 				sub.DesiredIsActive = nil
@@ -1035,22 +1054,13 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 
 	case RemoteConfirmedAbsent:
 		// Client absent remotely. Create client in XUI first.
-		var inbounds []int
-		if len(payload.InboundIDs) > 0 {
-			inbounds = payload.InboundIDs
-		} else if payload.PlanID != nil {
-			paidPlan, pErr := db.GetPaidPlanByID(ctx, int64(*payload.PlanID))
-			if pErr == nil && paidPlan != nil {
-				inbounds = paidPlan.InboundIDs
-			}
-		}
-
-		if len(inbounds) == 0 {
+		if len(payload.InboundIDs) == 0 {
 			return ProcessOutcome{
 				Kind:   OutcomeManualReview,
-				Reason: fmt.Sprintf("inbound snapshot is missing for direct payment client %s (plan_id=%v); manual review required", payload.ClientEmail, payload.PlanID),
+				Reason: "missing required immutable provisioning snapshot",
 			}
 		}
+		inbounds := payload.InboundIDs
 
 		// Exact first-use lazy expiry value (negative duration in milliseconds)
 		expiryMilli := int64(0)
@@ -1078,6 +1088,7 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 				ExpiryTime: expiryMilli,
 				LimitIP:    payload.IPLimit,
 				TotalGB:    totalBytes,
+				Flow:       payload.Flow,
 			},
 		}
 

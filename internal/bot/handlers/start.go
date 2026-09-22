@@ -34,7 +34,7 @@ func RegisterStart(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.Mi
 		return c.Send("برای پشتیبانی لطفا با ادمین در ارتباط باشید.")
 	}, auth)
 
-	b.Handle("\fmenu_request_access", func(c telebot.Context) error {
+	handleRequestAccess := func(c telebot.Context) error {
 		user := userFromContext(c)
 		if user == nil {
 			return c.Send("خطا.")
@@ -43,14 +43,16 @@ func RegisterStart(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.Mi
 			return c.Send("شما قبلا درخواست دسترسی داده‌اید یا تایید شده‌اید.")
 		}
 
+		err := c.Send("✅ درخواست دسترسی شما برای ادمین ارسال شد. پس از تایید به شما اطلاع داده خواهد شد.")
 		msg := fmt.Sprintf("📝 درخواست دسترسی نمایندگی جدید:\nکاربر: %s\nآیدی عددی: `%d`\n\nبرای تایید به منوی ادمین مراجعه کنید.", userIdentifier(user), user.TelegramID)
 		for _, adminID := range adminCfg.AdminIDs {
 			adminUser := &telebot.User{ID: adminID}
 			_, _ = bot.Bot.Send(adminUser, msg, telebot.ModeMarkdown)
 		}
-
-		return c.Send("✅ درخواست دسترسی شما برای ادمین ارسال شد. پس از تایید به شما اطلاع داده خواهد شد.")
-	}, auth)
+		return err
+	}
+	b.Handle("\fmenu_request_access", handleRequestAccess, auth)
+	b.Handle("\frequest_access", handleRequestAccess, auth)
 }
 
 func HandleStart(c telebot.Context) error {

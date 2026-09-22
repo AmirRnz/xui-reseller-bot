@@ -166,6 +166,7 @@ type DirectPaymentProvisioningPayload struct {
 	IPLimit           int    `json:"ip_limit,omitempty"`
 	DataGB            int    `json:"data_gb,omitempty"`
 	CustomName        string `json:"custom_name,omitempty"`
+	Flow              string `json:"flow,omitempty"`
 }
 
 func (p *DirectPaymentProvisioningPayload) Validate() error {
@@ -723,6 +724,7 @@ func DecodeDirectPaymentProvisioning(raw map[string]any, fallbackReqID *int64, f
 	if p.CustomName == "" {
 		p.CustomName = coerceString(raw["display_name"])
 	}
+	p.Flow = coerceString(raw["flow"])
 
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid direct payment provisioning payload: %w", err)

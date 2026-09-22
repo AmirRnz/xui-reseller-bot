@@ -22,6 +22,7 @@ func RegisterAdminUsers(b *telebot.Bot, auth telebot.MiddlewareFunc, admin teleb
 	b.Handle("\fadmin_user_ban", HandleAdminUserBan, auth, admin)
 	b.Handle("\fadmin_user_unban", HandleAdminUserUnban, auth, admin)
 	b.Handle("\fadmin_user_approve", HandleAdminUserApprove, auth, admin)
+	b.Handle("\fapprove_user", HandleAdminUserApprove, auth, admin)
 	b.Handle("\fadmin_user_credit", HandleAdminUserCreditPrompt, auth, admin)
 	b.Handle("\fbulk_credit", HandleBulkCreditPrompt, auth, admin)
 	b.Handle("\fadmin_user_clients", HandleAdminUserClients, auth, admin)
@@ -202,6 +203,9 @@ func HandleAdminUserApprove(c telebot.Context) error {
 	user, err := db.GetUserByID(context.Background(), userID)
 	if err != nil || user == nil {
 		return c.Send("کاربر مورد نظر یافت نشد.")
+	}
+	if user.Status == db.UserStatusApproved || user.Status == db.UserStatusApprovedNamePending {
+		return c.Send("این کاربر قبلاً تایید شده است.")
 	}
 
 	if err := db.UpdateUserStatusByID(context.Background(), user.ID, db.UserStatusApproved); err != nil {

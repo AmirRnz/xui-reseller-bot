@@ -163,6 +163,24 @@ CREATE TABLE IF NOT EXISTS bulk_credit_operations (
 );
 `,
 	},
+	{
+		Version: 7,
+		Name:    "corrective_integer_toman_pricing_and_topup_idempotency",
+		SQL: `
+UPDATE paid_plans SET
+    base_price_toman = CASE WHEN base_price_toman = 0 AND base_price > 0 THEN ROUND(base_price)::BIGINT ELSE base_price_toman END,
+    price_per_extra_ip_toman = CASE WHEN price_per_extra_ip_toman = 0 AND price_per_extra_ip > 0 THEN ROUND(price_per_extra_ip)::BIGINT ELSE price_per_extra_ip_toman END,
+    price_per_gb_toman = CASE WHEN price_per_gb_toman = 0 AND price_per_gb > 0 THEN ROUND(price_per_gb)::BIGINT ELSE price_per_gb_toman END,
+    price_per_extra_month_toman = CASE WHEN price_per_extra_month_toman = 0 AND price_per_extra_month > 0 THEN ROUND(price_per_extra_month)::BIGINT ELSE price_per_extra_month_toman END
+WHERE (base_price_toman = 0 AND base_price > 0)
+   OR (price_per_extra_ip_toman = 0 AND price_per_extra_ip > 0)
+   OR (price_per_gb_toman = 0 AND price_per_gb > 0)
+   OR (price_per_extra_month_toman = 0 AND price_per_extra_month > 0);
+
+ALTER TABLE topup_requests
+    ADD COLUMN IF NOT EXISTS operation_key TEXT UNIQUE;
+`,
+	},
 }
 
 func runMigrations(ctx context.Context) error {
