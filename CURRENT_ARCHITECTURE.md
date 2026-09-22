@@ -29,11 +29,11 @@ Both bots are Persian-only (`internal/bot/persian`).
 
 - **Payment Intents**: `payment_intents` table tracks durable checkout intents (`card_number`, `amount_toman`, `intent_type`, `status`) before presenting bank/card details, ensuring receipt submission survives bot restarts.
 - **Bulk Credit Operations**: `bulk_credit_operations` table tracks atomic bulk credit batches (`operation_key`, `amount_toman`, `recipient_count`, `recipient_user_ids`) with idempotency guards.
-- **Reconciliation CAS & Terminal Protection**: State transition CAS ensures reconciliation records can only transition from active pending/retryable states. Updates to terminal records (`completed`, `failed`, `manually_resolved`) are rejected.
+- **Reconciliation CAS & Terminal Protection**: State transition CAS ensures reconciliation records can only transition from active pending/retryable states (`pending`, `pending_refund`, `reconciliation_required`). Updates to terminal records (`resolved`, `resolved_verified`, `superseded`, `failed_terminal`, `manually_closed`, `manual_waiver`) are rejected.
 
 ## Safe 3x-ui ClientPatch & Bounded Pagination
 
-- **ClientPatch Semantics**: Targeted updates via `ClientPatch` use pointers to distinguish between zero-value changes (`limitIp=0`, `expiryTime=0`) and unset fields. Unmanaged metadata (`subId`, `flow`, `group`, `tgId`) is strictly preserved from full remote readback.
+- **ClientPatch Semantics**: Targeted updates via `ClientPatch` use pointers to distinguish between zero-value changes (`limitIp=0`, `expiryTime=0`) and unset fields. Unmanaged metadata (`subId`, `flow`, `group`, `tgId`, `comment`, `limitHwid`) is strictly preserved from full remote readback.
 - **Strict Timeout Verification**: On remote timeout during client update, readback verification requires patched fields to match before reporting `WriteSucceeded`. Mismatched readback or missing client returns `WriteUnknown`.
 - **Bounded Pagination**: `FindClientBySubID` uses targeted paged endpoint (`/panel/api/clients/list/paged?search={subId}&pageSize=10&page={page}`) bounded to at most 3 pages (`page=1..3`). Unconstrained `ListClients()` fallback scans have been completely eliminated from user-facing paths.
 
@@ -50,27 +50,29 @@ Both bots are Persian-only (`internal/bot/persian`).
      - Classifies remote client state (`ClassifyRemoteClient`).
      - Performs safe remote adoption (`verifyClientIdentity`).
      - Performs 3-way desired-vs-observed update comparison.
+     - Resolves records with explicit target terminal statuses (`resolved`, `resolved_verified`, `superseded`).
      - Executes idempotent wallet refunds (`db.ErrWalletOperationAlreadyApplied`).
 4. **Telebot**: Starts in webhook or long-poll mode with authentication/admin middleware, FSM, and per-user locking.
 5. **PostgreSQL Authority**: Commercial source of truth for users, plans, subscriptions, wallet balances, transactions, purchase requests, quotes, outbox events, payment intents, and reconciliation records. Subscription rows are preserved for historical audit.
-6. **Remote Create Compensation**: If 3x-ui creation succeeds but DB insertion fails, synchronous compensating deletion is attempted. If outcome is ambiguous, a reconciliation record is created.
+6. **Remote Create Compensation**: If 3x-ui creation succeeds but DB insertion fails, synchronous compensating deletion is attempted. If outcome is ambiguous, a typed reconciliation record is created.
 7. **Direct Payment Provisioning**: When an admin approves a direct payment, payment approval is recorded immediately. If remote provisioning fails, a `direct_payment_provisioning_retry` reconciliation record is created for the worker.
-8. **Cancellation & Refunds**: Cancellation in reseller bot immediately checks for active XUI connection. If remote delete is ambiguous or DB fails, reconciliation records are created. Legacy subscriptions without quotes route to admin manual refund review with `CalculatedAmount = 0` to preserve accounting safety.
-9. **Admin Reconciliation UI**: Telegram admin interface with inspection (`admin_reconcile_detail`), immediate retry (`admin_reconcile_retry`), manual review flag (`admin_reconcile_mark_manual`), and auditable manual close requiring reason input (`admin_reconcile_close`).
+8. **Cancellation & Refunds**: Cancellation in reseller bot immediately checks for active XUI connection. If remote delete is ambiguous or DB fails, reconciliation records are created (`subscription_cancellation_db_failure` vs `subscription_delete_unknown`). Legacy subscriptions without quotes route to admin manual refund review with `CalculatedAmount = 0` to preserve accounting safety.
+9. **Admin Reconciliation UI**: Telegram admin interface with inspection (`admin_reconcile_detail`), structured state summary (`formatStateSummary`), immediate retry (`admin_reconcile_retry`), manual review flag (`admin_reconcile_mark_manual`), and auditable manual close requiring reason input (`admin_reconcile_close`).
 
 ## Baseline test inventory
 
-- `go test -count=1 -v ./...`:
+- `go test -count=1 -p 1 -v ./...`:
   - `internal/bot`: **PASS**
   - `internal/bot/handlers`: **PASS** (100% pass)
   - `internal/bot/persian`: **PASS** (100% pass)
-  - `internal/db`: **PASS** (100% pass including concurrency, migration v6, and payment intents)
+  - `internal/db`: **PASS** (100% pass including concurrency, migration v6, wallet credit idempotency, and payment intents)
   - `internal/fsm`: **PASS**
   - `internal/services/outbox`: **PASS** (100% pass)
   - `internal/services/pricing`: **PASS** (100% pass including integer pricing and basis points)
   - `internal/services/reconcile`: **PASS** (100% pass including contracts, identity checks, and ProcessOnce integration)
+  - `internal/services/sync`: **PASS** (100% pass)
   - `internal/xui`: **PASS** (100% pass including contract tests, ClientPatch, and bounded pagination)
-  - `tests/e2e`: **PASS** (100% pass)
+  - `tests/e2e`: **PASS** (100% pass with JSON mock telegram server and Postgres sequence resets)
 - `go vet ./...` — **PASS**, zero diagnostics.
 - `gofmt -l .` — **PASS**, zero unformatted files.
-- `.github/workflows/ci.yml` — Automated CI with PostgreSQL service container running gofmt, go vet, unit/DB/e2e tests with race detection, and binary compilation.
+- `.github/workflows/ci.yml` — Automated CI with PostgreSQL service container running gofmt, go vet, isolated unit/DB/e2e tests with race detection (`go test -v -race -count=1 -p 1 ./...`), and binary compilation.

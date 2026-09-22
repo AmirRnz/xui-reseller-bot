@@ -82,6 +82,7 @@ func TestConcurrencyStress(t *testing.T) {
 					IPLimit:     r.Intn(5) + 1,
 					ExpireTime:  &expireTime,
 					IsActive:    true,
+					Status:      SubscriptionStatusActive,
 				}
 
 				// Create

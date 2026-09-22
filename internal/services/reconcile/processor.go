@@ -56,10 +56,11 @@ const (
 )
 
 type ProcessOutcome struct {
-	Kind       OutcomeKind
-	Resolution string
-	Reason     string
-	Err        error
+	Kind         OutcomeKind
+	TargetStatus string
+	Resolution   string
+	Reason       string
+	Err          error
 }
 
 type Processor struct {
@@ -187,8 +188,10 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 		outcome = p.handlePurchaseReconciliation(ctx, rec)
 	case KindSubscriptionUpdateDbFailed:
 		outcome = p.handleUpdateReconciliation(ctx, rec)
-	case KindSubscriptionDeleteUnknown, KindSubscriptionCancellationDbFailed:
+	case KindSubscriptionDeleteUnknown:
 		outcome = p.handleDeleteReconciliation(ctx, rec)
+	case KindSubscriptionCancellationDbFailed:
+		outcome = p.handleSubscriptionCancellation(ctx, rec)
 	case KindDirectPaymentProvisioningRetry:
 		outcome = p.handleDirectPaymentProvisioning(ctx, rec)
 	case KindSubscriptionRemoteMissing:
@@ -206,10 +209,14 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 
 	switch outcome.Kind {
 	case OutcomeResolved:
-		if err := db.ResolveReconciliationRecord(ctx, rec.ID, p.WorkerID, rec.Status, outcome.Resolution); err != nil {
-			log.Printf("[RECONCILE] Failed to mark record %d resolved: %v", rec.ID, err)
+		targetStatus := outcome.TargetStatus
+		if targetStatus == "" {
+			targetStatus = db.ReconciliationStatusResolvedVerified
+		}
+		if err := db.ResolveReconciliationRecordWithStatus(ctx, rec.ID, p.WorkerID, rec.Status, targetStatus, outcome.Resolution); err != nil {
+			log.Printf("[RECONCILE] Failed to mark record %d %s: %v", rec.ID, targetStatus, err)
 		} else {
-			log.Printf("[RECONCILE] Resolved record %d (op=%s, kind=%s): %s", rec.ID, rec.OperationKey, rec.Kind, outcome.Resolution)
+			log.Printf("[RECONCILE] Resolved record %d (op=%s, kind=%s) -> %s: %s", rec.ID, rec.OperationKey, rec.Kind, targetStatus, outcome.Resolution)
 		}
 
 	case OutcomeManualReview:
@@ -281,8 +288,9 @@ func (p *Processor) handlePendingRefund(ctx context.Context, rec *db.Reconciliat
 		}
 	}
 	return ProcessOutcome{
-		Kind:       OutcomeResolved,
-		Resolution: fmt.Sprintf("wallet refunded %d Toman (key: %s)", payload.Amount, payload.OperationKey),
+		Kind:         OutcomeResolved,
+		TargetStatus: db.ReconciliationStatusResolved,
+		Resolution:   fmt.Sprintf("wallet refunded %d Toman (key: %s)", payload.Amount, payload.OperationKey),
 	}
 }
 
@@ -405,8 +413,9 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 				}
 			}
 			return ProcessOutcome{
-				Kind:       OutcomeResolved,
-				Resolution: fmt.Sprintf("remote client %s and verified subscription %d both exist", payload.Email, existing.ID),
+				Kind:         OutcomeResolved,
+				TargetStatus: db.ReconciliationStatusResolvedVerified,
+				Resolution:   fmt.Sprintf("remote client %s and verified subscription %d both exist", payload.Email, existing.ID),
 			}
 		}
 
@@ -450,8 +459,9 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 			}
 		}
 		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: fmt.Sprintf("remote client %s confirmed, safely adopted into subscription %d", payload.Email, sub.ID),
+			Kind:         OutcomeResolved,
+			TargetStatus: db.ReconciliationStatusResolvedVerified,
+			Resolution:   fmt.Sprintf("remote client %s confirmed, safely adopted into subscription %d", payload.Email, sub.ID),
 		}
 
 	case RemoteConfirmedAbsent:
@@ -505,8 +515,9 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 			}
 			// Zero price and no debit: safely resolve without refund
 			return ProcessOutcome{
-				Kind:       OutcomeResolved,
-				Resolution: fmt.Sprintf("remote client %s absent, zero price and no debit recorded; resolved without refund", payload.Email),
+				Kind:         OutcomeResolved,
+				TargetStatus: db.ReconciliationStatusResolved,
+				Resolution:   fmt.Sprintf("remote client %s absent, zero price and no debit recorded; resolved without refund", payload.Email),
 			}
 		}
 
@@ -530,8 +541,9 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 			}
 		}
 		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: fmt.Sprintf("remote client absent, refunded %d Toman (key: %s)", refundAmount, refundOpKey),
+			Kind:         OutcomeResolved,
+			TargetStatus: db.ReconciliationStatusResolved,
+			Resolution:   fmt.Sprintf("remote client absent, refunded %d Toman (key: %s)", refundAmount, refundOpKey),
 		}
 
 	default: // RemotePresenceUnknown
@@ -544,7 +556,91 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 }
 
 func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
-	return p.handleSubscriptionCancellation(ctx, rec)
+	payload, err := DecodeSubscriptionDelete(rec.DesiredState, rec.SubscriptionID, rec.UserID, rec.OperationKey)
+	if err != nil {
+		return ProcessOutcome{
+			Kind:   OutcomeManualReview,
+			Reason: fmt.Sprintf("invalid subscription delete payload: %v", err),
+		}
+	}
+
+	if p.XUI == nil {
+		return ProcessOutcome{
+			Kind: OutcomeRetry,
+			Err:  errors.New("xui client is not available"),
+		}
+	}
+
+	remote, err := p.XUI.GetClientByEmail(payload.ClientEmail)
+	presence := ClassifyRemoteClient(remote, err)
+
+	switch presence {
+	case RemoteConfirmedAbsent:
+		// Step 1: Remote is confirmed absent.
+		// Step 2: Persist local deleted state in DB.
+		if payload.SubscriptionID != nil {
+			if delErr := db.DeleteSubscription(ctx, int(*payload.SubscriptionID)); delErr != nil {
+				return ProcessOutcome{
+					Kind: OutcomeRetry,
+					Err:  fmt.Errorf("failed to mark subscription %d deleted in DB: %w", *payload.SubscriptionID, delErr),
+				}
+			}
+		}
+		// Step 3: Perform/confirm compensation refund if required.
+		if payload.RefundAmount > 0 && payload.UserID != nil {
+			refundErr := p.executeRefund(ctx, *payload.UserID, payload.RefundAmount, "refund for cancelled subscription", payload.RefundOperationKey)
+			if refundErr != nil {
+				return ProcessOutcome{
+					Kind: OutcomeRetry,
+					Err:  refundErr, // Keep retryable!
+				}
+			}
+		}
+		// Step 4: Resolve.
+		return ProcessOutcome{
+			Kind:         OutcomeResolved,
+			TargetStatus: db.ReconciliationStatusResolved,
+			Resolution:   fmt.Sprintf("remote client %s confirmed deleted, local record cleaned", payload.ClientEmail),
+		}
+
+	case RemoteConfirmedPresent:
+		// Remote client still exists. Attempt delete once.
+		delErr := p.XUI.DeleteClient(payload.ClientEmail)
+		if delErr == nil || xui.IsNotFound(delErr) {
+			if payload.SubscriptionID != nil {
+				if dbDelErr := db.DeleteSubscription(ctx, int(*payload.SubscriptionID)); dbDelErr != nil {
+					return ProcessOutcome{
+						Kind: OutcomeRetry,
+						Err:  fmt.Errorf("failed to mark subscription %d deleted in DB after remote deletion: %w", *payload.SubscriptionID, dbDelErr),
+					}
+				}
+			}
+			if payload.RefundAmount > 0 && payload.UserID != nil {
+				refundErr := p.executeRefund(ctx, *payload.UserID, payload.RefundAmount, "refund for cancelled subscription", payload.RefundOperationKey)
+				if refundErr != nil {
+					return ProcessOutcome{
+						Kind: OutcomeRetry,
+						Err:  refundErr, // Keep retryable!
+					}
+				}
+			}
+			return ProcessOutcome{
+				Kind:         OutcomeResolved,
+				TargetStatus: db.ReconciliationStatusResolved,
+				Resolution:   fmt.Sprintf("remote client %s deleted on retry", payload.ClientEmail),
+			}
+		}
+		return ProcessOutcome{
+			Kind: OutcomeRetry,
+			Err:  fmt.Errorf("remote client %s still present after retry delete: %w", payload.ClientEmail, delErr),
+		}
+
+	default: // RemotePresenceUnknown
+		return ProcessOutcome{
+			Kind: OutcomeRetry,
+			Err:  fmt.Errorf("inconclusive delete check for %s: %w", payload.ClientEmail, err),
+		}
+	}
 }
 
 func (p *Processor) handleSubscriptionCancellation(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
@@ -552,7 +648,14 @@ func (p *Processor) handleSubscriptionCancellation(ctx context.Context, rec *db.
 	if err != nil {
 		return ProcessOutcome{
 			Kind:   OutcomeManualReview,
-			Reason: fmt.Sprintf("invalid subscription delete payload: %v", err),
+			Reason: fmt.Sprintf("invalid subscription cancellation payload: %v", err),
+		}
+	}
+
+	if payload.SubscriptionID == nil {
+		return ProcessOutcome{
+			Kind:   OutcomeManualReview,
+			Reason: fmt.Sprintf("subscription cancellation missing subscription ID for %s: manual review required", payload.ClientEmail),
 		}
 	}
 
@@ -582,7 +685,6 @@ func (p *Processor) handleSubscriptionCancellation(ctx context.Context, rec *db.
 		}
 
 	default: // RemotePresenceUnknown
-		// Timeout or network error! Ambiguous! NEVER assume deleted.
 		return ProcessOutcome{
 			Kind: OutcomeRetry,
 			Err:  fmt.Errorf("inconclusive delete check for %s: %w", payload.ClientEmail, err),
@@ -591,93 +693,73 @@ func (p *Processor) handleSubscriptionCancellation(ctx context.Context, rec *db.
 }
 
 func (p *Processor) reconcileAbsentSubscription(ctx context.Context, rec *db.ReconciliationRecord, payload *SubscriptionDeletePayload) ProcessOutcome {
-	// Remote client is confirmed absent.
-	// Step 1: Ensure subscription is marked CANCELLED (never deleted).
-	// Step 2: Under no circumstances perform direct wallet credit or bypass the refund queue.
-	//         Ensure refund request is recorded in refund_requests with status 'pending'.
-	if payload.SubscriptionID != nil {
-		subID := int(*payload.SubscriptionID)
-		sub, err := p.getSubByID(ctx, subID)
-		if err != nil {
-			return ProcessOutcome{
-				Kind: OutcomeRetry,
-				Err:  fmt.Errorf("failed to fetch subscription %d: %w", subID, err),
-			}
-		}
-		if sub == nil {
-			return ProcessOutcome{
-				Kind:   OutcomeManualReview,
-				Reason: fmt.Sprintf("remote client %s confirmed deleted, but local subscription %d not found in DB", payload.ClientEmail, subID),
-			}
-		}
-		if payload.UserID != nil && sub.UserID != *payload.UserID {
-			return ProcessOutcome{
-				Kind:   OutcomeManualReview,
-				Reason: fmt.Sprintf("remote client %s confirmed deleted, but subscription %d user mismatch (db=%d, payload=%d)", payload.ClientEmail, subID, sub.UserID, *payload.UserID),
-			}
-		}
-
-		if payload.RefundAmount > 0 {
-			userID := sub.UserID
-			if payload.UserID != nil {
-				userID = *payload.UserID
-			}
-			refundOpKey := payload.RefundOperationKey
-			if refundOpKey == "" {
-				refundOpKey = fmt.Sprintf("subscription_cancel_refund:%d", subID)
-			}
-
-			refundReq, cancelErr := p.cancelSubWithRefund(ctx, subID, userID, payload.RefundAmount, refundOpKey)
-			if cancelErr != nil {
-				return ProcessOutcome{
-					Kind: OutcomeRetry,
-					Err:  fmt.Errorf("remote client %s confirmed deleted, but CancelSubscriptionWithRefund failed for sub %d: %w", payload.ClientEmail, subID, cancelErr),
-				}
-			}
-			if refundReq == nil {
-				return ProcessOutcome{
-					Kind:   OutcomeManualReview,
-					Reason: fmt.Sprintf("remote client %s confirmed deleted, CancelSubscriptionWithRefund returned nil request for sub %d", payload.ClientEmail, subID),
-				}
-			}
-		} else {
-			if updateErr := p.updateSubStatus(ctx, subID, db.SubscriptionStatusCancelled); updateErr != nil {
-				return ProcessOutcome{
-					Kind: OutcomeRetry,
-					Err:  fmt.Errorf("remote client %s confirmed deleted, but UpdateSubscriptionStatus failed for sub %d: %w", payload.ClientEmail, subID, updateErr),
-				}
-			}
-		}
-
+	if payload.SubscriptionID == nil {
 		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: fmt.Sprintf("remote client %s confirmed deleted, subscription %d marked cancelled and refund recorded in pending queue", payload.ClientEmail, subID),
+			Kind:   OutcomeManualReview,
+			Reason: fmt.Sprintf("subscription cancellation missing subscription ID for %s: manual review required", payload.ClientEmail),
 		}
 	}
 
-	// If no subscription ID provided but refund requested:
-	if payload.RefundAmount > 0 && payload.UserID != nil {
+	subID := int(*payload.SubscriptionID)
+	sub, err := p.getSubByID(ctx, subID)
+	if err != nil {
+		return ProcessOutcome{
+			Kind: OutcomeRetry,
+			Err:  fmt.Errorf("failed to fetch subscription %d: %w", subID, err),
+		}
+	}
+	if sub == nil {
+		return ProcessOutcome{
+			Kind:   OutcomeManualReview,
+			Reason: fmt.Sprintf("remote client %s confirmed deleted, but local subscription %d not found in DB", payload.ClientEmail, subID),
+		}
+	}
+	if payload.UserID != nil && sub.UserID != *payload.UserID {
+		return ProcessOutcome{
+			Kind:   OutcomeManualReview,
+			Reason: fmt.Sprintf("remote client %s confirmed deleted, but subscription %d user mismatch (db=%d, payload=%d)", payload.ClientEmail, subID, sub.UserID, *payload.UserID),
+		}
+	}
+
+	// Step 1: Ensure subscription is marked CANCELLED (never deleted).
+	// Step 2: Under no circumstances perform direct wallet credit or bypass the refund queue.
+	//         Ensure refund request is recorded in refund_requests with status 'pending'.
+	if payload.RefundAmount > 0 {
+		userID := sub.UserID
+		if payload.UserID != nil {
+			userID = *payload.UserID
+		}
 		refundOpKey := payload.RefundOperationKey
 		if refundOpKey == "" {
-			refundOpKey = rec.OperationKey
+			refundOpKey = fmt.Sprintf("subscription_cancel_refund:%d", subID)
 		}
-		req := &db.RefundRequest{
-			UserID:           *payload.UserID,
-			CalculatedAmount: payload.RefundAmount,
-			Status:           "pending",
-			OperationKey:     refundOpKey,
-		}
-		if createErr := p.createRefundRequest(ctx, req); createErr != nil {
+
+		refundReq, cancelErr := p.cancelSubWithRefund(ctx, subID, userID, payload.RefundAmount, refundOpKey)
+		if cancelErr != nil {
 			return ProcessOutcome{
 				Kind: OutcomeRetry,
-				Err:  fmt.Errorf("remote client %s confirmed deleted, but CreateRefundRequest failed: %w", payload.ClientEmail, createErr),
+				Err:  fmt.Errorf("remote client %s confirmed deleted, but CancelSubscriptionWithRefund failed for sub %d: %w", payload.ClientEmail, subID, cancelErr),
+			}
+		}
+		if refundReq == nil {
+			return ProcessOutcome{
+				Kind:   OutcomeManualReview,
+				Reason: fmt.Sprintf("remote client %s confirmed deleted, CancelSubscriptionWithRefund returned nil request for sub %d", payload.ClientEmail, subID),
+			}
+		}
+	} else {
+		if updateErr := p.updateSubStatus(ctx, subID, db.SubscriptionStatusCancelled); updateErr != nil {
+			return ProcessOutcome{
+				Kind: OutcomeRetry,
+				Err:  fmt.Errorf("remote client %s confirmed deleted, but UpdateSubscriptionStatus failed for sub %d: %w", payload.ClientEmail, subID, updateErr),
 			}
 		}
 	}
 
 	return ProcessOutcome{
-		Kind:       OutcomeResolved,
-		Resolution: fmt.Sprintf("remote client %s confirmed deleted", payload.ClientEmail),
+		Kind:         OutcomeResolved,
+		TargetStatus: db.ReconciliationStatusResolved,
+		Resolution:   fmt.Sprintf("remote client %s confirmed deleted, subscription %d marked cancelled and refund recorded in pending queue", payload.ClientEmail, subID),
 	}
 }
 
@@ -756,8 +838,9 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 			}
 		}
 		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: fmt.Sprintf("subscription %d db state updated to match remote", sub.ID),
+			Kind:         OutcomeResolved,
+			TargetStatus: db.ReconciliationStatusResolvedVerified,
+			Resolution:   fmt.Sprintf("subscription %d db state updated to match remote", sub.ID),
 		}
 	}
 
@@ -802,8 +885,9 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 					}
 				}
 				return ProcessOutcome{
-					Kind:       OutcomeResolved,
-					Resolution: fmt.Sprintf("retried remote update for %s and verified readback", payload.ClientEmail),
+					Kind:         OutcomeResolved,
+					TargetStatus: db.ReconciliationStatusResolvedVerified,
+					Resolution:   fmt.Sprintf("retried remote update for %s and verified readback", payload.ClientEmail),
 				}
 			}
 		}
@@ -852,15 +936,17 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 	}
 	if req.ProvisioningStatus == db.PurchaseProvisioningSucceeded {
 		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: "already provisioned successfully",
+			Kind:         OutcomeResolved,
+			TargetStatus: db.ReconciliationStatusResolved,
+			Resolution:   "already provisioned successfully",
 		}
 	}
 	if req.Status != "approved" {
 		if req.Status == "rejected" || req.Status == "cancelled" {
 			return ProcessOutcome{
-				Kind:       OutcomeResolved,
-				Resolution: fmt.Sprintf("purchase request %d %s; provisioning superseded", payload.PurchaseRequestID, req.Status),
+				Kind:         OutcomeResolved,
+				TargetStatus: db.ReconciliationStatusSuperseded,
+				Resolution:   fmt.Sprintf("purchase request %d %s; provisioning superseded", payload.PurchaseRequestID, req.Status),
 			}
 		}
 		return ProcessOutcome{
@@ -942,8 +1028,9 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 			}
 		}
 		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: fmt.Sprintf("direct payment client %s confirmed, adopted into subscription", payload.ClientEmail),
+			Kind:         OutcomeResolved,
+			TargetStatus: db.ReconciliationStatusResolvedVerified,
+			Resolution:   fmt.Sprintf("direct payment client %s confirmed, adopted into subscription", payload.ClientEmail),
 		}
 
 	case RemoteConfirmedAbsent:
@@ -1037,8 +1124,9 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 			}
 		}
 		return ProcessOutcome{
-			Kind:       OutcomeResolved,
-			Resolution: fmt.Sprintf("direct payment client %s created and provisioned successfully", payload.ClientEmail),
+			Kind:         OutcomeResolved,
+			TargetStatus: db.ReconciliationStatusResolved,
+			Resolution:   fmt.Sprintf("direct payment client %s created and provisioned successfully", payload.ClientEmail),
 		}
 
 	default: // RemotePresenceUnknown

@@ -627,6 +627,9 @@ func HandleBuyAutoName(c telebot.Context) error {
 
 	bot.FSM.SetState(user.TelegramID, "awaiting_buy_confirm", map[string]interface{}{
 		"plan_id":         fmt.Sprintf("%d", plan.ID),
+		"plan_name":       plan.Name,
+		"inbound_ids":     plan.InboundIDs,
+		"flow":            plan.Flow,
 		"quote_id":        fmt.Sprintf("%d", quote.ID),
 		"quote_key":       quote.QuoteKey,
 		"months":          fmt.Sprintf("%d", months),
@@ -860,6 +863,20 @@ func HandleBuyDirectPayment(c telebot.Context) error {
 	intentToken := stateToken
 	if intentToken == "" {
 		intentToken = fmt.Sprintf("intent_%d_%d", user.ID, time.Now().UnixNano())
+	}
+
+	if planIDPtr != nil {
+		if p, err := db.GetPaidPlanByID(context.Background(), *planIDPtr); err == nil && p != nil {
+			if _, ok := state.Data["inbound_ids"]; !ok {
+				state.Data["inbound_ids"] = p.InboundIDs
+			}
+			if _, ok := state.Data["flow"]; !ok {
+				state.Data["flow"] = p.Flow
+			}
+			if _, ok := state.Data["plan_name"]; !ok {
+				state.Data["plan_name"] = p.Name
+			}
+		}
 	}
 
 	intent := &db.PaymentIntent{

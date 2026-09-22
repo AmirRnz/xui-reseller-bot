@@ -126,4 +126,32 @@ func TestPayloadRoundTrips(t *testing.T) {
 	if decodedMissing.SubscriptionID != 501 || decodedMissing.UserID != 106 || decodedMissing.ClientEmail != "missing@test.com" {
 		t.Fatalf("SubscriptionRemoteMissing mismatch: %+v", decodedMissing)
 	}
+
+	// 7. PurchaseRemoteCreatedDbFailed
+	remoteCreatedRec := NewPurchaseRemoteCreatedDbFailedRecord(purchasePayload)
+	if remoteCreatedRec.Kind != KindPurchaseRemoteCreatedDbFailed {
+		t.Fatalf("expected kind %s, got %s", KindPurchaseRemoteCreatedDbFailed, remoteCreatedRec.Kind)
+	}
+	decodedRemoteCreated, err := DecodePurchaseProvisioning(remoteCreatedRec.DesiredState, remoteCreatedRec.UserID, remoteCreatedRec.OperationKey)
+	if err != nil {
+		t.Fatalf("DecodePurchaseProvisioning for remote created failed: %v", err)
+	}
+	if decodedRemoteCreated.UserID != 102 || decodedRemoteCreated.ExpectedUUID != "uuid-1234" ||
+		decodedRemoteCreated.ExpectedSubID != "sub-5678" || len(decodedRemoteCreated.InboundIDs) != 2 ||
+		decodedRemoteCreated.InboundIDs[0] != 1 || decodedRemoteCreated.InboundIDs[1] != 2 {
+		t.Fatalf("PurchaseRemoteCreatedDbFailed mismatch: %+v", decodedRemoteCreated)
+	}
+
+	// 8. SubscriptionCancellation
+	cancelRec := NewSubscriptionCancellationRecord(deletePayload)
+	if cancelRec.Kind != KindSubscriptionCancellationDbFailed {
+		t.Fatalf("expected kind %s, got %s", KindSubscriptionCancellationDbFailed, cancelRec.Kind)
+	}
+	decodedCancel, err := DecodeSubscriptionDelete(cancelRec.DesiredState, cancelRec.SubscriptionID, cancelRec.UserID, cancelRec.OperationKey)
+	if err != nil {
+		t.Fatalf("DecodeSubscriptionDelete for cancellation failed: %v", err)
+	}
+	if *decodedCancel.SubscriptionID != 301 || *decodedCancel.UserID != 104 || decodedCancel.ClientEmail != "delete@test.com" {
+		t.Fatalf("SubscriptionCancellation mismatch: %+v", decodedCancel)
+	}
 }

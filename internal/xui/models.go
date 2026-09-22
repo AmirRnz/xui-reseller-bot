@@ -142,8 +142,14 @@ type XUIClientInfo struct {
 // ClientPatch defines a partial update where nil means "preserve current remote value",
 // and non-nil means "set or clear this value".
 type ClientPatch struct {
-	Enable     *bool  `json:"enable,omitempty"`
-	ExpiryTime *int64 `json:"expiryTime,omitempty"`
-	LimitIP    *int   `json:"limitIp,omitempty"`
-	TotalGB    *int64 `json:"totalGB,omitempty"`
+	Enable     *bool   `json:"enable,omitempty"`
+	ExpiryTime *int64  `json:"expiryTime,omitempty"`
+	LimitIP    *int    `json:"limitIp,omitempty"`
+	TotalGB    *int64  `json:"totalGB,omitempty"`
+	Flow       *string `json:"flow,omitempty"`
+	LimitHWID  *int    `json:"limitHwid,omitempty"`
+	SubID      *string `json:"subId,omitempty"`
+	TgID       *int64  `json:"tgId,omitempty"`
+	Group      *string `json:"group,omitempty"`
+	Comment    *string `json:"comment,omitempty"`
 }

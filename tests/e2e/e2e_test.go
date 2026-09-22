@@ -74,22 +74,31 @@ func (m *MockTelegramServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if strings.HasSuffix(r.URL.Path, "/answerCallbackQuery") {
+		w.Write([]byte(`{"ok":true,"result":true}`))
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/sendMessage") ||
 		strings.HasSuffix(r.URL.Path, "/editMessageText") ||
-		strings.HasSuffix(r.URL.Path, "/sendPhoto") ||
-		strings.HasSuffix(r.URL.Path, "/answerCallbackQuery") {
+		strings.HasSuffix(r.URL.Path, "/sendPhoto") {
 
-		_ = r.ParseMultipartForm(10 << 20)
 		params := make(map[string]interface{})
-		for k, v := range r.Form {
-			if len(v) > 0 {
-				params[k] = v[0]
-			}
-		}
-		if r.MultipartForm != nil {
-			for k, v := range r.MultipartForm.Value {
+		contentType := r.Header.Get("Content-Type")
+		if strings.Contains(contentType, "application/json") {
+			bodyBytes, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(bodyBytes, &params)
+		} else {
+			_ = r.ParseMultipartForm(10 << 20)
+			for k, v := range r.Form {
 				if len(v) > 0 {
 					params[k] = v[0]
+				}
+			}
+			if r.MultipartForm != nil {
+				for k, v := range r.MultipartForm.Value {
+					if len(v) > 0 {
+						params[k] = v[0]
+					}
 				}
 			}
 		}
@@ -103,24 +112,33 @@ func (m *MockTelegramServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 		}
 
-		if strings.HasSuffix(r.URL.Path, "/answerCallbackQuery") {
-			w.Write([]byte(`{"ok":true,"result":true}`))
-		} else if strings.HasSuffix(r.URL.Path, "/sendPhoto") {
+		if strings.HasSuffix(r.URL.Path, "/sendPhoto") {
 			replyMarkup := ""
 			if rm, ok := params["reply_markup"]; ok {
-				replyMarkup = fmt.Sprintf(",\"reply_markup\":%s", rm)
+				if rmStr, ok := rm.(string); ok {
+					replyMarkup = fmt.Sprintf(",\"reply_markup\":%s", rmStr)
+				} else {
+					rmJSON, _ := json.Marshal(rm)
+					replyMarkup = fmt.Sprintf(",\"reply_markup\":%s", string(rmJSON))
+				}
 			}
 			caption := ""
 			if cap, ok := params["caption"]; ok {
-				caption = fmt.Sprintf(",\"caption\":\"%s\"", cap)
+				caption = fmt.Sprintf(",\"caption\":%q", fmt.Sprintf("%v", cap))
 			}
 			w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"message_id":999,"chat":{"id":123456},"photo":[{"file_id":"test_photo_file_id","width":100,"height":100}]%s%s,"date":1600000000}}`, caption, replyMarkup)))
 		} else {
 			replyMarkup := ""
 			if rm, ok := params["reply_markup"]; ok {
-				replyMarkup = fmt.Sprintf(",\"reply_markup\":%s", rm)
+				if rmStr, ok := rm.(string); ok {
+					replyMarkup = fmt.Sprintf(",\"reply_markup\":%s", rmStr)
+				} else {
+					rmJSON, _ := json.Marshal(rm)
+					replyMarkup = fmt.Sprintf(",\"reply_markup\":%s", string(rmJSON))
+				}
 			}
-			w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"message_id":999,"chat":{"id":123456},"text":"%s"%s,"date":1600000000}}`, params["text"], replyMarkup)))
+			text := getStr(params, "text")
+			w.Write([]byte(fmt.Sprintf(`{"ok":true,"result":{"message_id":999,"chat":{"id":123456},"text":%q%s,"date":1600000000}}`, text, replyMarkup)))
 		}
 		return
 	}
@@ -397,6 +415,14 @@ func cleanDB(ctx context.Context, t *testing.T) {
 	`)
 	if err != nil {
 		t.Fatalf("Failed to seed paid plans: %v", err)
+	}
+
+	_, err = db.Pool.Exec(ctx, `
+		SELECT setval(pg_get_serial_sequence('test_plans', 'id'), COALESCE((SELECT MAX(id) FROM test_plans), 1));
+		SELECT setval(pg_get_serial_sequence('paid_plans', 'id'), COALESCE((SELECT MAX(id) FROM paid_plans), 1));
+	`)
+	if err != nil {
+		t.Fatalf("Failed to reset sequences: %v", err)
 	}
 
 	// Seed settings

@@ -511,7 +511,7 @@ func HandleDeleteSubscription(c telebot.Context) error {
 		if err != nil {
 			log.Printf("[CRITICAL] subscription %d was removed remotely but cancellation/refund DB transaction failed: %v", sub.ID, err)
 			subID64 := int64(sub.ID)
-			rec := reconcile.NewSubscriptionDeleteRecord(&reconcile.SubscriptionDeletePayload{
+			rec := reconcile.NewSubscriptionCancellationRecord(&reconcile.SubscriptionDeletePayload{
 				SubscriptionID:     &subID64,
 				UserID:             &user.ID,
 				ClientEmail:        sub.ClientEmail,
@@ -520,7 +520,6 @@ func HandleDeleteSubscription(c telebot.Context) error {
 				Reason:             "remote deleted but cancellation/refund DB transaction failed",
 			})
 			rec.OperationKey = fmt.Sprintf("subscription_cancel_reconciliation:%d", sub.ID)
-			rec.Kind = reconcile.KindSubscriptionCancellationDbFailed
 			rec.ObservedState = map[string]any{"remote_deleted": true}
 			rec.ErrorMessage = err.Error()
 			if recErr := db.CreateReconciliationRecord(context.Background(), rec); recErr != nil {
@@ -532,36 +531,39 @@ func HandleDeleteSubscription(c telebot.Context) error {
 			log.Printf("[CRITICAL] cancellation refund request for subscription %d has no valid ID", sub.ID)
 			return c.Send("لغو سرویس ثبت شد اما درخواست استرداد شناسه معتبر ندارد؛ لطفا با پشتیبانی تماس بگیرید.")
 		}
-	} else if err := db.UpdateSubscriptionStatus(context.Background(), sub.ID, db.SubscriptionStatusCancelled); err != nil {
-		log.Printf("[CRITICAL] subscription %d was removed remotely but cancellation DB update failed: %v", sub.ID, err)
-		subID64 := int64(sub.ID)
-		rec := reconcile.NewSubscriptionDeleteRecord(&reconcile.SubscriptionDeletePayload{
-			SubscriptionID: &subID64,
-			UserID:         &user.ID,
-			ClientEmail:    sub.ClientEmail,
-			Reason:         "remote deleted but cancellation DB update failed",
-		})
-		rec.OperationKey = fmt.Sprintf("subscription_cancel_reconciliation:%d", sub.ID)
-		rec.Kind = reconcile.KindSubscriptionCancellationDbFailed
-		rec.ObservedState = map[string]any{"remote_deleted": true}
-		rec.ErrorMessage = err.Error()
-		if recErr := db.CreateReconciliationRecord(context.Background(), rec); recErr != nil {
-			log.Printf("[CRITICAL] failed to persist cancellation reconciliation for subscription %d: %v", sub.ID, recErr)
+	} else {
+		if err := db.UpdateSubscriptionStatus(context.Background(), sub.ID, db.SubscriptionStatusCancelled); err != nil {
+			log.Printf("[CRITICAL] subscription %d was removed remotely but cancellation DB update failed: %v", sub.ID, err)
+			subID64 := int64(sub.ID)
+			rec := reconcile.NewSubscriptionCancellationRecord(&reconcile.SubscriptionDeletePayload{
+				SubscriptionID: &subID64,
+				UserID:         &user.ID,
+				ClientEmail:    sub.ClientEmail,
+				Reason:         "remote deleted but cancellation DB update failed",
+			})
+			rec.OperationKey = fmt.Sprintf("subscription_cancel_reconciliation:%d", sub.ID)
+			rec.ObservedState = map[string]any{"remote_deleted": true}
+			rec.ErrorMessage = err.Error()
+			if recErr := db.CreateReconciliationRecord(context.Background(), rec); recErr != nil {
+				log.Printf("[CRITICAL] failed to persist cancellation reconciliation for subscription %d: %v", sub.ID, recErr)
+			}
+			return c.Send("حذف در پنل انجام شد اما ثبت لغو در دیتابیس ناموفق بود؛ لطفا با پشتیبانی تماس بگیرید.")
 		}
-		return c.Send("حذف در پنل انجام شد اما ثبت لغو در دیتابیس ناموفق بود؛ لطفا با پشتیبانی تماس بگیرید.")
-	} else if sub.PlanType == db.PlanTypePaid && sub.QuoteID == nil {
-		subID64 := int64(sub.ID)
-		legacyReq := &db.RefundRequest{
-			UserID:           user.ID,
-			SubscriptionID:   &subID64,
-			CalculatedAmount: 0,
-			Status:           "pending",
-			OperationKey:     fmt.Sprintf("subscription_cancel_legacy_manual_refund:%d", sub.ID),
-		}
-		if reqErr := db.CreateRefundRequest(context.Background(), legacyReq); reqErr == nil {
-			req = legacyReq
-		} else {
-			log.Printf("[REFUND] Failed to create manual refund review for legacy sub %d: %v", sub.ID, reqErr)
+
+		if sub.PlanType == db.PlanTypePaid && sub.QuoteID == nil {
+			subID64 := int64(sub.ID)
+			legacyReq := &db.RefundRequest{
+				UserID:           user.ID,
+				SubscriptionID:   &subID64,
+				CalculatedAmount: 0,
+				Status:           "pending",
+				OperationKey:     fmt.Sprintf("subscription_cancel_legacy_manual_refund:%d", sub.ID),
+			}
+			if reqErr := db.CreateRefundRequest(context.Background(), legacyReq); reqErr == nil {
+				req = legacyReq
+			} else {
+				log.Printf("[REFUND] Failed to create manual refund review for legacy sub %d: %v", sub.ID, reqErr)
+			}
 		}
 	}
 

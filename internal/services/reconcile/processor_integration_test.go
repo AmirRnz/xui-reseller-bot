@@ -95,8 +95,8 @@ func TestProcessOnce_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get reconciliation record: %v", err)
 	}
-	if rec.Status != "completed" {
-		t.Fatalf("expected status 'completed', got %s", rec.Status)
+	if rec.Status != db.ReconciliationStatusResolvedVerified && rec.Status != db.ReconciliationStatusResolved {
+		t.Fatalf("expected status 'resolved_verified' or 'resolved', got %s", rec.Status)
 	}
 
 	// 3. Second call finds 0 pending records

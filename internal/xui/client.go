@@ -292,6 +292,24 @@ func (c *Client) UpdateClientPatchResult(email string, patch ClientPatch) WriteR
 		if patch.TotalGB != nil && remote.TotalGB != *patch.TotalGB {
 			matches = false
 		}
+		if patch.Flow != nil && remote.Flow != *patch.Flow {
+			matches = false
+		}
+		if patch.LimitHWID != nil && remote.LimitHWID != *patch.LimitHWID {
+			matches = false
+		}
+		if patch.SubID != nil && remote.SubID != *patch.SubID {
+			matches = false
+		}
+		if patch.TgID != nil && remote.TgID != *patch.TgID {
+			matches = false
+		}
+		if patch.Group != nil && remote.Group != *patch.Group {
+			matches = false
+		}
+		if patch.Comment != nil && remote.Comment != *patch.Comment {
+			matches = false
+		}
 
 		if matches {
 			return WriteResult{Outcome: WriteSucceeded}
@@ -550,6 +568,24 @@ func mergeClientConfigWithPatch(current XUIClientInfo, patch ClientPatch) Client
 	}
 	if patch.TotalGB != nil {
 		merged.TotalGB = *patch.TotalGB
+	}
+	if patch.Flow != nil {
+		merged.Flow = *patch.Flow
+	}
+	if patch.LimitHWID != nil {
+		merged.LimitHWID = *patch.LimitHWID
+	}
+	if patch.SubID != nil {
+		merged.SubID = *patch.SubID
+	}
+	if patch.TgID != nil {
+		merged.TgID = *patch.TgID
+	}
+	if patch.Group != nil {
+		merged.Group = *patch.Group
+	}
+	if patch.Comment != nil {
+		merged.Comment = *patch.Comment
 	}
 
 	return merged

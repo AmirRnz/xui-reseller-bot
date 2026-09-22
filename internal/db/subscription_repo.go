@@ -125,6 +125,9 @@ func CreateSubscription(ctx context.Context, s *Subscription) error {
 	if s.DisplayName == "" {
 		s.DisplayName = s.ClientEmail
 	}
+	if s.Status == "" {
+		s.Status = SubscriptionStatusActive
+	}
 	if s.IPLimit == 0 {
 		s.IPLimit = 1
 	}

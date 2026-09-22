@@ -213,20 +213,28 @@ func checkReconciliationRecordTransitionFailure(ctx context.Context, id int64, l
 }
 
 func ResolveReconciliationRecord(ctx context.Context, id int64, lockedBy string, expectedStatus string, resolution string) error {
+	return ResolveReconciliationRecordWithStatus(ctx, id, lockedBy, expectedStatus, ReconciliationStatusResolvedVerified, resolution)
+}
+
+func ResolveReconciliationRecordWithStatus(ctx context.Context, id int64, lockedBy string, expectedStatus string, targetStatus string, resolution string) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
 	if Pool == nil {
 		return errors.New("database pool is not initialized")
 	}
+	if targetStatus == "" {
+		targetStatus = ReconciliationStatusResolvedVerified
+	}
 	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'resolved_verified', resolution = $1, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
-		WHERE id = $2
-		  AND ($3 = '' OR locked_by = $3)
-		  AND ($4 = '' OR status = $4)
+		SET status = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
+		WHERE id = $3
+		  AND ($4 = '' OR locked_by = $4)
+		  AND ($5 = '' OR status = $5)
+		  AND status IN ('pending', 'pending_refund', 'reconciliation_required')
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
-	`, resolution, id, lockedBy, expectedStatus)
+	`, targetStatus, resolution, id, lockedBy, expectedStatus)
 	if err != nil {
 		return err
 	}
@@ -296,6 +304,7 @@ func FailAndScheduleRetry(ctx context.Context, id int64, lockedBy string, expect
 		WHERE id = $3
 		  AND ($4 = '' OR locked_by = $4)
 		  AND ($5 = '' OR status = $5)
+		  AND status IN ('pending', 'pending_refund', 'reconciliation_required')
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
 	`, errMessage, intervalStr, id, lockedBy, expectedStatus)
 	if err != nil {
@@ -320,6 +329,32 @@ func MarkReconciliationManualReview(ctx context.Context, id int64, lockedBy stri
 		WHERE id = $2
 		  AND ($3 = '' OR locked_by = $3)
 		  AND ($4 = '' OR status = $4)
+		  AND status IN ('pending', 'pending_refund', 'reconciliation_required', 'retryable')
+		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
+	`, reason, id, lockedBy, expectedStatus)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return checkReconciliationRecordTransitionFailure(ctx, id, lockedBy, expectedStatus)
+	}
+	return nil
+}
+
+func FailReconciliationTerminal(ctx context.Context, id int64, lockedBy string, expectedStatus string, reason string) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return errors.New("database pool is not initialized")
+	}
+	tag, err := Pool.Exec(ctx, `
+		UPDATE reconciliation_records
+		SET status = 'failed_terminal', error_message = $1, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
+		WHERE id = $2
+		  AND ($3 = '' OR locked_by = $3)
+		  AND ($4 = '' OR status = $4)
+		  AND status IN ('pending', 'pending_refund', 'reconciliation_required', 'manual_review', 'retryable')
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
 	`, reason, id, lockedBy, expectedStatus)
 	if err != nil {

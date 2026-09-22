@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -12,6 +11,7 @@ import (
 
 	"gopkg.in/telebot.v3"
 	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/db"
 	"xui-reseller-bot/internal/services/reconcile"
 )
@@ -139,14 +139,11 @@ func HandleAdminReconcileDetail(c telebot.Context) error {
 		sb.WriteString(fmt.Sprintf("▫️ **دلیل بازبینی دستی**: %s\n", r.ManualReviewReason))
 	}
 
-	desiredJSON, _ := json.MarshalIndent(r.DesiredState, "", "  ")
-	observedJSON, _ := json.MarshalIndent(r.ObservedState, "", "  ")
-
-	if len(desiredJSON) > 0 && string(desiredJSON) != "{}" {
-		sb.WriteString(fmt.Sprintf("\n📋 **وضعیت مطلوب**:\n```json\n%s\n```\n", string(desiredJSON)))
+	if desiredSummary := formatStateSummary(r.DesiredState); desiredSummary != "" {
+		sb.WriteString(fmt.Sprintf("\n📋 **خلاصه وضعیت مطلوب**:\n%s\n", desiredSummary))
 	}
-	if len(observedJSON) > 0 && string(observedJSON) != "{}" {
-		sb.WriteString(fmt.Sprintf("👁 **وضعیت مشاهده شده**:\n```json\n%s\n```\n", string(observedJSON)))
+	if observedSummary := formatStateSummary(r.ObservedState); observedSummary != "" {
+		sb.WriteString(fmt.Sprintf("\n👁 **خلاصه وضعیت مشاهده شده**:\n%s\n", observedSummary))
 	}
 
 	menu := &telebot.ReplyMarkup{}
@@ -264,12 +261,24 @@ func ProcessAdminReconcileCloseReason(c telebot.Context, text string) error {
 
 func formatReconcileKind(kind string) string {
 	switch kind {
-	case "purchase_provisioning":
-		return "ایجاد اشتراک خرید"
-	case "direct_payment_provisioning":
+	case reconcile.KindPendingRefund, "wallet_refund":
+		return "استرداد در انتظار کیف پول"
+	case reconcile.KindPurchaseProvisioningUnknown, "purchase_provisioning":
+		return "عدم قطعیت ایجاد سرویس در پنل"
+	case reconcile.KindPurchaseRemoteCreatedDbFailed:
+		return "ایجاد در پنل با خطای ثبت دیتابیس"
+	case reconcile.KindSubscriptionUpdateDbFailed:
+		return "بروزرسانی در پنل با خطای دیتابیس"
+	case reconcile.KindSubscriptionDeleteUnknown, "subscription_delete":
+		return "عدم قطعیت حذف سرویس در پنل"
+	case reconcile.KindSubscriptionCancellationDbFailed:
+		return "لغو سرویس با خطای ثبت دیتابیس"
+	case reconcile.KindDirectPaymentProvisioningRetry, "direct_payment_provisioning":
 		return "پرداخت مستقیم و ایجاد سرویس"
-	case "subscription_delete":
-		return "حذف اشتراک"
+	case reconcile.KindSubscriptionRemoteMissing:
+		return "ناپدید شدن سرویس در پنل (مفقود)"
+	case "purchase_request_db_failed_compensated":
+		return "ایجاد سرویس با خطای دیتابیس (جبران‌شده)"
 	case "subscription_ip_change":
 		return "تغییر آی‌پی اشتراک"
 	case "subscription_traffic_reset":
@@ -278,8 +287,6 @@ func formatReconcileKind(kind string) string {
 		return "تمدید اشتراک"
 	case "bulk_credit":
 		return "شارژ گروهی کیف پول"
-	case "wallet_refund":
-		return "استرداد کیف پول"
 	default:
 		return kind
 	}
@@ -287,19 +294,100 @@ func formatReconcileKind(kind string) string {
 
 func formatReconcileStatus(status string) string {
 	switch status {
-	case "pending":
-		return "در انتظار پردازش"
+	case db.ReconciliationStatusPending:
+		return "در انتظار بررسی"
 	case "in_progress":
 		return "در حال پردازش"
-	case "completed":
-		return "تکمیل شده"
+	case db.ReconciliationStatusResolved, "completed":
+		return "حل‌شده"
+	case db.ReconciliationStatusResolvedVerified:
+		return "حل‌شده و راستی‌آزمایی‌شده"
 	case "failed":
 		return "ناموفق"
-	case "manual_review":
+	case db.ReconciliationStatusFailedTerminal:
+		return "ناموفق نهایی"
+	case db.ReconciliationStatusManualReview:
 		return "نیازمند بررسی دستی ادمین"
-	case "manually_resolved":
+	case db.ReconciliationStatusManuallyClosed, "manually_resolved":
 		return "حل‌شده به صورت دستی"
+	case db.ReconciliationStatusManualWaiver:
+		return "صرف‌نظر دستی"
+	case db.ReconciliationStatusRequired:
+		return "نیازمند تطبیق"
+	case db.ReconciliationStatusPendingRefund:
+		return "در انتظار استرداد وجه"
+	case db.ReconciliationStatusSuperseded:
+		return "منسوخ‌شده"
+	case "compensated":
+		return "جبران‌شده"
 	default:
 		return status
 	}
+}
+
+func formatStateSummary(state map[string]any) string {
+	if len(state) == 0 {
+		return ""
+	}
+	var lines []string
+	if email, ok := state["client_email"].(string); ok && email != "" {
+		lines = append(lines, fmt.Sprintf("▫️ ایمیل: `%s`", email))
+	} else if email, ok := state["email"].(string); ok && email != "" {
+		lines = append(lines, fmt.Sprintf("▫️ ایمیل: `%s`", email))
+	}
+	if amt, ok := coerceAnyInt64(state["amount"]); ok && amt > 0 {
+		lines = append(lines, fmt.Sprintf("▫️ مبلغ: %s تومان", persian.FormatMoney(amt)))
+	} else if amt, ok := coerceAnyInt64(state["price"]); ok && amt > 0 {
+		lines = append(lines, fmt.Sprintf("▫️ مبلغ: %s تومان", persian.FormatMoney(amt)))
+	} else if amt, ok := coerceAnyInt64(state["refund_amount"]); ok && amt > 0 {
+		lines = append(lines, fmt.Sprintf("▫️ مبلغ استرداد: %s تومان", persian.FormatMoney(amt)))
+	}
+	if months, ok := coerceAnyInt64(state["months"]); ok && months > 0 {
+		lines = append(lines, fmt.Sprintf("▫️ مدت: %d ماه", months))
+	}
+	if ipLimit, ok := coerceAnyInt64(state["ip_limit"]); ok && ipLimit > 0 {
+		lines = append(lines, fmt.Sprintf("▫️ سقف آی‌پی: %d", ipLimit))
+	}
+	if dataGB, ok := coerceAnyInt64(state["data_gb"]); ok && dataGB > 0 {
+		lines = append(lines, fmt.Sprintf("▫️ سقف ترافیک: %d گیگابایت", dataGB))
+	}
+	if reason, ok := state["reason"].(string); ok && reason != "" {
+		lines = append(lines, fmt.Sprintf("▫️ علت: %s", reason))
+	}
+	if outcome, ok := state["outcome"].(string); ok && outcome != "" {
+		lines = append(lines, fmt.Sprintf("▫️ نتیجه: %s", outcome))
+	}
+	if del, ok := state["remote_deleted"].(bool); ok && del {
+		lines = append(lines, "▫️ وضعیت پنل: از پنل حذف شده")
+	}
+	if cre, ok := state["remote_created"].(bool); ok && cre {
+		lines = append(lines, "▫️ وضعیت پنل: در پنل ایجاد شده")
+	}
+
+	if len(lines) == 0 {
+		for k, v := range state {
+			if v != nil && fmt.Sprintf("%v", v) != "" {
+				lines = append(lines, fmt.Sprintf("▫️ %s: `%v`", k, v))
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func coerceAnyInt64(v any) (int64, bool) {
+	if v == nil {
+		return 0, false
+	}
+	switch val := v.(type) {
+	case int64:
+		return val, true
+	case int:
+		return int64(val), true
+	case float64:
+		return int64(val), true
+	case string:
+		n, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
+		return n, err == nil
+	}
+	return 0, false
 }

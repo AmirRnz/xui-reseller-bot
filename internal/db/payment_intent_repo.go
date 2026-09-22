@@ -156,3 +156,37 @@ func MarkPaymentIntentStatus(ctx context.Context, id int64, status string) error
 	}
 	return nil
 }
+
+func GetPaymentIntentByClientEmail(ctx context.Context, email string) (*PaymentIntent, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	query := `
+		SELECT id, user_id, intent_token, action_type, plan_id, subscription_id, quote_id,
+		       amount_toman, months, ip_limit, data_gb, display_name, client_email,
+		       provisioning_snapshot, status, created_at, updated_at
+		FROM payment_intents
+		WHERE client_email = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`
+	var intent PaymentIntent
+	var snapshotBytes []byte
+	err := Pool.QueryRow(ctx, query, email).Scan(
+		&intent.ID, &intent.UserID, &intent.IntentToken, &intent.ActionType, &intent.PlanID,
+		&intent.SubscriptionID, &intent.QuoteID, &intent.AmountToman, &intent.Months,
+		&intent.IPLimit, &intent.DataGB, &intent.DisplayName, &intent.ClientEmail,
+		&snapshotBytes, &intent.Status, &intent.CreatedAt, &intent.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrPaymentIntentNotFound
+		}
+		return nil, fmt.Errorf("failed to get payment intent by client email: %w", err)
+	}
+
+	if len(snapshotBytes) > 0 {
+		_ = json.Unmarshal(snapshotBytes, &intent.ProvisioningSnapshot)
+	}
+	return &intent, nil
+}

@@ -279,6 +279,42 @@ func NewSubscriptionDeleteRecord(p *SubscriptionDeletePayload) *db.Reconciliatio
 	}
 }
 
+func NewSubscriptionCancellationRecord(p *SubscriptionDeletePayload) *db.ReconciliationRecord {
+	opKey := p.RefundOperationKey
+	if opKey == "" {
+		if p.SubscriptionID != nil {
+			opKey = fmt.Sprintf("sub:cancel:%d", *p.SubscriptionID)
+		} else {
+			opKey = fmt.Sprintf("sub:cancel:%s", p.ClientEmail)
+		}
+	}
+	return &db.ReconciliationRecord{
+		OperationKey:   opKey,
+		Kind:           KindSubscriptionCancellationDbFailed,
+		UserID:         p.UserID,
+		SubscriptionID: p.SubscriptionID,
+		DesiredState:   p.ToMap(),
+		ObservedState:  map[string]any{"remote_deleted": true},
+		Status:         "pending",
+	}
+}
+
+func NewPurchaseRemoteCreatedDbFailedRecord(p *PurchaseProvisioningPayload) *db.ReconciliationRecord {
+	opKey := p.OperationKey
+	if !strings.HasSuffix(opKey, ":db_failed") && !strings.Contains(opKey, "db_failed") {
+		opKey = opKey + ":db_failed"
+	}
+	return &db.ReconciliationRecord{
+		OperationKey:      opKey,
+		Kind:              KindPurchaseRemoteCreatedDbFailed,
+		UserID:            &p.UserID,
+		PurchaseRequestID: p.PurchaseRequestID,
+		DesiredState:      p.ToMap(),
+		ObservedState:     map[string]any{"remote_created": true},
+		Status:            "pending",
+	}
+}
+
 func NewDirectPaymentProvisioningRecord(p *DirectPaymentProvisioningPayload) *db.ReconciliationRecord {
 	reqID := p.PurchaseRequestID
 	opKey := p.OperationKey

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"xui-reseller-bot/internal/db"
+	"xui-reseller-bot/internal/services/reconcile"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -288,26 +289,32 @@ func compensateRemoteCreateDbFailure(
 		}
 
 	case deleteReconciliationRequired:
-		desired := map[string]any{
-			"action":               "confirm_delete_and_refund",
-			"email":                client.Email,
-			"client_id":            client.ID,
-			"client_uuid":          client.ID,
-			"sub_id":               client.SubID,
-			"inbound_ids":          inboundIDs,
-			"enable":               client.Enable,
-			"expiry_time":          client.ExpiryTime,
-			"limit_ip":             client.LimitIP,
-			"total_gb":             client.TotalGB,
-			"plan_id":              plan.ID,
-			"plan_name":            plan.Name,
-			"user_id":              user.ID,
-			"display_name":         displayName,
-			"price":                price,
-			"operation_key":        operationKey,
-			"refund_operation_key": operationKey + ":refund",
-			"db_error":             dbErr.Error(),
+		planID := int(plan.ID)
+		months := 1
+		if client.ExpiryTime < 0 {
+			months = int((-client.ExpiryTime) / (30 * 24 * 3600 * 1000))
 		}
+		if months <= 0 {
+			months = 1
+		}
+		dataGB := int(client.TotalGB / (1024 * 1024 * 1024))
+		payload := &reconcile.PurchaseProvisioningPayload{
+			UserID:             user.ID,
+			OperationKey:       operationKey,
+			DebitOperationKey:  operationKey,
+			Email:              client.Email,
+			ExpectedUUID:       client.ID,
+			ExpectedSubID:      client.SubID,
+			PlanID:             &planID,
+			InboundIDs:         inboundIDs,
+			Months:             months,
+			IPLimit:            client.LimitIP,
+			DataGB:             dataGB,
+			Price:              price,
+			RefundOperationKey: operationKey + ":refund",
+			DisplayName:        displayName,
+		}
+
 		observed := map[string]any{
 			"remote_created": true,
 			"delete_outcome": "unknown",
@@ -318,15 +325,23 @@ func compensateRemoteCreateDbFailure(
 		if resErr != nil {
 			observed["resolution_error"] = resErr.Error()
 		}
-		rec := &db.ReconciliationRecord{
-			OperationKey:  operationKey + ":compensating_delete_unknown",
-			Kind:          "purchase_remote_created_db_failed",
-			UserID:        &user.ID,
-			DesiredState:  desired,
-			ObservedState: observed,
-			Status:        "reconciliation_required",
-			ErrorMessage:  fmt.Sprintf("local DB failed: %v; remote delete outcome unknown: %v", dbErr, resErr),
+		rec := reconcile.NewPurchaseRemoteCreatedDbFailedRecord(payload)
+		rec.DesiredState["action"] = "confirm_delete_and_refund"
+		rec.DesiredState["client_id"] = client.ID
+		rec.DesiredState["client_uuid"] = client.ID
+		rec.DesiredState["sub_id"] = client.SubID
+		rec.DesiredState["plan_name"] = plan.Name
+		rec.DesiredState["enable"] = client.Enable
+		rec.DesiredState["expiry_time"] = client.ExpiryTime
+		rec.DesiredState["limit_ip"] = client.LimitIP
+		rec.DesiredState["total_gb"] = client.TotalGB
+		if dbErr != nil {
+			rec.DesiredState["db_error"] = dbErr.Error()
 		}
+		rec.OperationKey = operationKey + ":compensating_delete_unknown"
+		rec.ObservedState = observed
+		rec.Status = "reconciliation_required"
+		rec.ErrorMessage = fmt.Sprintf("local DB failed: %v; remote delete outcome unknown: %v", dbErr, resErr)
 		reconErr := persistReconFn(ctx, rec)
 		return RemoteCreateCompensationResult{
 			Outcome:   CompensationReconciliationRequired,
@@ -338,26 +353,32 @@ func compensateRemoteCreateDbFailure(
 		}
 
 	default: // deleteStillPresent or deleteDefinitiveFailure
-		desired := map[string]any{
-			"action":               "adopt_subscription_or_delete",
-			"email":                client.Email,
-			"client_id":            client.ID,
-			"client_uuid":          client.ID,
-			"sub_id":               client.SubID,
-			"inbound_ids":          inboundIDs,
-			"enable":               client.Enable,
-			"expiry_time":          client.ExpiryTime,
-			"limit_ip":             client.LimitIP,
-			"total_gb":             client.TotalGB,
-			"plan_id":              plan.ID,
-			"plan_name":            plan.Name,
-			"user_id":              user.ID,
-			"display_name":         displayName,
-			"price":                price,
-			"operation_key":        operationKey,
-			"refund_operation_key": operationKey + ":refund",
-			"db_error":             dbErr.Error(),
+		planID := int(plan.ID)
+		months := 1
+		if client.ExpiryTime < 0 {
+			months = int((-client.ExpiryTime) / (30 * 24 * 3600 * 1000))
 		}
+		if months <= 0 {
+			months = 1
+		}
+		dataGB := int(client.TotalGB / (1024 * 1024 * 1024))
+		payload := &reconcile.PurchaseProvisioningPayload{
+			UserID:             user.ID,
+			OperationKey:       operationKey,
+			DebitOperationKey:  operationKey,
+			Email:              client.Email,
+			ExpectedUUID:       client.ID,
+			ExpectedSubID:      client.SubID,
+			PlanID:             &planID,
+			InboundIDs:         inboundIDs,
+			Months:             months,
+			IPLimit:            client.LimitIP,
+			DataGB:             dataGB,
+			Price:              price,
+			RefundOperationKey: operationKey + ":refund",
+			DisplayName:        displayName,
+		}
+
 		observed := map[string]any{
 			"remote_created": true,
 			"client_present": true,
@@ -365,15 +386,23 @@ func compensateRemoteCreateDbFailure(
 		if deleteErr != nil {
 			observed["delete_error"] = deleteErr.Error()
 		}
-		rec := &db.ReconciliationRecord{
-			OperationKey:  operationKey + ":client_present_db_failed",
-			Kind:          "purchase_remote_created_db_failed",
-			UserID:        &user.ID,
-			DesiredState:  desired,
-			ObservedState: observed,
-			Status:        "reconciliation_required",
-			ErrorMessage:  fmt.Sprintf("local DB failed: %v; remote client remains present on panel", dbErr),
+		rec := reconcile.NewPurchaseRemoteCreatedDbFailedRecord(payload)
+		rec.DesiredState["action"] = "adopt_subscription_or_delete"
+		rec.DesiredState["client_id"] = client.ID
+		rec.DesiredState["client_uuid"] = client.ID
+		rec.DesiredState["sub_id"] = client.SubID
+		rec.DesiredState["plan_name"] = plan.Name
+		rec.DesiredState["enable"] = client.Enable
+		rec.DesiredState["expiry_time"] = client.ExpiryTime
+		rec.DesiredState["limit_ip"] = client.LimitIP
+		rec.DesiredState["total_gb"] = client.TotalGB
+		if dbErr != nil {
+			rec.DesiredState["db_error"] = dbErr.Error()
 		}
+		rec.OperationKey = operationKey + ":client_present_db_failed"
+		rec.ObservedState = observed
+		rec.Status = "reconciliation_required"
+		rec.ErrorMessage = fmt.Sprintf("local DB failed: %v; remote client remains present on panel", dbErr)
 		reconErr := persistReconFn(ctx, rec)
 		return RemoteCreateCompensationResult{
 			Outcome:   CompensationClientStillPresent,

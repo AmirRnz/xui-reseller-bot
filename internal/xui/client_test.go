@@ -804,3 +804,177 @@ func TestFindClientBySubID_BoundedPagination(t *testing.T) {
 		}
 	})
 }
+
+func TestUpdateClientPatchResult(t *testing.T) {
+	t.Run("partial update preserves remote unset fields and updates set fields", func(t *testing.T) {
+		var mu sync.Mutex
+		remote := XUIClientInfo{
+			Email:      "patch@example.com",
+			SubID:      "sub-old",
+			Flow:       "xtls-rprx-vision",
+			ExpiryTime: 1000,
+			Enable:     true,
+			LimitIP:    1,
+			TotalGB:    5000,
+			Group:      "grp1",
+		}
+		var received ClientConfig
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/panel/api/clients/get/patch@example.com":
+				mu.Lock()
+				curr := remote
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": curr})
+			case "/panel/api/clients/update/patch@example.com":
+				if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client, err := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		if err != nil {
+			t.Fatalf("NewClient failed: %v", err)
+		}
+
+		newIP := 5
+		res := client.UpdateClientPatchResult("patch@example.com", ClientPatch{
+			LimitIP: &newIP,
+		})
+		if res.Outcome != WriteSucceeded {
+			t.Fatalf("expected WriteSucceeded, got %v: %v", res.Outcome, res.Err)
+		}
+		if received.LimitIP != 5 {
+			t.Errorf("expected LimitIP=5, got %d", received.LimitIP)
+		}
+		if received.Flow != "xtls-rprx-vision" {
+			t.Errorf("expected Flow preserved as xtls-rprx-vision, got %s", received.Flow)
+		}
+		if received.TotalGB != 5000 {
+			t.Errorf("expected TotalGB preserved as 5000, got %d", received.TotalGB)
+		}
+		if received.Group != "grp1" {
+			t.Errorf("expected Group preserved as grp1, got %s", received.Group)
+		}
+	})
+
+	t.Run("TotalGB 0 is explicitly applied and flow can be cleared", func(t *testing.T) {
+		var received ClientConfig
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/panel/api/clients/get/zero@example.com":
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": XUIClientInfo{
+					Email:   "zero@example.com",
+					Flow:    "old-flow",
+					TotalGB: 99999,
+				}})
+			case "/panel/api/clients/update/zero@example.com":
+				if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		zeroGB := int64(0)
+		emptyFlow := ""
+		res := client.UpdateClientPatchResult("zero@example.com", ClientPatch{
+			TotalGB: &zeroGB,
+			Flow:    &emptyFlow,
+		})
+		if res.Outcome != WriteSucceeded {
+			t.Fatalf("expected WriteSucceeded, got %v: %v", res.Outcome, res.Err)
+		}
+		if received.TotalGB != 0 {
+			t.Errorf("expected TotalGB=0, got %d", received.TotalGB)
+		}
+		if received.Flow != "" {
+			t.Errorf("expected Flow cleared to empty, got %q", received.Flow)
+		}
+	})
+
+	t.Run("timeout verification mismatch returns WriteUnknown", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/panel/api/clients/get/timeout-mismatch@example.com":
+				// Remote still has old IP=1, old Flow="old"
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": XUIClientInfo{
+					Email:   "timeout-mismatch@example.com",
+					LimitIP: 1,
+					Flow:    "old",
+				}})
+			case "/panel/api/clients/update/timeout-mismatch@example.com":
+				time.Sleep(100 * time.Millisecond)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		client.httpClient.Timeout = 10 * time.Millisecond
+
+		newIP := 3
+		newFlow := "new-flow"
+		res := client.UpdateClientPatchResult("timeout-mismatch@example.com", ClientPatch{
+			LimitIP: &newIP,
+			Flow:    &newFlow,
+		})
+		if res.Outcome != WriteUnknown {
+			t.Fatalf("expected WriteUnknown on timeout verification mismatch, got %v", res.Outcome)
+		}
+		if res.Err == nil {
+			t.Fatalf("expected non-nil error")
+		}
+	})
+
+	t.Run("timeout verification match returns WriteSucceeded", func(t *testing.T) {
+		var mu sync.Mutex
+		remote := XUIClientInfo{
+			Email:   "timeout-match@example.com",
+			LimitIP: 1,
+			Flow:    "old",
+		}
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/panel/api/clients/get/timeout-match@example.com":
+				mu.Lock()
+				curr := remote
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": curr})
+			case "/panel/api/clients/update/timeout-match@example.com":
+				mu.Lock()
+				remote.LimitIP = 5
+				remote.Flow = "new-flow"
+				mu.Unlock()
+				time.Sleep(100 * time.Millisecond)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		client, _ := NewClient(&config.XUIConfig{BaseURL: server.URL})
+		client.httpClient.Timeout = 10 * time.Millisecond
+
+		newIP := 5
+		newFlow := "new-flow"
+		res := client.UpdateClientPatchResult("timeout-match@example.com", ClientPatch{
+			LimitIP: &newIP,
+			Flow:    &newFlow,
+		})
+		if res.Outcome != WriteSucceeded {
+			t.Fatalf("expected WriteSucceeded on verified timeout readback, got %v: %v", res.Outcome, res.Err)
+		}
+	})
+}

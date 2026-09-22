@@ -80,4 +80,13 @@ func TestPaymentIntentLifecycle(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected ErrPaymentIntentNotFound after status change, got nil")
 	}
+
+	// 5. Get by client email
+	byEmail, err := GetPaymentIntentByClientEmail(ctx, "intent@test.com")
+	if err != nil {
+		t.Fatalf("GetPaymentIntentByClientEmail failed: %v", err)
+	}
+	if byEmail.ID != created.ID || byEmail.ClientEmail != "intent@test.com" {
+		t.Fatalf("GetPaymentIntentByClientEmail mismatch: %+v", byEmail)
+	}
 }

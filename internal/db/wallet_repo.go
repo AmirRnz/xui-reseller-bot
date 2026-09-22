@@ -263,11 +263,68 @@ func CreditAllApprovedUsersWithKey(ctx context.Context, amount int64, descriptio
 	defer tx.Rollback(ctx)
 
 	if operationKey != "" {
-		var existingOpID int64
-		err := tx.QueryRow(ctx, `SELECT id FROM bulk_credit_operations WHERE operation_key = $1`, operationKey).Scan(&existingOpID)
+		var opID int64
+		var opStatus string
+		var recipientUserIDs []int64
+
+		err := tx.QueryRow(ctx, `
+			SELECT id, status, recipient_user_ids
+			FROM bulk_credit_operations
+			WHERE operation_key = $1
+			FOR UPDATE
+		`, operationKey).Scan(&opID, &opStatus, &recipientUserIDs)
+
 		if err == nil {
-			_ = tx.Rollback(ctx)
-			return 0, ErrWalletOperationAlreadyApplied
+			if opStatus == "completed" {
+				_ = tx.Rollback(ctx)
+				return 0, ErrWalletOperationAlreadyApplied
+			}
+			// Operation exists but not completed; resume using snapshotted recipients.
+		} else if errors.Is(err, pgx.ErrNoRows) {
+			rows, qErr := tx.Query(ctx, `
+				SELECT id
+				FROM bot_users
+				WHERE status IN ('active', 'approved')
+				ORDER BY id
+				FOR UPDATE
+			`)
+			if qErr != nil {
+				return 0, qErr
+			}
+			recipientUserIDs = make([]int64, 0)
+			for rows.Next() {
+				var uid int64
+				if sErr := rows.Scan(&uid); sErr != nil {
+					rows.Close()
+					return 0, sErr
+				}
+				recipientUserIDs = append(recipientUserIDs, uid)
+			}
+			if rErr := rows.Err(); rErr != nil {
+				return 0, rErr
+			}
+
+			if len(recipientUserIDs) == 0 {
+				_, err = tx.Exec(ctx, `
+					INSERT INTO bulk_credit_operations (operation_key, amount, admin_id, recipient_user_ids, status, created_at)
+					VALUES ($1, $2, NULL, '{}', 'completed', NOW())
+				`, operationKey, amount)
+				if err != nil {
+					return 0, err
+				}
+				return 0, tx.Commit(ctx)
+			}
+
+			err = tx.QueryRow(ctx, `
+				INSERT INTO bulk_credit_operations (operation_key, amount, admin_id, recipient_user_ids, status, created_at)
+				VALUES ($1, $2, NULL, $3, 'in_progress', NOW())
+				RETURNING id
+			`, operationKey, amount, recipientUserIDs).Scan(&opID)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			return 0, err
 		}
 
 		tag, err := tx.Exec(ctx, `
@@ -275,7 +332,7 @@ func CreditAllApprovedUsersWithKey(ctx context.Context, amount int64, descriptio
 				INSERT INTO transactions (user_id, amount, type, status, description, operation_key)
 				SELECT id, $1, 'credit', 'completed', $2, $3 || ':user:' || id
 				FROM bot_users
-				WHERE status IN ('active', 'approved')
+				WHERE id = ANY($4)
 				ON CONFLICT (operation_key) DO NOTHING
 				RETURNING user_id
 			)
@@ -283,32 +340,21 @@ func CreditAllApprovedUsersWithKey(ctx context.Context, amount int64, descriptio
 			SET wallet_balance = u.wallet_balance + $1, updated_at = NOW()
 			FROM inserted_txs i
 			WHERE u.id = i.user_id
-		`, amount, description, operationKey)
+		`, amount, description, operationKey, recipientUserIDs)
+		if err != nil {
+			return 0, err
+		}
+
+		_, err = tx.Exec(ctx, `
+			UPDATE bulk_credit_operations
+			SET status = 'completed'
+			WHERE id = $1
+		`, opID)
 		if err != nil {
 			return 0, err
 		}
 
 		count := tag.RowsAffected()
-		if count == 0 {
-			var existingCount int64
-			err := tx.QueryRow(ctx, `
-				SELECT COUNT(*) FROM transactions WHERE operation_key LIKE $1 || ':user:%'
-			`, operationKey).Scan(&existingCount)
-			if err == nil && existingCount > 0 {
-				_ = tx.Rollback(ctx)
-				return 0, ErrWalletOperationAlreadyApplied
-			}
-		}
-
-		_, _ = tx.Exec(ctx, `
-			INSERT INTO bulk_credit_operations (operation_key, amount, admin_id, recipient_user_ids, status, created_at)
-			SELECT $1, $2, NULL, COALESCE(ARRAY_AGG(user_id), '{}'), 'completed', NOW()
-			FROM (
-				SELECT DISTINCT user_id FROM transactions WHERE operation_key LIKE $1 || ':user:%'
-			) s
-			ON CONFLICT (operation_key) DO NOTHING
-		`, operationKey, amount)
-
 		return count, tx.Commit(ctx)
 	}
 

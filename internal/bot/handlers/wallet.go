@@ -620,6 +620,35 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 		return fmt.Errorf("x-ui client is not initialized")
 	}
 	inboundIDs := validInboundIDs(plan.InboundIDs)
+	flow := plan.Flow
+	planName := plan.Name
+	if intent, err := db.GetPaymentIntentByClientEmail(context.Background(), req.ClientEmail); err == nil && intent != nil && intent.ProvisioningSnapshot != nil {
+		if snapshotInbounds, ok := intent.ProvisioningSnapshot["inbound_ids"]; ok && snapshotInbounds != nil {
+			var ids []int
+			switch v := snapshotInbounds.(type) {
+			case []int:
+				ids = v
+			case []any:
+				for _, item := range v {
+					if idF, ok := item.(float64); ok {
+						ids = append(ids, int(idF))
+					} else if idI, ok := item.(int); ok {
+						ids = append(ids, idI)
+					}
+				}
+			}
+			if len(ids) > 0 {
+				inboundIDs = validInboundIDs(ids)
+			}
+		}
+		if snapFlow, ok := intent.ProvisioningSnapshot["flow"].(string); ok && snapFlow != "" {
+			flow = snapFlow
+		}
+		if snapName, ok := intent.ProvisioningSnapshot["plan_name"].(string); ok && snapName != "" {
+			planName = snapName
+		}
+	}
+
 	if len(inboundIDs) == 0 {
 		return fmt.Errorf("این طرح هیچ کانکشن معتبری ندارد")
 	}
@@ -628,7 +657,7 @@ func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req
 	totalBytes := int64(req.DataGB) * 1073741824
 	subID := makeSubID()
 	clientUUID := makeClientUUID()
-	client := prepareClientConfig(req.ClientEmail, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, req.IPLimit, plan.Flow, subID, clientUUID, plan.Name, user)
+	client := prepareClientConfig(req.ClientEmail, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, req.IPLimit, flow, subID, clientUUID, planName, user)
 
 	err := bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: inboundIDs})
 	if err != nil && !xui.IsUnknownOutcome(err) {
