@@ -540,7 +540,7 @@ func GetTestUsageToday(ctx context.Context, userID int64, planID int64) (int, er
 	var count int
 	err := Pool.QueryRow(ctx, `
 		SELECT used_count FROM test_usage
-		WHERE user_id = $1 AND plan_id = $2 AND reset_date = CURRENT_DATE
+		WHERE user_id = $1 AND plan_id = $2 AND reset_date = (NOW() AT TIME ZONE 'UTC')::date
 	`, userID, planID).Scan(&count)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -551,19 +551,43 @@ func GetTestUsageToday(ctx context.Context, userID int64, planID int64) (int, er
 	return count, nil
 }
 
-func IncrementTestUsageToday(ctx context.Context, userID int64, planID int64, increment int) error {
+var ErrTestUsageLimitReached = errors.New("daily test subscription limit reached")
+
+// ReserveTestUsageToday atomically claims quota before remote provisioning.
+func ReserveTestUsageToday(ctx context.Context, userID int64, planID int64, limit int) (time.Time, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
-	if increment <= 0 {
-		increment = 1
+	if limit <= 0 {
+		return time.Time{}, ErrTestUsageLimitReached
 	}
-	_, err := Pool.Exec(ctx, `
+	var resetDate time.Time
+	err := Pool.QueryRow(ctx, `
 		INSERT INTO test_usage (user_id, plan_id, used_count, reset_date)
-		VALUES ($1, $2, $3, CURRENT_DATE)
+		VALUES ($1, $2, 1, (NOW() AT TIME ZONE 'UTC')::date)
 		ON CONFLICT (user_id, plan_id, reset_date)
 		DO UPDATE SET used_count = test_usage.used_count + EXCLUDED.used_count, updated_at = NOW()
-	`, userID, planID, increment)
+		WHERE test_usage.used_count + 1 <= $3
+		RETURNING reset_date
+	`, userID, planID, limit).Scan(&resetDate)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, ErrTestUsageLimitReached
+	}
+	return resetDate, err
+}
+
+// ReleaseTestUsageToday frees only the quota units reserved by a confirmed
+// no-write attempt. The reservation date is returned by ReserveTestUsageToday
+// so a request crossing midnight still releases the correct day's quota.
+func ReleaseTestUsageToday(ctx context.Context, userID int64, planID int64, resetDate time.Time) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	_, err := Pool.Exec(ctx, `
+		UPDATE test_usage
+		SET used_count = GREATEST(used_count - 1, 0), updated_at = NOW()
+		WHERE user_id = $1 AND plan_id = $2 AND reset_date = $3::date
+	`, userID, planID, resetDate)
 	return err
 }
 

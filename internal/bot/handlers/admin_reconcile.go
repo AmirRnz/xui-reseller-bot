@@ -81,7 +81,11 @@ func HandleAdminReconcileRun(c telebot.Context) error {
 func HandleAdminReconcileManual(c telebot.Context) error {
 	_ = c.Respond()
 	records, err := db.GetManualReviewReconciliationRecords(context.Background(), 10)
-	if err != nil || len(records) == 0 {
+	if err != nil {
+		log.Printf("[ERROR] Failed to load manual-review reconciliation records: %v", err)
+		return maybeEditOrSend(c, "خطا در دریافت موارد نیازمند بررسی دستی.")
+	}
+	if len(records) == 0 {
 		menu := &telebot.ReplyMarkup{}
 		menu.Inline(menu.Row(menu.Data("« بازگشت", "admin_reconcile")))
 		return maybeEditOrSend(c, "✅ هیچ موردی نیازمند بررسی دستی وجود ندارد.", menu)
@@ -380,6 +384,8 @@ func formatReconcileKind(kind string) string {
 		return "پرداخت مستقیم و ایجاد سرویس"
 	case reconcile.KindSubscriptionRemoteMissing:
 		return "ناپدید شدن سرویس در پنل (مفقود)"
+	case "test_subscription_provisioning_unknown":
+		return "وضعیت ایجاد اشتراک تست نامشخص"
 	case "purchase_request_db_failed_compensated":
 		return "ایجاد سرویس با خطای دیتابیس (جبران‌شده)"
 	case "subscription_ip_change":

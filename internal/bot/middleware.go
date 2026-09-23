@@ -13,7 +13,7 @@ func AuthMiddleware() telebot.MiddlewareFunc {
 	return func(next telebot.HandlerFunc) telebot.HandlerFunc {
 		return func(c telebot.Context) error {
 			if c.Sender() == nil {
-				return next(c)
+				return nil
 			}
 
 			telegramID := c.Sender().ID
@@ -52,8 +52,8 @@ func AuthMiddleware() telebot.MiddlewareFunc {
 func AdminMiddleware(adminCfg *config.AdminConfig) telebot.MiddlewareFunc {
 	return func(next telebot.HandlerFunc) telebot.HandlerFunc {
 		return func(c telebot.Context) error {
-			if c.Sender() == nil {
-				return next(c)
+			if c.Sender() == nil || adminCfg == nil {
+				return nil
 			}
 
 			isAdmin := false

@@ -14,7 +14,7 @@ The two bot repositories serve different commercial audiences with distinct test
 | **Purpose of Test** | Personal trial to test connectivity before buying | Demo accounts to distribute to prospective buyers |
 | **Eligibility Model** | Cooldown reset period (`test_reset_days`) | Daily quota (`MaxPerDay` / `today` usage) |
 | **Reseller Approval Impact**| N/A (all users are retail customers) | Unapproved resellers get lower trial limit; approved resellers get full `MaxPerDay` |
-| **Batch Issuance** | Single test issuance | Bulk/batch generation supported (`fts_multi`) |
+| **Batch Issuance** | Single test issuance | Single test issuance; batch generation is unsupported |
 
 ---
 
@@ -45,9 +45,7 @@ The two bot repositories serve different commercial audiences with distinct test
 - **Reset Logic**: Quotas reset every day at 00:00 UTC.
 
 ### 3.2 Bulk / Multi-Test Generation
-- Approved resellers can generate multiple test links in a single operation (`HandleMultipleTestsRun`).
-- The system validates that `requested_count <= (limit - used_today)`.
-- If an individual test creation fails during a batch, previously created tests remain valid and the error is cleanly reported.
+Batch generation is unsupported. Each request creates at most one test subscription. Legacy callback handlers reject stale buttons from older messages without issuing subscriptions.
 
 ---
 

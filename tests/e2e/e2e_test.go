@@ -1474,8 +1474,8 @@ func TestE2ESuite(t *testing.T) {
 			}
 		})
 
-		// 34. Multi test generation disabled
-		t.Run("MultiTestDisabled", func(t *testing.T) {
+		// Stale multi-test callback must remain rejected.
+		t.Run("LegacyMultiTestCallbackRejected", func(t *testing.T) {
 			setupApprovedUser()
 			env.SendCallback(userTGID, userUsername, 999, "\fts_multi_run|3:1")
 			resp := env.ExpectResponse(t, 2*time.Second)

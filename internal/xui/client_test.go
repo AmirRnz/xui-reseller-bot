@@ -96,6 +96,65 @@ func TestMutationReadinessGateAndRecovery(t *testing.T) {
 	}
 }
 
+func TestCheckReadinessHonorsContextForInboundRead(t *testing.T) {
+	inboundStarted := make(chan struct{})
+	inboundCancelled := make(chan struct{})
+	releaseInbound := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseInbound) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/panel/api/server/getPanelUpdateInfo":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": map[string]any{"currentVersion": "3.8.5"}})
+		case "/panel/api/inbounds/options":
+			close(inboundStarted)
+			select {
+			case <-r.Context().Done():
+				close(inboundCancelled)
+				return
+			case <-releaseInbound:
+				_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": []any{}})
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := client.CheckReadiness(ctx)
+		resultCh <- err
+	}()
+
+	select {
+	case <-inboundStarted:
+	case <-time.After(time.Second):
+		t.Fatal("readiness check did not start inbound read")
+	}
+	cancel()
+	select {
+	case err := <-resultCh:
+		if err == nil {
+			t.Fatal("expected canceled readiness check to return an error")
+		}
+	case <-time.After(time.Second):
+		releaseOnce.Do(func() { close(releaseInbound) })
+		<-resultCh
+		t.Fatal("readiness check did not stop after its context was canceled")
+	}
+	select {
+	case <-inboundCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("canceled context was not propagated to the inbound request")
+	}
+}
+
 func TestGetClientByEmailReturnsTypedNotFound(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "client does not exist", http.StatusNotFound)
@@ -886,6 +945,147 @@ func TestFindClientBySubID_BoundedPagination(t *testing.T) {
 			t.Fatalf("expected early stop after page 1 (filtered=3 <= 10), got %d calls", pageCalls)
 		}
 	})
+}
+
+func TestAddClientRepairsPartialInboundApplicationReportedByPanel(t *testing.T) {
+	var mu sync.Mutex
+	remote := XUIClientInfo{
+		Email: "partial-error@example.com", UUID: "partial-error-uuid",
+		SubID: "partial-error-sub", Enable: true, ExpiryTime: -3600000,
+		LimitIP: 2, TotalGB: 2147483648, InboundIDs: []int{11},
+	}
+	addCalls, attachCalls := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/panel/api/clients/add":
+			mu.Lock()
+			addCalls++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "msg": "inbound 22: address unavailable"})
+		case "/panel/api/clients/get/partial-error@example.com":
+			mu.Lock()
+			current := remote
+			current.InboundIDs = append([]int(nil), remote.InboundIDs...)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": current})
+		case "/panel/api/clients/partial-error@example.com/attach":
+			mu.Lock()
+			attachCalls++
+			remote.InboundIDs = append(remote.InboundIDs, 22)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	result := client.AddClientResult(AddClientRequest{Client: ClientConfig{
+		ID: "partial-error-uuid", Email: "partial-error@example.com",
+		SubID: "partial-error-sub", Enable: true, ExpiryTime: -3600000,
+		LimitIP: 2, TotalGB: 2147483648,
+	}, InboundIDs: []int{11, 22}})
+	if result.Outcome != WriteSucceeded || result.Err != nil {
+		t.Fatalf("expected partial add to be repaired and verified, got %#v", result)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if addCalls != 1 || attachCalls != 1 {
+		t.Fatalf("expected one add and one repair, got add=%d attach=%d", addCalls, attachCalls)
+	}
+}
+
+func TestUpdateClientPanelPartialFailureRemainsUnknown(t *testing.T) {
+	getCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/panel/api/clients/get/update-partial@example.com":
+			getCalls++
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": XUIClientInfo{
+				Email: "update-partial@example.com", LimitIP: 3,
+			}})
+		case "/panel/api/clients/update/update-partial@example.com":
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": false, "msg": "inbound 7: update failed"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	newLimit := 5
+	result := client.UpdateClientPatchResult("update-partial@example.com", ClientPatch{LimitIP: &newLimit})
+	if result.Outcome != WriteUnknown || !IsUnknownOutcome(result.Err) {
+		t.Fatalf("expected partial update to remain unknown, got %#v", result)
+	}
+	if getCalls != 1 {
+		t.Fatalf("partial API failure must not be resolved from one aggregate readback, got %d reads", getCalls)
+	}
+}
+
+func TestAddClientMalformedResponseRemainsUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/panel/api/clients/add":
+			_, _ = w.Write([]byte("not-json"))
+		case "/panel/api/clients/get/malformed@example.com":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	result := client.AddClientResult(AddClientRequest{Client: ClientConfig{
+		ID: "malformed-uuid", Email: "malformed@example.com", SubID: "malformed-sub",
+	}, InboundIDs: []int{11}})
+	if result.Outcome != WriteUnknown || !IsUnknownOutcome(result.Err) {
+		t.Fatalf("malformed write response must remain unknown, got %#v", result)
+	}
+}
+
+func TestGetClientByEmailRejectsEmptySuccessObject(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "obj": nil})
+	}))
+	defer server.Close()
+
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	if _, err := client.GetClientByEmail("missing@example.com"); err == nil {
+		t.Fatal("expected an empty success object to be rejected as an invalid client read")
+	}
+}
+
+func TestSupportedPanelVersionRequiresExactPatchVersion(t *testing.T) {
+	for _, test := range []struct {
+		version   string
+		supported bool
+	}{
+		{"3.8.5", true},
+		{"v3.8.5", true},
+		{"3.8.5-beta.1", true},
+		{"3.8.50", false},
+		{"3.8.4", false},
+		{"3.8.6", false},
+	} {
+		if got := isSupportedPanelVersion(test.version); got != test.supported {
+			t.Errorf("isSupportedPanelVersion(%q) = %v, want %v", test.version, got, test.supported)
+		}
+	}
 }
 
 func TestUpdateClientPatchResult(t *testing.T) {

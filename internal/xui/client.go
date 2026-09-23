@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -208,7 +209,7 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 	}
 
 	var updateInfo PanelUpdateInfo
-	err := c.doRequest("GET", "/panel/api/server/getPanelUpdateInfo", nil, &updateInfo)
+	err := c.doRequestContext(ctx, "GET", "/panel/api/server/getPanelUpdateInfo", nil, &updateInfo)
 	if err != nil {
 		status.Error = fmt.Errorf("master server unreachable or token invalid: %w", err)
 		c.SetReady(false)
@@ -218,15 +219,15 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 	status.TokenValid = true
 	status.Version = updateInfo.CurrentVersion
 	normalizedVersion := strings.TrimPrefix(strings.TrimSpace(updateInfo.CurrentVersion), "v")
-	status.VersionOK = strings.HasPrefix(normalizedVersion, "3.8.5")
+	status.VersionOK = isSupportedPanelVersion(normalizedVersion)
 	if !status.VersionOK {
 		status.Error = fmt.Errorf("unsupported 3x-ui version %s (expected 3.8.5)", status.Version)
 		c.SetReady(false)
 		return status, status.Error
 	}
 
-	inbounds, err := c.GetInbounds()
-	if err != nil {
+	var inbounds []Inbound
+	if err := c.doRequestContext(ctx, "GET", "/panel/api/inbounds/options", nil, &inbounds); err != nil {
 		status.Error = fmt.Errorf("failed to fetch panel inbounds: %w", err)
 		c.SetReady(false)
 		return status, status.Error
@@ -234,6 +235,15 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 	status.InboundsCount = len(inbounds)
 	c.SetReady(true)
 	return status, nil
+}
+
+func isSupportedPanelVersion(version string) bool {
+	version = strings.TrimSpace(version)
+	version = strings.TrimPrefix(version, "v")
+	if i := strings.IndexAny(version, "-+"); i >= 0 {
+		version = version[:i]
+	}
+	return version == "3.8.5"
 }
 
 func (c *Client) GetInbounds() ([]Inbound, error) {
@@ -267,12 +277,9 @@ func (c *Client) AddClientResult(req AddClientRequest) WriteResult {
 	if err == nil {
 		return WriteResult{Outcome: WriteSucceeded}
 	}
-	if !isTimeoutError(err) {
-		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: err}}
-	}
-
-	// A timeout is ambiguous. Read the client back before deciding whether the
-	// create committed; never issue a second non-idempotent create blindly.
+	// Panel errors can follow partial application: the add endpoint works on
+	// each requested inbound independently and may still return success:false.
+	// Read back and repair only missing inbounds. Never repeat the create.
 	remote, verifyErr := c.GetClientByEmail(req.Client.Email)
 	if verifyErr == nil && remote != nil {
 		if clientMatchesAdd(*remote, req.Client, req.InboundIDs) {
@@ -320,11 +327,7 @@ func (c *Client) UpdateClientPatchResult(email string, patch ClientPatch) WriteR
 	}
 	current, err := c.GetClientByEmail(email)
 	if err != nil {
-		outcome := WriteDefinitiveFailure
-		if isTimeoutError(err) {
-			outcome = WriteUnknown
-		}
-		return WriteResult{Outcome: outcome, Err: &WriteError{Outcome: outcome, Err: fmt.Errorf("cannot read current x-ui client %s: %w", email, err)}}
+		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: fmt.Errorf("cannot read current x-ui client %s: %w", email, err)}}
 	}
 	if current == nil {
 		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: fmt.Errorf("%w: client %s", ErrNotFound, email)}}
@@ -336,8 +339,8 @@ func (c *Client) UpdateClientPatchResult(email string, patch ClientPatch) WriteR
 	if err == nil {
 		return WriteResult{Outcome: WriteSucceeded}
 	}
-	if !isTimeoutError(err) {
-		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: err}}
+	if isRemoteResponseError(err) {
+		return WriteResult{Outcome: WriteUnknown, Err: &WriteError{Outcome: WriteUnknown, Err: fmt.Errorf("x-ui update client patch may have partially applied for %s: %w", email, err)}}
 	}
 
 	// Timeout or network error! Verification step:
@@ -396,11 +399,7 @@ func (c *Client) UpdateClientResult(email string, client ClientConfig) WriteResu
 	}
 	current, err := c.GetClientByEmail(email)
 	if err != nil {
-		outcome := WriteDefinitiveFailure
-		if isTimeoutError(err) {
-			outcome = WriteUnknown
-		}
-		return WriteResult{Outcome: outcome, Err: &WriteError{Outcome: outcome, Err: fmt.Errorf("cannot read current x-ui client %s: %w", email, err)}}
+		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: fmt.Errorf("cannot read current x-ui client %s: %w", email, err)}}
 	}
 	if current == nil {
 		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: fmt.Errorf("%w: client %s", ErrNotFound, email)}}
@@ -411,8 +410,8 @@ func (c *Client) UpdateClientResult(email string, client ClientConfig) WriteResu
 	if err == nil {
 		return WriteResult{Outcome: WriteSucceeded}
 	}
-	if !isTimeoutError(err) {
-		return WriteResult{Outcome: WriteDefinitiveFailure, Err: &WriteError{Outcome: WriteDefinitiveFailure, Err: err}}
+	if isRemoteResponseError(err) {
+		return WriteResult{Outcome: WriteUnknown, Err: &WriteError{Outcome: WriteUnknown, Err: fmt.Errorf("x-ui update client may have partially applied for %s: %w", email, err)}}
 	}
 
 	remote, verifyErr := c.GetClientByEmail(email)
@@ -432,50 +431,61 @@ func (c *Client) UpdateClientResult(email string, client ClientConfig) WriteResu
 	return WriteResult{Outcome: WriteUnknown, Err: &WriteError{Outcome: WriteUnknown, Err: unknownErr}}
 }
 
-func isTimeoutError(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout() || errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout") || strings.Contains(strings.ToLower(err.Error()), "deadline exceeded")
+func isRemoteResponseError(err error) bool {
+	if IsNotFound(err) {
+		return true
+	}
+	var panelErr *PanelAPIError
+	if errors.As(err, &panelErr) {
+		return true
+	}
+	var statusErr *HTTPStatusError
+	return errors.As(err, &statusErr)
 }
 
 func wrapWriteError(err error) error {
 	if err == nil {
 		return nil
 	}
-	outcome := WriteDefinitiveFailure
-	if isTimeoutError(err) {
-		outcome = WriteUnknown
-	}
-	return &WriteError{Outcome: outcome, Err: err}
+	return &WriteError{Outcome: WriteUnknown, Err: err}
 }
 
 func clientMatchesAdd(remote XUIClientInfo, desired ClientConfig, inboundIDs []int) bool {
-	return clientMatchesAddFields(remote, desired) && allInboundIDsPresent(remote.InboundIDs, inboundIDs)
+	return clientMatchesAddFields(remote, desired) && sameInboundIDs(remote.InboundIDs, inboundIDs)
 }
 
 func clientMatchesAddFields(remote XUIClientInfo, desired ClientConfig) bool {
 	if remote.Email != desired.Email || remote.Enable != desired.Enable ||
 		remote.ExpiryTime != desired.ExpiryTime || remote.LimitIP != desired.LimitIP ||
-		remote.TotalGB != desired.TotalGB {
+		remote.TotalGB != desired.TotalGB || remote.Flow != desired.Flow ||
+		remote.Group != desired.Group || remote.TgID != desired.TgID ||
+		remote.Comment != desired.Comment || remote.LimitHWID != desired.LimitHWID ||
+		remote.SubID != desired.SubID {
 		return false
 	}
-	if desired.SubID != "" && remote.SubID != desired.SubID {
-		return false
-	}
-	if desired.ID != "" && remote.UUID != desired.ID {
-		return false
+	if desired.ID != "" {
+		if remote.UUID != "" {
+			return remote.UUID == desired.ID
+		}
+		return remote.Password == desired.ID || remote.Auth == desired.ID ||
+			(remote.ID != 0 && strconv.Itoa(remote.ID) == desired.ID)
 	}
 	return true
 }
 
-func allInboundIDsPresent(actual, desired []int) bool {
-	if len(desired) == 0 {
-		return true
-	}
+func sameInboundIDs(actual, expected []int) bool {
 	actualSet := make(map[int]struct{}, len(actual))
+	expectedSet := make(map[int]struct{}, len(expected))
 	for _, id := range actual {
 		actualSet[id] = struct{}{}
 	}
-	for _, id := range desired {
+	for _, id := range expected {
+		expectedSet[id] = struct{}{}
+	}
+	if len(actualSet) != len(expectedSet) {
+		return false
+	}
+	for id := range expectedSet {
 		if _, ok := actualSet[id]; !ok {
 			return false
 		}
@@ -503,10 +513,26 @@ func missingInboundIDs(actual, desired []int) []int {
 }
 
 func clientMatchesUpdate(remote XUIClientInfo, desired ClientConfig) bool {
-	return remote.Email == desired.Email && remote.Enable == desired.Enable &&
+	identityMatches := desired.ID == "" || remote.UUID == desired.ID ||
+		remote.Password == desired.ID || remote.Auth == desired.ID ||
+		(remote.ID != 0 && strconv.Itoa(remote.ID) == desired.ID)
+	return identityMatches && remote.Email == desired.Email && remote.Enable == desired.Enable &&
 		remote.ExpiryTime == desired.ExpiryTime && remote.LimitIP == desired.LimitIP &&
-		(remote.SubID == desired.SubID || desired.SubID == "") &&
-		(remote.TotalGB == desired.TotalGB || desired.TotalGB == 0)
+		remote.Flow == desired.Flow && remote.Group == desired.Group &&
+		remote.Reset == desired.Reset && remote.ResetDay == desired.ResetDay &&
+		remote.ResetMax == desired.ResetMax && remote.Security == desired.Security &&
+		remote.SubID == desired.SubID && remote.TgID == desired.TgID &&
+		remote.TotalGB == desired.TotalGB && remote.Comment == desired.Comment &&
+		remote.Password == desired.Password && remote.Auth == desired.Auth &&
+		remote.LimitHWID == desired.LimitHWID &&
+		reflect.DeepEqual(remote.KeepAlive, desired.KeepAlive) &&
+		remote.ForwardedPorts == desired.ForwardedPorts &&
+		remote.PrivateKey == desired.PrivateKey && remote.PublicKey == desired.PublicKey &&
+		remote.PreSharedKey == desired.PreSharedKey && remote.AllowedIPs == desired.AllowedIPs &&
+		reflect.DeepEqual(remote.AllowedIPsByInbound, desired.AllowedIPsByInbound) &&
+		remote.Secret == desired.Secret && remote.AdTag == desired.AdTag &&
+		remote.TrafficReset == desired.TrafficReset && remote.TrafficResetDay == desired.TrafficResetDay &&
+		reflect.DeepEqual(remote.Reverse, desired.Reverse)
 }
 
 func mergeClientConfig(current XUIClientInfo, desired ClientConfig) ClientConfig {
@@ -885,6 +911,9 @@ func (c *Client) GetClientByEmail(email string) (*XUIClientInfo, error) {
 	var client XUIClientInfo
 	if err := c.doRequest("GET", "/panel/api/clients/get/"+pathEscape(email), nil, &client); err != nil {
 		return nil, err
+	}
+	if strings.TrimSpace(client.Email) == "" || client.Email != email {
+		return nil, fmt.Errorf("x-ui returned an empty or mismatched client for email %s", email)
 	}
 	return &client, nil
 }

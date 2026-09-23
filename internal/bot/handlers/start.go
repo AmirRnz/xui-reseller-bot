@@ -103,10 +103,6 @@ func HandleText(c telebot.Context) error {
 			return ProcessBuyCustomName(c, text)
 		case "awaiting_test_custom_name":
 			return ProcessTestCustomName(c, text)
-		case "awaiting_multiple_tests_base_name":
-			return ProcessMultipleTestsBaseName(c, text)
-		case "awaiting_multiple_tests_count":
-			return ProcessMultipleTestsCount(c, text)
 		case "awaiting_receipt":
 			return c.Send("لطفا رسید پرداخت را به صورت تصویر (عکس) ارسال کنید.")
 		case "awaiting_purchase_receipt":
