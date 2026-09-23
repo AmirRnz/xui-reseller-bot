@@ -11,15 +11,17 @@ import (
 )
 
 type mockXUI struct {
-	client       *xui.XUIClientInfo
-	err          error
-	delErr       error
-	updateRes    xui.WriteResult
-	updatedState *xui.ClientConfig
-	addRes       xui.WriteResult
-	addResults   []xui.WriteResult
-	addCalls     int
-	persistAdded bool
+	client        *xui.XUIClientInfo
+	err           error
+	delErr        error
+	updateRes     xui.WriteResult
+	updatedState  *xui.ClientConfig
+	addRes        xui.WriteResult
+	addResults    []xui.WriteResult
+	addCalls      int
+	persistAdded  bool
+	updateCalls   int
+	persistUpdate bool
 }
 
 func amountPtr(value int64) *int64 { return &value }
@@ -64,7 +66,17 @@ func (m *mockXUI) AddClientResult(req xui.AddClientRequest) xui.WriteResult {
 }
 
 func (m *mockXUI) UpdateClientResult(email string, client xui.ClientConfig) xui.WriteResult {
+	m.updateCalls++
 	m.updatedState = &client
+	if m.persistUpdate && m.client != nil {
+		m.client.Enable = client.Enable
+		m.client.ExpiryTime = client.ExpiryTime
+		m.client.LimitIP = client.LimitIP
+		m.client.SubID = client.SubID
+		if client.TotalGB != 0 {
+			m.client.TotalGB = client.TotalGB
+		}
+	}
 	if m.updateRes.Outcome != "" {
 		return m.updateRes
 	}

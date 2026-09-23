@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 )
 
 type Migration struct {
@@ -353,9 +354,34 @@ CREATE TABLE IF NOT EXISTS ip_limit_repair_rows (
 );
 `,
 	},
+	{
+		Version: 15,
+		Name:    "subscription_lifecycle_status_active_consistency",
+		SQL: `
+ALTER TABLE subscriptions
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+
+UPDATE subscriptions SET status = 'disabled' WHERE status = 'active' AND is_active = FALSE;
+UPDATE subscriptions SET status = 'reconciliation_required'
+WHERE status IN ('disabled', 'expired', 'cancelled', 'deleted') AND is_active = TRUE;
+UPDATE subscriptions SET is_active = TRUE WHERE status IN ('cancellation_requested', 'deprovisioning');
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'subscriptions_lifecycle_status_active_check') THEN
+        ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_lifecycle_status_active_check CHECK (
+            (status <> 'active' OR is_active = TRUE)
+            AND (status NOT IN ('disabled', 'expired', 'cancelled', 'deleted') OR is_active = FALSE)
+            AND (status NOT IN ('cancellation_requested', 'deprovisioning') OR is_active = TRUE)
+        );
+    END IF;
+END $$;
+`,
+	},
 }
 
-func runMigrations(ctx context.Context) error {
+func runMigrations(ctx context.Context) (retErr error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
@@ -363,13 +389,32 @@ func runMigrations(ctx context.Context) error {
 		return fmt.Errorf("database pool is not initialized")
 	}
 
-	// Serialize concurrent migration runs during parallel testing
-	_, _ = Pool.Exec(ctx, `SELECT pg_advisory_lock(742948214)`)
+	// Session advisory locks belong to one physical PostgreSQL connection.
+	// Keep the acquired connection for the complete lock lifetime and fail
+	// closed if lock acquisition cannot be confirmed.
+	conn, err := Pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to acquire migration connection: %w", err)
+	}
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(742948214)`); err != nil {
+		conn.Release()
+		return fmt.Errorf("failed to acquire migration advisory lock: %w", err)
+	}
 	defer func() {
-		_, _ = Pool.Exec(ctx, `SELECT pg_advisory_unlock(742948214)`)
+		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer unlockCancel()
+		if _, unlockErr := conn.Exec(unlockCtx, `SELECT pg_advisory_unlock(742948214)`); unlockErr != nil {
+			if retErr != nil {
+				retErr = fmt.Errorf("%w; migration advisory unlock also failed: %v", retErr, unlockErr)
+			} else {
+				retErr = fmt.Errorf("migration advisory unlock failed: %w", unlockErr)
+			}
+			conn.Conn().Close(context.Background())
+		}
+		conn.Release()
 	}()
 
-	_, err := Pool.Exec(ctx, `
+	_, err = conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INT PRIMARY KEY,
 			name TEXT NOT NULL,
@@ -381,17 +426,17 @@ func runMigrations(ctx context.Context) error {
 	}
 
 	var baselineApplied bool
-	err = Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)`).Scan(&baselineApplied)
+	err = conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)`).Scan(&baselineApplied)
 	if err != nil {
 		return fmt.Errorf("failed to check baseline migration status: %w", err)
 	}
 
 	if !baselineApplied {
-		_, err := Pool.Exec(ctx, schemaSQL)
+		_, err := conn.Exec(ctx, schemaSQL)
 		if err != nil {
 			return fmt.Errorf("failed to execute baseline schema.sql: %w", err)
 		}
-		_, err = Pool.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES (1, 'baseline') ON CONFLICT (version) DO NOTHING`)
+		_, err = conn.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES (1, 'baseline') ON CONFLICT (version) DO NOTHING`)
 		if err != nil {
 			return fmt.Errorf("failed to record baseline migration: %w", err)
 		}
@@ -400,7 +445,7 @@ func runMigrations(ctx context.Context) error {
 
 	for _, m := range migrations {
 		var alreadyApplied bool
-		err = Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, m.Version).Scan(&alreadyApplied)
+		err = conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, m.Version).Scan(&alreadyApplied)
 		if err != nil {
 			return fmt.Errorf("failed to check migration %d status: %w", m.Version, err)
 		}
@@ -408,7 +453,7 @@ func runMigrations(ctx context.Context) error {
 			continue
 		}
 
-		tx, err := Pool.Begin(ctx)
+		tx, err := conn.Begin(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to begin tx for migration %d: %w", m.Version, err)
 		}

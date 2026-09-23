@@ -210,6 +210,84 @@ func applyLegacyMoneyUnit(ctx context.Context, tx pgx.Tx, unit string) error {
 	return nil
 }
 
+func preflightRialMoneyConversion(ctx context.Context, tx pgx.Tx, hasRefundRequests bool) error {
+	checks := []string{
+		`SELECT 'paid_plans', id::text, 'base_price', base_price::text FROM paid_plans WHERE base_price <> 0 AND (base_price <> TRUNC(base_price) OR MOD(base_price, 10) <> 0) LIMIT 1`,
+		`SELECT 'paid_plans', id::text, 'price_per_extra_ip', price_per_extra_ip::text FROM paid_plans WHERE price_per_extra_ip <> 0 AND (price_per_extra_ip <> TRUNC(price_per_extra_ip) OR MOD(price_per_extra_ip, 10) <> 0) LIMIT 1`,
+		`SELECT 'paid_plans', id::text, 'price_per_gb', price_per_gb::text FROM paid_plans WHERE price_per_gb <> 0 AND (price_per_gb <> TRUNC(price_per_gb) OR MOD(price_per_gb, 10) <> 0) LIMIT 1`,
+		`SELECT 'paid_plans', id::text, 'price_per_extra_month', price_per_extra_month::text FROM paid_plans WHERE price_per_extra_month <> 0 AND (price_per_extra_month <> TRUNC(price_per_extra_month) OR MOD(price_per_extra_month, 10) <> 0) LIMIT 1`,
+		`SELECT 'bot_users', id::text, 'wallet_balance', wallet_balance::text FROM bot_users WHERE wallet_balance <> 0 AND MOD(wallet_balance, 10) <> 0 LIMIT 1`,
+		`SELECT 'transactions', id::text, 'amount', amount::text FROM transactions WHERE amount <> 0 AND MOD(amount, 10) <> 0 LIMIT 1`,
+		`SELECT 'topup_requests', id::text, 'amount', amount::text FROM topup_requests WHERE amount IS NOT NULL AND amount <> 0 AND MOD(amount, 10) <> 0 LIMIT 1`,
+		`SELECT 'bulk_credit_operations', id::text, 'amount', amount::text FROM bulk_credit_operations WHERE amount <> 0 AND MOD(amount, 10) <> 0 LIMIT 1`,
+		`SELECT 'purchase_quotes', id::text, 'money_fields', CONCAT_WS(',', base_price_toman, extra_ip_price_toman, extra_month_price_toman, traffic_price_toman, discount_toman, final_price_toman) FROM purchase_quotes WHERE MOD(base_price_toman, 10) <> 0 OR MOD(extra_ip_price_toman, 10) <> 0 OR MOD(extra_month_price_toman, 10) <> 0 OR MOD(traffic_price_toman, 10) <> 0 OR MOD(discount_toman, 10) <> 0 OR MOD(final_price_toman, 10) <> 0 LIMIT 1`,
+		`SELECT 'purchase_requests', id::text, 'price', price::text FROM purchase_requests WHERE price <> 0 AND (price <> TRUNC(price) OR MOD(price, 10) <> 0) LIMIT 1`,
+		`SELECT 'purchase_requests', id::text, 'price_toman', price_toman::text FROM purchase_requests WHERE price_toman IS NOT NULL AND price_toman <> 0 AND MOD(price_toman, 10) <> 0 LIMIT 1`,
+		`SELECT 'payment_intents', id::text, 'amount_toman', amount_toman::text FROM payment_intents WHERE amount_toman <> 0 AND MOD(amount_toman, 10) <> 0 LIMIT 1`,
+		`SELECT 'reconciliation_records', id::text, 'manual_action_amount', manual_action_amount::text FROM reconciliation_records WHERE manual_action_amount IS NOT NULL AND manual_action_amount <> 0 AND MOD(manual_action_amount, 10) <> 0 LIMIT 1`,
+		`SELECT 'bot_settings', '', 'min_topup_amount', value FROM bot_settings WHERE key = 'min_topup_amount' AND value ~ '^-?[0-9]+([.][0-9]+)?$' AND MOD(value::numeric, 10) <> 0 LIMIT 1`,
+	}
+	if hasRefundRequests {
+		checks = append(checks,
+			`SELECT 'refund_requests', id::text, 'calculated_amount', calculated_amount::text FROM refund_requests WHERE calculated_amount <> 0 AND MOD(calculated_amount, 10) <> 0 LIMIT 1`,
+			`SELECT 'refund_requests', id::text, 'approved_amount', approved_amount::text FROM refund_requests WHERE approved_amount IS NOT NULL AND approved_amount <> 0 AND MOD(approved_amount, 10) <> 0 LIMIT 1`,
+		)
+	}
+	for _, query := range checks {
+		var table, rowID, field, value string
+		err := tx.QueryRow(ctx, query).Scan(&table, &rowID, &field, &value)
+		if errors.Is(err, pgx.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("preflight Rial conversion: %w", err)
+		}
+		return fmt.Errorf("refusing Rial conversion: %s row %s field %s has non-divisible value %s; reconcile this amount explicitly before retrying", table, rowID, field, value)
+	}
+	for _, column := range []struct{ table, field string }{
+		{"payment_intents", "provisioning_snapshot"},
+		{"purchase_requests", "provisioning_snapshot"},
+		{"reconciliation_records", "desired_state"},
+		{"reconciliation_records", "observed_state"},
+	} {
+		var lastID int64
+		for {
+			rows, err := tx.Query(ctx, fmt.Sprintf(`SELECT id, %s FROM %s WHERE id > $1 ORDER BY id LIMIT 500`, column.field, column.table), lastID)
+			if err != nil {
+				return fmt.Errorf("preflight %s.%s: %w", column.table, column.field, err)
+			}
+			type item struct {
+				id  int64
+				raw []byte
+			}
+			var items []item
+			for rows.Next() {
+				var row item
+				if err := rows.Scan(&row.id, &row.raw); err != nil {
+					rows.Close()
+					return fmt.Errorf("read %s.%s for preflight: %w", column.table, column.field, err)
+				}
+				items = append(items, row)
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return fmt.Errorf("read %s.%s for preflight: %w", column.table, column.field, err)
+			}
+			rows.Close()
+			if len(items) == 0 {
+				break
+			}
+			for _, row := range items {
+				if _, err := scaleMoneyJSON(row.raw); err != nil {
+					return fmt.Errorf("refusing Rial conversion: %s row %d contains a monetary value not exactly divisible by 10: %w", column.table, row.id, err)
+				}
+			}
+			lastID = items[len(items)-1].id
+		}
+	}
+	return nil
+}
+
 func scaleMoneyJSONColumn(ctx context.Context, tx pgx.Tx, table, field string) error {
 	// Table and field names are selected only from the static list above.
 	type snapshot struct {
@@ -260,44 +338,53 @@ func scaleMoneyJSON(raw []byte) ([]byte, error) {
 	if err := decoder.Decode(&value); err != nil {
 		return nil, err
 	}
-	value = scaleMoneyJSONValue(value, false)
-	return json.Marshal(value)
+	scaledValue, err := scaleMoneyJSONValue(value, false)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(scaledValue)
 }
 
-func scaleMoneyJSONValue(value any, force bool) any {
+func scaleMoneyJSONValue(value any, force bool) (any, error) {
 	switch node := value.(type) {
 	case map[string]any:
 		for key, child := range node {
 			lower := strings.ToLower(key)
 			moneyField := strings.Contains(lower, "price") || strings.Contains(lower, "amount") || strings.Contains(lower, "balance")
-			if moneyField {
-				node[key] = scaleMoneyJSONValue(child, true)
-			} else {
-				node[key] = scaleMoneyJSONValue(child, force)
+			scaled, err := scaleMoneyJSONValue(child, force || moneyField)
+			if err != nil {
+				return nil, fmt.Errorf("field %s: %w", key, err)
 			}
+			node[key] = scaled
 		}
-		return node
+		return node, nil
 	case []any:
 		for index, child := range node {
-			node[index] = scaleMoneyJSONValue(child, force)
+			scaled, err := scaleMoneyJSONValue(child, force)
+			if err != nil {
+				return nil, fmt.Errorf("index %d: %w", index, err)
+			}
+			node[index] = scaled
 		}
-		return node
+		return node, nil
 	case json.Number:
 		if force {
 			if scaled, ok := divideMoneyNumber(string(node)); ok {
-				return scaled
+				return scaled, nil
 			}
+			return nil, fmt.Errorf("value %s is not exactly divisible by 10", node)
 		}
-		return node
+		return node, nil
 	case string:
 		if force {
 			if scaled, ok := divideMoneyNumber(node); ok {
-				return scaled.String()
+				return scaled.String(), nil
 			}
+			return nil, fmt.Errorf("value %q is not exactly divisible by 10", node)
 		}
-		return node
+		return node, nil
 	default:
-		return value
+		return value, nil
 	}
 }
 
@@ -309,13 +396,8 @@ func divideMoneyNumber(input string) (json.Number, bool) {
 	denominator := new(big.Int).Mul(rational.Denom(), big.NewInt(10))
 	quotient, remainder := new(big.Int), new(big.Int)
 	quotient.QuoRem(rational.Num(), denominator, remainder)
-	absRemainder := new(big.Int).Abs(remainder)
-	if new(big.Int).Mul(absRemainder, big.NewInt(2)).Cmp(denominator) >= 0 {
-		if rational.Num().Sign() < 0 {
-			quotient.Sub(quotient, big.NewInt(1))
-		} else {
-			quotient.Add(quotient, big.NewInt(1))
-		}
+	if remainder.Sign() != 0 {
+		return "", false
 	}
 	return json.Number(quotient.String()), true
 }

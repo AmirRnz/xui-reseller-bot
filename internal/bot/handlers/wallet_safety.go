@@ -135,6 +135,10 @@ func safeRefundWalletWithDeps(
 	}
 	record.ObservedState = map[string]any{"refund_error": err.Error()}
 	record.ErrorMessage = err.Error()
+	if errors.Is(err, db.ErrWalletOperationConflict) {
+		record.Status = db.ReconciliationStatusManualReview
+		record.ManualReviewReason = "refund operation key exists with a different economic effect: " + err.Error()
+	}
 	recErr := persistReconFn(ctx, record)
 	if recErr != nil {
 		log.Printf("[CRITICAL] failed to persist pending refund reconciliation for user %d, key %s: %v", userID, refundOpKey, recErr)

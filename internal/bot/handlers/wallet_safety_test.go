@@ -602,7 +602,7 @@ func setupResellerTestDB(t *testing.T) context.Context {
 	return ctx
 }
 
-func TestNilXUIClientBlocksCancellationAndRefund(t *testing.T) {
+func TestNilXUIClientLeavesCancellationAndRefundDurable(t *testing.T) {
 	ctx := setupResellerTestDB(t)
 
 	prevClient := bot.XUIClient
@@ -624,6 +624,7 @@ func TestNilXUIClientBlocksCancellationAndRefund(t *testing.T) {
 		t.Fatalf("failed to insert test user: %v", err)
 	}
 	defer func() {
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM reconciliation_records WHERE user_id = $1`, userID)
 		_, _ = db.Pool.Exec(ctx, `DELETE FROM refund_requests WHERE user_id = $1`, userID)
 		_, _ = db.Pool.Exec(ctx, `DELETE FROM transactions WHERE user_id = $1`, userID)
 		_, _ = db.Pool.Exec(ctx, `DELETE FROM subscriptions WHERE user_id = $1`, userID)
@@ -661,28 +662,33 @@ func TestNilXUIClientBlocksCancellationAndRefund(t *testing.T) {
 		t.Fatalf("HandleDeleteSubscription returned unexpected error: %v", err)
 	}
 
-	// Verify user received failure message
+	// A missing XUI client must leave the durable cancellation request queued.
 	if mockCtx.sentText == "" {
 		t.Fatal("expected failure message sent to user, got empty string")
 	}
 
-	// Invariant 1: Local subscription MUST NOT be cancelled (remains active)
+	// Invariant 1: the subscription remains remotely active while deletion is queued.
 	sub, err := db.GetSubscriptionByID(ctx, subID)
 	if err != nil || sub == nil {
 		t.Fatalf("subscription must exist: %v", err)
 	}
-	if sub.Status != "active" {
-		t.Fatalf("subscription status must remain active, got %s", sub.Status)
+	if sub.Status != db.SubscriptionStatusCancelRequested || !sub.IsActive {
+		t.Fatalf("subscription must remain active with cancellation requested, got status=%s active=%t", sub.Status, sub.IsActive)
 	}
 
-	// Invariant 2: No refund request must be created
+	// Invariant 2: the refund/manual-review intent and deprovisioning job are durable.
 	var refundCount int
 	err = db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM refund_requests WHERE subscription_id = $1`, subID).Scan(&refundCount)
 	if err != nil {
 		t.Fatalf("failed to query refund_requests: %v", err)
 	}
-	if refundCount != 0 {
-		t.Fatalf("expected 0 refund requests, got %d", refundCount)
+	if refundCount != 1 {
+		t.Fatalf("expected one durable refund request, got %d", refundCount)
+	}
+	var workCount int
+	err = db.Pool.QueryRow(ctx, `SELECT COUNT(*) FROM reconciliation_records WHERE subscription_id = $1 AND kind = 'subscription_cancellation_requested' AND status = 'pending'`, subID).Scan(&workCount)
+	if err != nil || workCount != 1 {
+		t.Fatalf("expected one durable cancellation job, count=%d err=%v", workCount, err)
 	}
 
 	// Invariant 3: No wallet transactions created and wallet balance untouched

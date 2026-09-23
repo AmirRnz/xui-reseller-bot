@@ -1,6 +1,9 @@
 package db
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 const (
 	UserStatusPending             = "pending"
@@ -12,12 +15,14 @@ const (
 	PlanTypeTest = "test"
 	PlanTypePaid = "paid"
 
-	SubscriptionStatusActive         = "active"
-	SubscriptionStatusDisabled       = "disabled"
-	SubscriptionStatusExpired        = "expired"
-	SubscriptionStatusCancelled      = "cancelled"
-	SubscriptionStatusDeleted        = "deleted"
-	SubscriptionStatusReconciliation = "reconciliation_required"
+	SubscriptionStatusActive          = "active"
+	SubscriptionStatusDisabled        = "disabled"
+	SubscriptionStatusExpired         = "expired"
+	SubscriptionStatusCancelled       = "cancelled"
+	SubscriptionStatusDeleted         = "deleted"
+	SubscriptionStatusReconciliation  = "reconciliation_required"
+	SubscriptionStatusCancelRequested = "cancellation_requested"
+	SubscriptionStatusDeprovisioning  = "deprovisioning"
 
 	PurchaseProvisioningPending   = "pending"
 	PurchaseProvisioningSucceeded = "succeeded"
@@ -57,11 +62,31 @@ func IsValidSubscriptionStatus(status string) bool {
 		SubscriptionStatusExpired,
 		SubscriptionStatusCancelled,
 		SubscriptionStatusDeleted,
-		SubscriptionStatusReconciliation:
+		SubscriptionStatusReconciliation,
+		SubscriptionStatusCancelRequested,
+		SubscriptionStatusDeprovisioning:
 		return true
 	default:
 		return false
 	}
+}
+
+func validateSubscriptionLifecycle(status string, isActive bool) error {
+	switch status {
+	case SubscriptionStatusActive:
+		if !isActive {
+			return fmt.Errorf("active subscription must have is_active=true")
+		}
+	case SubscriptionStatusDisabled, SubscriptionStatusExpired, SubscriptionStatusCancelled, SubscriptionStatusDeleted:
+		if isActive {
+			return fmt.Errorf("%s subscription must have is_active=false", status)
+		}
+	case SubscriptionStatusCancelRequested, SubscriptionStatusDeprovisioning:
+		if !isActive {
+			return fmt.Errorf("%s subscription must remain active until remote deletion is verified", status)
+		}
+	}
+	return nil
 }
 
 type WalletTransaction struct {

@@ -38,7 +38,7 @@ func newDirectRestartFixture(t *testing.T, ctx context.Context) *directRestartFi
 	if err := db.Pool.QueryRow(ctx, `INSERT INTO bot_users (telegram_id, username, status) VALUES ($1, $2, 'approved') RETURNING id`, telegramID, fmt.Sprintf("restart_user_%d", telegramID)).Scan(&f.userID); err != nil {
 		t.Fatalf("create restart user: %v", err)
 	}
-	if err := db.Pool.QueryRow(ctx, `INSERT INTO paid_plans (name) VALUES ($1) RETURNING id`, fmt.Sprintf("restart_plan_%d", telegramID)).Scan(&f.planID); err != nil {
+	if err := db.Pool.QueryRow(ctx, `INSERT INTO paid_plans (name, enabled, base_ip_limit, max_ip_limit, inbound_ids, flow) VALUES ($1, TRUE, 1, 10, '[4,9]'::jsonb, 'restart-flow') RETURNING id`, fmt.Sprintf("restart_plan_%d", telegramID)).Scan(&f.planID); err != nil {
 		t.Fatalf("create restart plan: %v", err)
 	}
 	if err := db.Pool.QueryRow(ctx, `
@@ -290,6 +290,61 @@ func TestWalletDebitCrashBeforeXUIAndDuplicateWorker(t *testing.T) {
 	if err := db.Pool.QueryRow(ctx, `SELECT wallet_balance FROM bot_users WHERE id = $1`, f.userID).Scan(&balance); err != nil || balance != 76544 {
 		t.Fatalf("restart changed the wallet a second time: balance=%d err=%v", balance, err)
 	}
+}
+
+func TestWalletIPUpgradeCrashAfterCommitResumesFromDurableDesiredState(t *testing.T) {
+	ctx := setupTestDBForReconcile(t)
+	tgID := time.Now().UnixNano()
+	var userID, planID int64
+	if err := db.Pool.QueryRow(ctx, `INSERT INTO bot_users (telegram_id, username, status, wallet_balance) VALUES ($1, $2, 'approved', 2000) RETURNING id`, tgID, fmt.Sprintf("wallet_ip_restart_%d", tgID)).Scan(&userID); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	var planUpdated time.Time
+	if err := db.Pool.QueryRow(ctx, `INSERT INTO paid_plans (name, enabled, max_ip_limit) VALUES ($1, TRUE, 5) RETURNING id, updated_at`, fmt.Sprintf("wallet_ip_plan_%d", tgID)).Scan(&planID, &planUpdated); err != nil {
+		t.Fatalf("create plan: %v", err)
+	}
+	email := fmt.Sprintf("wallet_ip_%d@example.test", tgID)
+	uuid := fmt.Sprintf("wallet-ip-uuid-%d", tgID)
+	subID := fmt.Sprintf("wallet-ip-sub-%d", tgID)
+	expiry := time.Now().Add(24 * time.Hour).UnixMilli()
+	var localSubID int
+	if err := db.Pool.QueryRow(ctx, `INSERT INTO subscriptions (user_id, plan_id, plan_type, client_email, client_uuid, sub_id, status, is_active, ip_limit, expire_time) VALUES ($1, $2, 'paid', $3, $4, $5, 'active', TRUE, 1, $6) RETURNING id`, userID, planID, email, uuid, subID, expiry).Scan(&localSubID); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	operationKey := fmt.Sprintf("wallet_ip_restart:%d", tgID)
+	desiredLimit := 3
+	desiredActive := true
+	if err := db.DebitWalletForSubscriptionMutation(ctx, db.WalletSubscriptionMutationIntent{
+		UserID: userID, SubscriptionID: localSubID, Amount: 500, Description: "IP limit increase",
+		OperationKey: operationKey, ExpectedIPLimit: 1, ExpectedExpireTime: &expiry, ExpectedIsActive: true,
+		ExpectedPlanUpdatedAt: planUpdated, DesiredIPLimit: &desiredLimit, DesiredIsActive: &desiredActive,
+	}); err != nil {
+		t.Fatalf("commit wallet debit and desired-state work: %v", err)
+	}
+	panel := &mockXUI{client: &xui.XUIClientInfo{Email: email, UUID: uuid, SubID: subID, Enable: true, ExpiryTime: expiry, LimitIP: 1}, persistUpdate: true}
+	worker := NewProcessor("wallet_ip_restart_worker", panel)
+	worker.BatchSize = 10
+	if _, err := worker.ProcessOnce(ctx); err != nil {
+		t.Fatalf("restart worker could not apply committed mutation: %v", err)
+	}
+	if panel.updateCalls != 1 || panel.client.LimitIP != desiredLimit {
+		t.Fatalf("expected one verified remote update to %d IPs, calls=%d remote=%+v", desiredLimit, panel.updateCalls, panel.client)
+	}
+	local, err := db.GetSubscriptionByID(ctx, localSubID)
+	if err != nil || local == nil || local.Status != db.SubscriptionStatusActive || !local.IsActive || local.IPLimit != desiredLimit || local.DesiredIPLimit != nil {
+		t.Fatalf("local subscription did not converge after worker restart: sub=%+v err=%v", local, err)
+	}
+	var balance int64
+	if err := db.Pool.QueryRow(ctx, `SELECT wallet_balance FROM bot_users WHERE id = $1`, userID).Scan(&balance); err != nil || balance != 1500 {
+		t.Fatalf("restart changed debit result: balance=%d err=%v", balance, err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM reconciliation_records WHERE user_id = $1`, userID)
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM transactions WHERE user_id = $1`, userID)
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM subscriptions WHERE id = $1`, localSubID)
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM paid_plans WHERE id = $1`, planID)
+		_, _ = db.Pool.Exec(ctx, `DELETE FROM bot_users WHERE id = $1`, userID)
+	})
 }
 
 func TestRemoteCreateBeforeLocalInsertIsAdoptedByPersistedIdentity(t *testing.T) {

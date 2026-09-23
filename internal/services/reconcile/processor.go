@@ -194,6 +194,8 @@ func (p *Processor) processRecord(ctx context.Context, rec *db.ReconciliationRec
 		outcome = p.handleDeleteReconciliation(ctx, rec)
 	case KindSubscriptionCancellationDbFailed:
 		outcome = p.handleSubscriptionCancellation(ctx, rec)
+	case KindSubscriptionCancellationRequested:
+		outcome = p.handleSubscriptionCancellationRequest(ctx, rec)
 	case KindDirectPaymentProvisioningRetry:
 		outcome = p.handleDirectPaymentProvisioning(ctx, rec)
 	case KindSubscriptionRemoteMissing:
@@ -284,6 +286,9 @@ func (p *Processor) handlePendingRefund(ctx context.Context, rec *db.Reconciliat
 	}
 
 	if err := p.executeRefund(ctx, payload.UserID, payload.Amount, payload.Description, payload.OperationKey); err != nil {
+		if errors.Is(err, db.ErrWalletOperationConflict) {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: err.Error()}
+		}
 		return ProcessOutcome{
 			Kind: OutcomeRetry,
 			Err:  err,
@@ -641,6 +646,9 @@ func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.Reco
 		if payload.RefundAmount > 0 && payload.UserID != nil {
 			refundErr := p.executeRefund(ctx, *payload.UserID, payload.RefundAmount, "refund for cancelled subscription", payload.RefundOperationKey)
 			if refundErr != nil {
+				if errors.Is(refundErr, db.ErrWalletOperationConflict) {
+					return ProcessOutcome{Kind: OutcomeManualReview, Reason: refundErr.Error()}
+				}
 				return ProcessOutcome{
 					Kind: OutcomeRetry,
 					Err:  refundErr, // Keep retryable!
@@ -669,6 +677,9 @@ func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.Reco
 			if payload.RefundAmount > 0 && payload.UserID != nil {
 				refundErr := p.executeRefund(ctx, *payload.UserID, payload.RefundAmount, "refund for cancelled subscription", payload.RefundOperationKey)
 				if refundErr != nil {
+					if errors.Is(refundErr, db.ErrWalletOperationConflict) {
+						return ProcessOutcome{Kind: OutcomeManualReview, Reason: refundErr.Error()}
+					}
 					return ProcessOutcome{
 						Kind: OutcomeRetry,
 						Err:  refundErr, // Keep retryable!
@@ -691,6 +702,67 @@ func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.Reco
 			Kind: OutcomeRetry,
 			Err:  fmt.Errorf("inconclusive delete check for %s: %w", payload.ClientEmail, err),
 		}
+	}
+}
+
+func (p *Processor) handleSubscriptionCancellationRequest(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
+	payload, err := DecodeSubscriptionCancellationRequest(rec.DesiredState, rec.SubscriptionID, rec.UserID)
+	if err != nil {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: err.Error()}
+	}
+	if p.XUI == nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: errors.New("xui client is not available")}
+	}
+	getSubscription := p.GetSubscriptionByIDFn
+	if getSubscription == nil {
+		getSubscription = db.GetSubscriptionByID
+	}
+	sub, err := getSubscription(ctx, int(payload.SubscriptionID))
+	if err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("load cancellation subscription %d: %w", payload.SubscriptionID, err)}
+	}
+	if sub == nil || sub.UserID != payload.UserID || sub.ClientEmail != payload.ClientEmail {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "durable cancellation identity does not match the local subscription"}
+	}
+	if sub.Status == db.SubscriptionStatusCancelled {
+		remote, getErr := p.XUI.GetClientByEmail(payload.ClientEmail)
+		if ClassifyRemoteClient(remote, getErr) == RemoteConfirmedAbsent {
+			return ProcessOutcome{Kind: OutcomeResolved, TargetStatus: db.ReconciliationStatusResolvedVerified, Resolution: "subscription is already cancelled and remote absence is verified"}
+		}
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "subscription is marked cancelled but the remote client still exists or its state is unknown"}
+	}
+	if err := db.MarkSubscriptionDeprovisioning(ctx, int(payload.SubscriptionID)); err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("mark subscription deprovisioning: %w", err)}
+	}
+
+	remote, getErr := p.XUI.GetClientByEmail(payload.ClientEmail)
+	switch ClassifyRemoteClient(remote, getErr) {
+	case RemoteConfirmedAbsent:
+		if err := db.CompleteSubscriptionCancellation(ctx, int(payload.SubscriptionID), payload.UserID); err != nil {
+			return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("complete cancellation after confirmed remote absence: %w", err)}
+		}
+		return ProcessOutcome{Kind: OutcomeResolved, TargetStatus: db.ReconciliationStatusResolvedVerified, Resolution: "remote absence verified; local subscription marked cancelled"}
+	case RemotePresenceUnknown:
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("remote cancellation state is unknown: %w", getErr)}
+	case RemoteConfirmedPresent:
+		deleteErr := p.XUI.DeleteClient(payload.ClientEmail)
+		readback, verifyErr := p.XUI.GetClientByEmail(payload.ClientEmail)
+		switch ClassifyRemoteClient(readback, verifyErr) {
+		case RemoteConfirmedAbsent:
+			if err := db.CompleteSubscriptionCancellation(ctx, int(payload.SubscriptionID), payload.UserID); err != nil {
+				return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("complete cancellation after delete verification: %w", err)}
+			}
+			return ProcessOutcome{Kind: OutcomeResolved, TargetStatus: db.ReconciliationStatusResolvedVerified, Resolution: "3x-ui deletion was verified and local subscription marked cancelled"}
+		case RemoteConfirmedPresent:
+			if deleteErr == nil {
+				deleteErr = errors.New("client remains present after delete")
+			}
+			return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("delete subscription %d was not verified: %w", payload.SubscriptionID, deleteErr)}
+		default:
+			return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("delete outcome is ambiguous and read-back failed: delete=%v verify=%w", deleteErr, verifyErr)}
+		}
+	default:
+		return ProcessOutcome{Kind: OutcomeRetry, Err: errors.New("unsupported remote presence state")}
 	}
 }
 
@@ -1293,6 +1365,15 @@ func (p *Processor) handleDirectSubscriptionUpdate(ctx context.Context, payload 
 			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct IP upgrade has no valid durable target limit"}
 		}
 		desiredIP = *payload.DesiredIPLimit
+		if sub.PlanID == nil || desiredIP <= sub.IPLimit {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct IP upgrade violates the current-to-requested limit transition"}
+		}
+		plan, planErr := db.GetPaidPlanByID(ctx, int64(*sub.PlanID))
+		if planErr != nil || plan == nil || plan.MaxIPLimit <= 0 || desiredIP > plan.MaxIPLimit {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct IP upgrade exceeds the current paid plan limit"}
+		}
+	} else if payload.ActionType == "extend" && (payload.Months < 1 || payload.Months > 120) {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct extension duration is outside the supported range"}
 	}
 	desiredExpiry := payload.ExpiryTimeMilli
 	if payload.ActionType == "upgrade_ip" && desiredExpiry == 0 && sub.ExpireTime != nil {
@@ -1325,6 +1406,16 @@ func (p *Processor) handleDirectSubscriptionUpdate(ctx context.Context, payload 
 	sub.ExpireTime = &desiredExpiry
 	sub.IPLimit = desiredIP
 	sub.IsActive = true
+	sub.Status = db.SubscriptionStatusActive
+	sub.DesiredIPLimit = nil
+	sub.DesiredExpireTime = nil
+	sub.DesiredIsActive = nil
+	sub.ReconciliationNote = ""
+	if desiredExpiry > 0 {
+		sub.EndDate = time.UnixMilli(desiredExpiry)
+	} else {
+		sub.EndDate = time.Time{}
+	}
 	if err := db.UpdateSubscription(ctx, sub); err != nil {
 		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("panel update is verified but local subscription update failed: %w", err)}
 	}

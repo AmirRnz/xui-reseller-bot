@@ -1,6 +1,8 @@
 package db
 
 import (
+	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -54,5 +56,46 @@ func TestLegacyZeroSuggestionRefundApprovalIsEditableAndIdempotent(t *testing.T)
 	}
 	if balanceAfter-balanceBefore != approvedAmount || ledgerCount != 1 {
 		t.Fatalf("refund economic effect duplicated or missing: balance delta=%d ledger rows=%d", balanceAfter-balanceBefore, ledgerCount)
+	}
+}
+
+func TestRefundApprovalOperationKeyCollisionDoesNotCreditWallet(t *testing.T) {
+	ctx := setupTestDB(t)
+	telegramID := time.Now().UnixNano()
+	opKey := fmt.Sprintf("test_refund_collision:%d", telegramID)
+	var userID int64
+	if err := Pool.QueryRow(ctx, `INSERT INTO bot_users (telegram_id, username) VALUES ($1, $2) RETURNING id`,
+		telegramID, fmt.Sprintf("refund_collision_%d", telegramID)).Scan(&userID); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	req := &RefundRequest{UserID: userID, CalculatedAmount: 1000, Status: "pending", OperationKey: opKey}
+	if err := CreateRefundRequest(ctx, req); err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	ledgerKey := fmt.Sprintf("refund_approval:%d", req.ID)
+	t.Cleanup(func() {
+		_, _ = Pool.Exec(ctx, `DELETE FROM transactions WHERE operation_key = $1`, ledgerKey)
+		_, _ = Pool.Exec(ctx, `DELETE FROM refund_requests WHERE id = $1`, req.ID)
+		_, _ = Pool.Exec(ctx, `DELETE FROM bot_users WHERE id = $1`, userID)
+	})
+	if _, err := Pool.Exec(ctx, `
+		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id, operation_key)
+		VALUES ($1, 1, 'credit', 'completed', 'unrelated credit', 'manual_admin', NULL, $2)
+	`, userID, ledgerKey); err != nil {
+		t.Fatalf("create colliding ledger entry: %v", err)
+	}
+	if _, err := ApproveRefundRequestAndCredit(ctx, req.ID, 999, 500, "collision test"); !errors.Is(err, ErrWalletOperationConflict) {
+		t.Fatalf("refund with mismatched ledger collision = %v, want semantic conflict", err)
+	}
+	var balance int64
+	var status string
+	if err := Pool.QueryRow(ctx, `SELECT wallet_balance FROM bot_users WHERE id = $1`, userID).Scan(&balance); err != nil {
+		t.Fatalf("read wallet: %v", err)
+	}
+	if err := Pool.QueryRow(ctx, `SELECT status FROM refund_requests WHERE id = $1`, req.ID).Scan(&status); err != nil {
+		t.Fatalf("read request: %v", err)
+	}
+	if balance != 0 || status != "pending" {
+		t.Fatalf("collision changed refund economics: balance=%d status=%q", balance, status)
 	}
 }

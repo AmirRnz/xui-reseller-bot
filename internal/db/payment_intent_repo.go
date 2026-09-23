@@ -60,17 +60,6 @@ func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIn
 		return nil, fmt.Errorf("unsupported payment intent action %q", intent.ActionType)
 	}
 
-	var snapshotBytes []byte
-	if intent.ProvisioningSnapshot != nil {
-		var err error
-		snapshotBytes, err = json.Marshal(intent.ProvisioningSnapshot)
-		if err != nil {
-			return nil, fmt.Errorf("failed to serialize provisioning snapshot: %w", err)
-		}
-	} else {
-		snapshotBytes = []byte("{}")
-	}
-
 	if intent.Status == "" {
 		intent.Status = IntentStatusAwaitingReceipt
 	}
@@ -87,6 +76,16 @@ func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIn
 	if err := tx.QueryRow(ctx, `SELECT id FROM bot_users WHERE id = $1 FOR UPDATE`, intent.UserID).Scan(&lockedUserID); err != nil {
 		return nil, fmt.Errorf("failed to lock payment-intent owner: %w", err)
 	}
+	if intent.ActionType == "extend" || intent.ActionType == "upgrade_ip" {
+		if err := validateAndSnapshotDirectSubscriptionIntent(ctx, tx, intent); err != nil {
+			return nil, err
+		}
+	}
+	if intent.ActionType == "buy" {
+		if err := validateDirectBuyIntentTx(ctx, tx, intent); err != nil {
+			return nil, err
+		}
+	}
 	if intent.Status == IntentStatusAwaitingReceipt {
 		var existingID int64
 		err := tx.QueryRow(ctx, `SELECT id FROM payment_intents WHERE user_id = $1 AND status = $2 LIMIT 1`, intent.UserID, IntentStatusAwaitingReceipt).Scan(&existingID)
@@ -96,6 +95,16 @@ func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIn
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("failed to check active payment intent: %w", err)
 		}
+	}
+
+	var snapshotBytes []byte
+	if intent.ProvisioningSnapshot != nil {
+		snapshotBytes, err = json.Marshal(intent.ProvisioningSnapshot)
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize provisioning snapshot: %w", err)
+		}
+	} else {
+		snapshotBytes = []byte("{}")
 	}
 
 	query := `
@@ -121,6 +130,205 @@ func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIn
 		return nil, fmt.Errorf("failed to commit payment intent: %w", err)
 	}
 	return intent, nil
+}
+
+func validateDirectBuyIntentTx(ctx context.Context, tx pgx.Tx, intent *PaymentIntent) error {
+	if intent.PlanID == nil || intent.QuoteID == nil || *intent.PlanID <= 0 || *intent.QuoteID <= 0 ||
+		intent.AmountToman <= 0 || intent.Months < 1 || intent.Months > 120 || intent.DataGB < 0 ||
+		strings.TrimSpace(intent.ClientEmail) == "" {
+		return ErrSubscriptionMutationInvalid
+	}
+	var enabled, isLimited bool
+	var baseIP, maxIP int
+	var minData int64
+	var inboundJSON []byte
+	var planFlow string
+	var planUpdatedAt time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT enabled, base_ip_limit, max_ip_limit, is_limited, min_data_gb, inbound_ids, flow, updated_at
+		FROM paid_plans WHERE id = $1 FOR SHARE
+	`, *intent.PlanID).Scan(&enabled, &baseIP, &maxIP, &isLimited, &minData, &inboundJSON, &planFlow, &planUpdatedAt); err != nil {
+		return err
+	}
+	if !enabled || (maxIP == 0 && intent.IPLimit != 0) || (maxIP > 0 && (intent.IPLimit < baseIP || intent.IPLimit > maxIP)) || (isLimited && int64(intent.DataGB) < minData) {
+		return ErrSubscriptionMutationInvalid
+	}
+	var quoteUserID, quotePlanID *int64
+	var quoteMonths, quoteDays, quoteIP, quoteData int
+	var quoteAmount int64
+	var quoteCreatedAt time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT user_id, plan_id, months, duration_days, ip_limit, data_gb, final_price_toman, created_at
+		FROM purchase_quotes WHERE id = $1 FOR SHARE
+	`, *intent.QuoteID).Scan(&quoteUserID, &quotePlanID, &quoteMonths, &quoteDays, &quoteIP, &quoteData, &quoteAmount, &quoteCreatedAt); err != nil {
+		return fmt.Errorf("failed to lock purchase quote: %w", err)
+	}
+	if quoteUserID == nil || *quoteUserID != intent.UserID || quotePlanID == nil || *quotePlanID != *intent.PlanID ||
+		quoteMonths != intent.Months || quoteDays <= 0 || quoteIP != intent.IPLimit || quoteData != intent.DataGB || quoteAmount != intent.AmountToman ||
+		planUpdatedAt.After(quoteCreatedAt) {
+		return ErrSubscriptionMutationStale
+	}
+	var expectedUUID, expectedSubID string
+	if intent.ProvisioningSnapshot != nil {
+		expectedUUID, _ = intent.ProvisioningSnapshot["client_uuid"].(string)
+		expectedSubID, _ = intent.ProvisioningSnapshot["sub_id"].(string)
+	}
+	if strings.TrimSpace(expectedUUID) == "" || strings.TrimSpace(expectedSubID) == "" {
+		return ErrSubscriptionMutationInvalid
+	}
+	var inboundIDs []int
+	if err := json.Unmarshal(inboundJSON, &inboundIDs); err != nil {
+		return fmt.Errorf("invalid paid-plan inbound configuration: %w", err)
+	}
+	gotInboundIDs, ok := snapshotIntSlice(intent.ProvisioningSnapshot["inbound_ids"])
+	if !ok || !sameIntIDs(gotInboundIDs, inboundIDs) {
+		return ErrSubscriptionMutationStale
+	}
+	expectedExpiry, expiryOK := snapshotInt64Value(intent.ProvisioningSnapshot["expiry_time_milli"])
+	expectedTotal, totalOK := snapshotInt64Value(intent.ProvisioningSnapshot["total_bytes"])
+	if !expiryOK || !totalOK || expectedExpiry != -int64(quoteDays)*24*60*60*1000 || expectedTotal != int64(intent.DataGB)*1024*1024*1024 {
+		return ErrSubscriptionMutationInvalid
+	}
+	expectedFlow, flowOK := intent.ProvisioningSnapshot["flow"].(string)
+	if !flowOK || expectedFlow != planFlow {
+		return ErrSubscriptionMutationStale
+	}
+	return nil
+}
+
+func snapshotIntSlice(value any) ([]int, bool) {
+	switch values := value.(type) {
+	case []int:
+		return append([]int(nil), values...), true
+	case []any:
+		out := make([]int, 0, len(values))
+		for _, value := range values {
+			n, ok := snapshotInt64Value(value)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, int(n))
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+func sameIntIDs(left, right []int) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[int]int, len(left))
+	for _, id := range left {
+		counts[id]++
+	}
+	for _, id := range right {
+		if counts[id] == 0 {
+			return false
+		}
+		counts[id]--
+	}
+	return true
+}
+
+func validateAndSnapshotDirectSubscriptionIntent(ctx context.Context, tx pgx.Tx, intent *PaymentIntent) error {
+	if intent.SubscriptionID == nil || *intent.SubscriptionID <= 0 || intent.AmountToman <= 0 {
+		return ErrSubscriptionMutationInvalid
+	}
+	if (intent.ActionType == "extend" && (intent.Months < 1 || intent.Months > 120)) ||
+		(intent.ActionType == "upgrade_ip" && (intent.IPLimit <= 0 || intent.Months < 1 || intent.Months > 120)) {
+		return ErrSubscriptionMutationInvalid
+	}
+	var ownerID int64
+	var planID *int64
+	var planType, status, email string
+	var ipLimit int
+	var expireTime *int64
+	var active bool
+	var desiredIP *int
+	var desiredExpiry *int64
+	var desiredActive *bool
+	var updatedAt time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT user_id, plan_id, plan_type, status, client_email, ip_limit, expire_time, is_active,
+		       desired_ip_limit, desired_expire_time, desired_is_active, updated_at
+		FROM subscriptions WHERE id = $1 FOR UPDATE
+	`, *intent.SubscriptionID).Scan(&ownerID, &planID, &planType, &status, &email, &ipLimit, &expireTime, &active,
+		&desiredIP, &desiredExpiry, &desiredActive, &updatedAt)
+	if err != nil {
+		return fmt.Errorf("failed to lock direct-payment subscription: %w", err)
+	}
+	if ownerID != intent.UserID || email != intent.ClientEmail || planType != PlanTypePaid || planID == nil ||
+		status != SubscriptionStatusActive || !active || desiredIP != nil || desiredExpiry != nil || desiredActive != nil {
+		return ErrSubscriptionMutationStale
+	}
+	var enabled bool
+	var maxIP int
+	var planUpdatedAt time.Time
+	if err := tx.QueryRow(ctx, `SELECT enabled, max_ip_limit, updated_at FROM paid_plans WHERE id = $1 FOR SHARE`, *planID).
+		Scan(&enabled, &maxIP, &planUpdatedAt); err != nil {
+		return fmt.Errorf("failed to lock direct-payment plan: %w", err)
+	}
+	if !enabled || (intent.PlanID != nil && *intent.PlanID != *planID) {
+		return ErrSubscriptionMutationStale
+	}
+	expectedSubUpdatedAt, subTimeOK := snapshotTime(intent.ProvisioningSnapshot, "expected_subscription_updated_at")
+	expectedPlanUpdatedAt, planTimeOK := snapshotTime(intent.ProvisioningSnapshot, "expected_plan_updated_at")
+	expectedIP, ipOK := snapshotInt64Value(intent.ProvisioningSnapshot["expected_ip_limit"])
+	expectedExpiry, expiryOK := snapshotInt64Value(intent.ProvisioningSnapshot["expected_expire_time_milli"])
+	expectedActive, activeOK := intent.ProvisioningSnapshot["expected_is_active"].(bool)
+	currentExpiry := int64(0)
+	if expireTime != nil {
+		currentExpiry = *expireTime
+	}
+	if !subTimeOK || !planTimeOK || !ipOK || !expiryOK || !activeOK ||
+		!expectedSubUpdatedAt.Equal(updatedAt) || !expectedPlanUpdatedAt.Equal(planUpdatedAt) ||
+		expectedIP != int64(ipLimit) || expectedExpiry != currentExpiry || expectedActive != active {
+		return ErrSubscriptionMutationStale
+	}
+	if intent.ActionType == "upgrade_ip" && (intent.IPLimit <= ipLimit || maxIP <= 0 || intent.IPLimit > maxIP) {
+		return ErrSubscriptionMutationInvalid
+	}
+	if intent.ProvisioningSnapshot == nil {
+		intent.ProvisioningSnapshot = make(map[string]any)
+	}
+	intent.ProvisioningSnapshot["expected_user_id"] = ownerID
+	intent.ProvisioningSnapshot["expected_plan_id"] = *planID
+	intent.ProvisioningSnapshot["expected_plan_updated_at"] = planUpdatedAt.UTC().Format(time.RFC3339Nano)
+	intent.ProvisioningSnapshot["expected_subscription_updated_at"] = updatedAt.UTC().Format(time.RFC3339Nano)
+	intent.ProvisioningSnapshot["expected_ip_limit"] = ipLimit
+	intent.ProvisioningSnapshot["expected_expire_time_milli"] = expireTime
+	intent.ProvisioningSnapshot["expected_is_active"] = active
+	return nil
+}
+
+func snapshotTime(snapshot map[string]any, key string) (time.Time, bool) {
+	value, ok := snapshot[key].(string)
+	if !ok || strings.TrimSpace(value) == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	return parsed, err == nil
+}
+
+func snapshotInt64Value(value any) (int64, bool) {
+	switch v := value.(type) {
+	case int:
+		return int64(v), true
+	case int32:
+		return int64(v), true
+	case int64:
+		return v, true
+	case float64:
+		if float64(int64(v)) == v {
+			return int64(v), true
+		}
+	case json.Number:
+		parsed, err := v.Int64()
+		return parsed, err == nil
+	}
+	return 0, false
 }
 
 type ReceiptSubmissionResult struct {
@@ -170,6 +378,15 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 	if len(snapshotBytes) > 0 {
 		if err := json.Unmarshal(snapshotBytes, &intent.ProvisioningSnapshot); err != nil {
 			return nil, fmt.Errorf("invalid durable provisioning snapshot: %w", err)
+		}
+	}
+	if intent.Status == IntentStatusAwaitingReceipt && intent.ActionType == "buy" {
+		if err := validateDirectBuyIntentTx(ctx, tx, &intent); err != nil {
+			return nil, err
+		}
+	} else if intent.Status == IntentStatusAwaitingReceipt && (intent.ActionType == "extend" || intent.ActionType == "upgrade_ip") {
+		if err := validateAndSnapshotDirectSubscriptionIntent(ctx, tx, &intent); err != nil {
+			return nil, err
 		}
 	}
 

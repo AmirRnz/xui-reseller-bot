@@ -212,7 +212,7 @@ func HandleReceiptPhoto(c telebot.Context) error {
 			var details string
 			switch pType {
 			case "buy":
-				details = fmt.Sprintf("خرید سرویس جدید\nطرح: %s\nایمیل: %s\nمدت: %d ماه\nکاربر همزمان: %d\nحجم: %d گیگابایت", customName, email, months, ipLimit, dataGB)
+				details = fmt.Sprintf("خرید سرویس جدید\nطرح: %s\nایمیل: %s\nمدت: %d ماه\nIP همزمان: %d\nحجم: %d گیگابایت", customName, email, months, ipLimit, dataGB)
 			case "extend":
 				subDisplay := int64(0)
 				if subIDPtr != nil {
@@ -224,7 +224,7 @@ func HandleReceiptPhoto(c telebot.Context) error {
 				if subIDPtr != nil {
 					subDisplay = *subIDPtr
 				}
-				details = fmt.Sprintf("ارتقای تعداد کاربر همزمان\nشناسه اشتراک: %d\nتعداد کاربر جدید: %d", subDisplay, ipLimit)
+				details = fmt.Sprintf("ارتقای تعداد IP همزمان\nشناسه اشتراک: %d\nتعداد سقف IP جدید: %d", subDisplay, ipLimit)
 			}
 
 			caption := fmt.Sprintf("📥 درخواست خرید مستقیم #%d\nکاربر: @%s (%d)\nنوع: %s\nمبلغ: %s\n\nجزئیات:\n%s",
@@ -499,7 +499,7 @@ func HandleAdminRejectPurchase(c telebot.Context) error {
 		case "extend":
 			actionLabel = "تمدید سرویس"
 		case "upgrade_ip":
-			actionLabel = "ارتقای تعداد کاربر همزمان"
+			actionLabel = "ارتقای تعداد IP همزمان"
 		case "claim":
 			actionLabel = "ثبت اشتراک قدیمی"
 		}
@@ -642,6 +642,13 @@ func completeRefundApproval(c telebot.Context, reqID, amount int64, note string)
 	defer unlock()
 	req, err := db.ApproveRefundRequestAndCredit(context.Background(), reqID, c.Sender().ID, amount, note)
 	if err != nil {
+		if errors.Is(err, db.ErrSubscriptionCancellationNotComplete) {
+			return c.Send("استرداد پس از تایید حذف سرویس از پنل فعال می‌شود.")
+		}
+		if errors.Is(err, db.ErrWalletOperationConflict) {
+			log.Printf("[CRITICAL] refund request %d has a conflicting wallet operation key: %v", reqID, err)
+			return c.Send("شناسه مالی این استرداد با یک تراکنش دیگر برخورد کرده است؛ هیچ مبلغی واریز نشد و درخواست برای بررسی نیاز دارد.")
+		}
 		return c.Send("خطا در تایید استرداد.")
 	}
 	if req == nil {
@@ -765,7 +772,7 @@ func upgradeSubscriptionIPFromApprovedRequest(user *db.User, sub *db.Subscriptio
 		return fmt.Errorf("خطا در ذخیره‌سازی دیتابیس: %w", err)
 	}
 
-	msg := fmt.Sprintf("✅ پرداخت شما تایید و سقف کاربر همزمان اشتراک **%s** به %d دستگاه ارتقا یافت.\nهزینه ارتقا پرداخت شده: %s.",
+	msg := fmt.Sprintf("✅ پرداخت شما تایید و سقف IP همزمان اشتراک **%s** به %d IP ارتقا یافت.\nهزینه ارتقا پرداخت شده: %s.",
 		sub.DisplayName, req.IPLimit, persian.FormatMoney(purchaseAmountToman(req)))
 	_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
 	return nil

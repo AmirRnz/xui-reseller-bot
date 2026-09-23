@@ -104,6 +104,15 @@ func TestScaleMoneyJSONChangesMoneyFieldsAndKeepsIdentityFields(t *testing.T) {
 	}
 }
 
+func TestScaleMoneyJSONRefusesNonDivisibleRialAmount(t *testing.T) {
+	if _, err := scaleMoneyJSON([]byte(`{"refund_amount":10005,"identity":{"id":17}}`)); err == nil {
+		t.Fatal("expected non-divisible money to be rejected instead of rounded")
+	}
+	if _, ok := divideMoneyNumber("999"); ok {
+		t.Fatal("expected 999 Rial to be rejected as a non-integral Toman amount")
+	}
+}
+
 func TestV5MoneyUpgradeWaitsForOperatorUnitDecision(t *testing.T) {
 	ctx := setupTestDB(t)
 	originalPool := Pool

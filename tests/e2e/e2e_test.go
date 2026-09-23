@@ -384,6 +384,15 @@ type TestEnv struct {
 	ctx     context.Context
 }
 
+func processReconciliationWork(t *testing.T, env *TestEnv) {
+	t.Helper()
+	worker := reconcile.NewProcessor("e2e-reconciliation", bot.XUIClient)
+	worker.BatchSize = 100
+	if _, err := worker.ProcessOnce(env.ctx); err != nil {
+		t.Fatalf("process durable reconciliation work: %v", err)
+	}
+}
+
 func (env *TestEnv) SendMessage(tgID int64, username string, text string) {
 	update := map[string]interface{}{
 		"update_id": int(time.Now().UnixNano()),
@@ -1076,9 +1085,12 @@ func TestE2ESuite(t *testing.T) {
 			_, _ = db.Pool.Exec(env.ctx, `INSERT INTO subscriptions (id, user_id, plan_id, plan_type, client_email, sub_id, display_name, ip_limit, expire_time, is_active) VALUES (1, 1, 1, 'paid', 'myservice_deviceA', 'sub12345', 'Device A', 1, 1900000000000, true)`)
 			// Seed client on Mock XUI
 			env.mockXUI.Clients["myservice_deviceA"] = xui.ClientConfig{
-				ID:     "client-uuid-1",
-				Email:  "myservice_deviceA",
-				Enable: true,
+				ID:         "client-uuid-1",
+				SubID:      "sub12345",
+				Email:      "myservice_deviceA",
+				Enable:     true,
+				ExpiryTime: 1900000000000,
+				LimitIP:    1,
 			}
 		}
 
@@ -1154,11 +1166,11 @@ func TestE2ESuite(t *testing.T) {
 			}
 			env.SendCallback(userTGID, userUsername, 999, confirmData)
 			_ = env.ExpectResponse(t, 2*time.Second)     // callback response
-			resp := env.ExpectResponse(t, 2*time.Second) // send confirmation text
-			if !strings.Contains(getStr(resp, "text"), "با موفقیت") {
+			resp := env.ExpectResponse(t, 2*time.Second) // durable acknowledgement
+			if !strings.Contains(getStr(resp, "text"), "پایدار ثبت شد") && !strings.Contains(getStr(resp, "text"), "با موفقیت") {
 				t.Fatalf("Expected IP upgrade success, got: %+v", resp)
 			}
-			_ = env.ExpectResponse(t, 2*time.Second) // details page
+			processReconciliationWork(t, env)
 
 			// Verify DB (deduction occurred) and panel limit
 			sub, _ := db.GetSubscriptionByID(env.ctx, 1)
@@ -1186,11 +1198,12 @@ func TestE2ESuite(t *testing.T) {
 				t.Fatalf("Expected sub_extend_confirm button in invoice: %+v", respInvoice)
 			}
 			env.SendCallback(userTGID, userUsername, 999, confirmData)
+			_ = env.ExpectResponse(t, 2*time.Second) // callback response
 			resp := env.ExpectResponse(t, 2*time.Second)
-			if !strings.Contains(getStr(resp, "text"), "با موفقیت") && !strings.Contains(getStr(resp, "text"), "تمدید شد") {
+			if !strings.Contains(getStr(resp, "text"), "پایدار ثبت شد") && !strings.Contains(getStr(resp, "text"), "با موفقیت") && !strings.Contains(getStr(resp, "text"), "تمدید شد") {
 				t.Fatalf("Expected extension success, got: %+v", resp)
 			}
-			_ = env.ExpectResponse(t, 2*time.Second) // details page
+			processReconciliationWork(t, env)
 
 			// Verify DB (balance deducted) and expiry increased
 			sub, _ := db.GetSubscriptionByID(env.ctx, 1)
@@ -1208,12 +1221,15 @@ func TestE2ESuite(t *testing.T) {
 			setupApprovedUserWithSub()
 			// Set subscription to expired & inactive in DB
 			pastTime := time.Now().UTC().AddDate(0, -1, 0).UnixMilli()
-			_, _ = db.Pool.Exec(env.ctx, `UPDATE subscriptions SET expire_time = $1, is_active = false WHERE id = 1`, pastTime)
+			_, _ = db.Pool.Exec(env.ctx, `UPDATE subscriptions SET expire_time = $1, status = 'expired', is_active = false WHERE id = 1`, pastTime)
 			// Mock XUI has it disabled/inactive
 			env.mockXUI.Clients["myservice_deviceA"] = xui.ClientConfig{
-				ID:     "client-uuid-1",
-				Email:  "myservice_deviceA",
-				Enable: false,
+				ID:         "client-uuid-1",
+				SubID:      "sub12345",
+				Email:      "myservice_deviceA",
+				Enable:     false,
+				ExpiryTime: pastTime,
+				LimitIP:    1,
 			}
 
 			env.SendCallback(userTGID, userUsername, 999, "\fview_sub|1")
@@ -1228,11 +1244,12 @@ func TestE2ESuite(t *testing.T) {
 				t.Fatalf("Expected sub_extend_confirm button in invoice: %+v", respInvoice)
 			}
 			env.SendCallback(userTGID, userUsername, 999, confirmData)
+			_ = env.ExpectResponse(t, 2*time.Second) // callback response
 			resp := env.ExpectResponse(t, 2*time.Second)
-			if !strings.Contains(getStr(resp, "text"), "با موفقیت") && !strings.Contains(getStr(resp, "text"), "تمدید شد") {
+			if !strings.Contains(getStr(resp, "text"), "پایدار ثبت شد") && !strings.Contains(getStr(resp, "text"), "با موفقیت") && !strings.Contains(getStr(resp, "text"), "تمدید شد") {
 				t.Fatalf("Expected extension success, got: %+v", resp)
 			}
-			_ = env.ExpectResponse(t, 2*time.Second) // details page
+			processReconciliationWork(t, env)
 
 			// Verify in DB that it is active now
 			sub, _ := db.GetSubscriptionByID(env.ctx, 1)
@@ -1410,7 +1427,7 @@ func TestE2ESuite(t *testing.T) {
 			setupApprovedUser()
 			env.SendCallback(userTGID, userUsername, 999, "\fbuy_ip_run|10:1:1")
 			resp := env.ExpectResponse(t, 2*time.Second)
-			if !strings.Contains(getStr(resp, "text"), "حداکثر کاربر همزمان") {
+			if !strings.Contains(getStr(resp, "text"), "حداکثر IP همزمان") {
 				t.Fatalf("Expected invalid IP limit error, got: %+v", resp)
 			}
 		})
@@ -1420,7 +1437,7 @@ func TestE2ESuite(t *testing.T) {
 			setupApprovedUser()
 			env.SendCallback(userTGID, userUsername, 999, "\fbuy_ip_run|0:1:1")
 			resp := env.ExpectResponse(t, 2*time.Second)
-			if !strings.Contains(getStr(resp, "text"), "حداقل کاربر همزمان") {
+			if !strings.Contains(getStr(resp, "text"), "حداقل IP همزمان") {
 				t.Fatalf("Expected invalid IP limit error, got: %+v", resp)
 			}
 		})
@@ -1841,8 +1858,11 @@ func TestE2ESuite(t *testing.T) {
 			}
 			env.SendCallback(userTGID, userUsername, 999, confirmLimitData)
 			_ = env.ExpectResponse(t, 2*time.Second) // alert
-			_ = env.ExpectResponse(t, 2*time.Second) // confirmation text
-			_ = env.ExpectResponse(t, 2*time.Second) // details page
+			respUpgrade := env.ExpectResponse(t, 2*time.Second)
+			if !strings.Contains(getStr(respUpgrade, "text"), "پایدار ثبت شد") {
+				t.Fatalf("Expected durable IP upgrade acknowledgement, got: %+v", respUpgrade)
+			}
+			processReconciliationWork(t, env)
 
 			// Balance check: 1760 - 200 = 1560
 			u, _ = db.GetUserByTelegramID(env.ctx, userTGID)
@@ -1870,11 +1890,12 @@ func TestE2ESuite(t *testing.T) {
 			respExtendInvoice2 := env.ExpectResponse(t, 2*time.Second)
 			confirmExtData2 := extractCallbackData(respExtendInvoice2, "\fsub_extend_confirm")
 			env.SendCallback(userTGID, userUsername, 999, confirmExtData2)
+			_ = env.ExpectResponse(t, 2*time.Second) // callback response
 			respSuccess := env.ExpectResponse(t, 2*time.Second)
-			if !strings.Contains(getStr(respSuccess, "text"), "با موفقیت") && !strings.Contains(getStr(respSuccess, "text"), "تمدید شد") {
+			if !strings.Contains(getStr(respSuccess, "text"), "پایدار ثبت شد") && !strings.Contains(getStr(respSuccess, "text"), "با موفقیت") && !strings.Contains(getStr(respSuccess, "text"), "تمدید شد") {
 				t.Fatalf("Expected extension success, got: %+v", respSuccess)
 			}
-			_ = env.ExpectResponse(t, 2*time.Second) // details page
+			processReconciliationWork(t, env)
 		})
 
 		// 55. Combination: Buy fails -> Topup -> Admin Reject -> Manual Credit -> Buy succeeds
@@ -2033,8 +2054,12 @@ func TestE2ESuite(t *testing.T) {
 				t.Fatalf("Expected sub_extend_confirm in invoice: %+v", respExtInvoice)
 			}
 			env.SendCallback(userTGID, userUsername, 999, confirmExtData)
-			_ = env.ExpectResponse(t, 2*time.Second) // confirmation text
-			_ = env.ExpectResponse(t, 2*time.Second) // details page
+			_ = env.ExpectResponse(t, 2*time.Second) // callback response
+			respExtension := env.ExpectResponse(t, 2*time.Second)
+			if !strings.Contains(getStr(respExtension, "text"), "پایدار ثبت شد") {
+				t.Fatalf("Expected durable extension acknowledgement, got: %+v", respExtension)
+			}
+			processReconciliationWork(t, env)
 
 			// 8. User opens delete confirmation, then cancels
 			env.SendCallback(userTGID, userUsername, 999, "\fsub_delete_confirm|2")

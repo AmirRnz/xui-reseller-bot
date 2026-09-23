@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -122,14 +123,14 @@ func CreateSubscription(ctx context.Context, s *Subscription) error {
 	if !IsValidSubscriptionStatus(s.Status) {
 		return fmt.Errorf("invalid subscription status: %q", s.Status)
 	}
+	if err := validateSubscriptionLifecycle(s.Status, s.IsActive); err != nil {
+		return err
+	}
 	if s.DisplayName == "" {
 		s.DisplayName = s.ClientEmail
 	}
 	if s.Status == "" {
 		s.Status = SubscriptionStatusActive
-	}
-	if s.IPLimit == 0 {
-		s.IPLimit = 1
 	}
 	if s.StartDate.IsZero() {
 		s.StartDate = time.Now().UTC()
@@ -160,8 +161,16 @@ func UpdateSubscriptionStatus(ctx context.Context, id int, status string) error 
 		return fmt.Errorf("invalid subscription status: %q", status)
 	}
 
-	isActive := status == SubscriptionStatusActive
-	_, err := Pool.Exec(ctx, `UPDATE subscriptions SET status = $1, is_active = $2, end_date = CASE WHEN $1 = 'cancelled' THEN COALESCE(end_date, NOW()) ELSE end_date END, updated_at = NOW() WHERE id = $3`, status, isActive, id)
+	_, err := Pool.Exec(ctx, `
+		UPDATE subscriptions SET status = $1,
+			is_active = CASE
+				WHEN $1 IN ('active', 'cancellation_requested', 'deprovisioning') THEN TRUE
+				WHEN $1 IN ('disabled', 'expired', 'cancelled', 'deleted') THEN FALSE
+				ELSE is_active END,
+			end_date = CASE WHEN $1 = 'cancelled' THEN COALESCE(end_date, NOW()) ELSE end_date END,
+			updated_at = NOW()
+		WHERE id = $2
+	`, status, id)
 	return err
 }
 
@@ -171,6 +180,9 @@ func UpdateSubscription(ctx context.Context, s *Subscription) error {
 
 	if !IsValidSubscriptionStatus(s.Status) {
 		return fmt.Errorf("invalid subscription status: %q", s.Status)
+	}
+	if err := validateSubscriptionLifecycle(s.Status, s.IsActive); err != nil {
+		return err
 	}
 
 	if s.EndDate.IsZero() && s.ExpireTime != nil && *s.ExpireTime > 0 {
@@ -188,6 +200,161 @@ func UpdateSubscription(ctx context.Context, s *Subscription) error {
 		WHERE id = $17
 	`, s.PlanID, s.ClientEmail, s.ClientUUID, s.SubID, s.Status, s.PlanType, s.DisplayName, s.IPLimit, s.ExpireTime, s.IsActive, endDate, s.TrafficLimitBytes, s.DesiredIPLimit, s.DesiredExpireTime, s.DesiredIsActive, s.ReconciliationNote, s.ID)
 	return err
+}
+
+var ErrSubscriptionCancellationAlreadyRequested = errors.New("subscription cancellation is already requested")
+var ErrSubscriptionCancellationStale = errors.New("subscription changed before cancellation request was committed")
+var ErrSubscriptionCancellationNotComplete = errors.New("subscription deprovisioning is not complete")
+
+// RequestSubscriptionCancellation persists the commercial decision, any
+// refund/manual-review request, and deprovisioning work before XUI is touched.
+func RequestSubscriptionCancellation(ctx context.Context, subscriptionID int, userID int64, expectedUpdatedAt time.Time, refundAmount int64, refundOperationKey, manualReviewReason string) (*RefundRequest, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	if Pool == nil {
+		return nil, errors.New("database pool is not initialized")
+	}
+	if subscriptionID <= 0 || userID <= 0 || refundAmount < 0 {
+		return nil, errors.New("valid subscription, user, and refund amount are required")
+	}
+
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var ownerID int64
+	var status, planType, clientEmail string
+	var updatedAt time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT user_id, status, plan_type, client_email, updated_at
+		FROM subscriptions WHERE id = $1 FOR UPDATE
+	`, subscriptionID).Scan(&ownerID, &status, &planType, &clientEmail, &updatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if ownerID != userID {
+		return nil, errors.New("subscription does not belong to user")
+	}
+	if status == SubscriptionStatusCancelRequested || status == SubscriptionStatusDeprovisioning {
+		return nil, ErrSubscriptionCancellationAlreadyRequested
+	}
+	if status == SubscriptionStatusCancelled || status == SubscriptionStatusDeleted || status == SubscriptionStatusReconciliation {
+		return nil, ErrSubscriptionCancellationStale
+	}
+	if !expectedUpdatedAt.IsZero() && !updatedAt.Equal(expectedUpdatedAt) {
+		return nil, ErrSubscriptionCancellationStale
+	}
+
+	var refundRequest *RefundRequest
+	if refundAmount > 0 || strings.TrimSpace(manualReviewReason) != "" {
+		if refundOperationKey == "" {
+			return nil, errors.New("refund request operation key is required")
+		}
+		subID64 := int64(subscriptionID)
+		refundRequest = &RefundRequest{
+			UserID: userID, SubscriptionID: &subID64,
+			CalculatedAmount: refundAmount, Status: "pending",
+			OperationKey: refundOperationKey,
+		}
+		err = tx.QueryRow(ctx, `
+			INSERT INTO refund_requests (user_id, subscription_id, calculated_amount, status, operation_key)
+			VALUES ($1, $2, $3, 'pending', $4)
+			ON CONFLICT (operation_key) DO NOTHING
+			RETURNING id, created_at, updated_at
+		`, userID, subscriptionID, refundAmount, refundOperationKey).Scan(&refundRequest.ID, &refundRequest.CreatedAt, &refundRequest.UpdatedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errors.New("refund request operation key is already used")
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE subscriptions
+		SET status = $1, reconciliation_note = 'cancellation requested; waiting for durable deprovisioning',
+		    updated_at = NOW()
+		WHERE id = $2 AND user_id = $3
+	`, SubscriptionStatusCancelRequested, subscriptionID, userID); err != nil {
+		return nil, err
+	}
+
+	userIDCopy, subIDCopy := userID, int64(subscriptionID)
+	desired := map[string]any{
+		"subscription_id": subIDCopy,
+		"user_id":         userIDCopy,
+		"client_email":    clientEmail,
+		"plan_type":       planType,
+		"refund_amount":   refundAmount,
+		"reason":          "customer requested cancellation",
+	}
+	if refundRequest != nil {
+		desired["refund_request_id"] = refundRequest.ID
+		desired["refund_request_operation_key"] = refundRequest.OperationKey
+	}
+	work := &ReconciliationRecord{
+		OperationKey:   fmt.Sprintf("subscription_cancel_deprovision:%d", subscriptionID),
+		Kind:           "subscription_cancellation_requested",
+		UserID:         &userIDCopy,
+		SubscriptionID: &subIDCopy,
+		DesiredState:   desired,
+		ObservedState:  map[string]any{"phase": "queued"},
+		Status:         ReconciliationStatusPending,
+	}
+	if err := createReconciliationRecordTx(ctx, tx, work); err != nil {
+		return nil, fmt.Errorf("persist cancellation deprovisioning work: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return refundRequest, nil
+}
+
+func MarkSubscriptionDeprovisioning(ctx context.Context, subscriptionID int) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	tag, err := Pool.Exec(ctx, `
+		UPDATE subscriptions
+		SET status = $1, reconciliation_note = 'deprovisioning on 3x-ui',
+		    updated_at = NOW()
+		WHERE id = $2 AND status IN ($3, $1)
+	`, SubscriptionStatusDeprovisioning, subscriptionID, SubscriptionStatusCancelRequested)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		var status string
+		if err := Pool.QueryRow(ctx, `SELECT status FROM subscriptions WHERE id = $1`, subscriptionID).Scan(&status); err != nil {
+			return err
+		}
+		if status == SubscriptionStatusCancelled {
+			return nil
+		}
+		return ErrSubscriptionCancellationStale
+	}
+	return nil
+}
+
+func CompleteSubscriptionCancellation(ctx context.Context, subscriptionID int, userID int64) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	tag, err := Pool.Exec(ctx, `
+		UPDATE subscriptions
+		SET status = $1, is_active = FALSE, end_date = COALESCE(end_date, NOW()),
+		    desired_ip_limit = NULL, desired_expire_time = NULL, desired_is_active = NULL,
+		    reconciliation_note = '', updated_at = NOW()
+		WHERE id = $2 AND user_id = $3
+		  AND status IN ($4, $5, $1)
+	`, SubscriptionStatusCancelled, subscriptionID, userID, SubscriptionStatusCancelRequested, SubscriptionStatusDeprovisioning)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrSubscriptionCancellationStale
+	}
+	return nil
 }
 
 // CancelSubscriptionWithRefund preserves the commercial row and creates its

@@ -118,6 +118,7 @@ func TestConcurrencyStress(t *testing.T) {
 				// Update
 				sub.IPLimit = sub.IPLimit + 1
 				sub.IsActive = false
+				sub.Status = SubscriptionStatusDisabled
 				if err := UpdateSubscription(ctx, sub); err != nil {
 					errChan <- fmt.Errorf("routine %d: UpdateSubscription: %w", routineID, err)
 				}

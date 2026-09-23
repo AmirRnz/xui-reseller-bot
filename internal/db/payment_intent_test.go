@@ -29,7 +29,7 @@ func TestPaymentIntentLifecycle(t *testing.T) {
 	intent := &PaymentIntent{
 		UserID:      userID,
 		IntentToken: token,
-		ActionType:  "new_subscription",
+		ActionType:  "topup",
 		AmountToman: 150000,
 		Months:      1,
 		IPLimit:     2,
@@ -100,7 +100,7 @@ func TestSubmitReceiptUsesLockedPaymentIntentCommercialTerms(t *testing.T) {
 	if err := Pool.QueryRow(ctx, `INSERT INTO bot_users (telegram_id, username, status) VALUES ($1, $2, 'approved') RETURNING id`, telegramID, fmt.Sprintf("durable_intent_%d", telegramID)).Scan(&userID); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	if err := Pool.QueryRow(ctx, `INSERT INTO paid_plans (name) VALUES ($1) RETURNING id`, fmt.Sprintf("durable_plan_%d", telegramID)).Scan(&planID); err != nil {
+	if err := Pool.QueryRow(ctx, `INSERT INTO paid_plans (name, enabled, base_ip_limit, max_ip_limit, inbound_ids, flow) VALUES ($1, TRUE, 1, 10, '[4,9]'::jsonb, 'durable-flow') RETURNING id`, fmt.Sprintf("durable_plan_%d", telegramID)).Scan(&planID); err != nil {
 		t.Fatalf("create plan: %v", err)
 	}
 	quoteKey := fmt.Sprintf("durable_quote_%d", telegramID)
@@ -171,7 +171,7 @@ func TestConcurrentActivePaymentIntentCreationHasSingleWinner(t *testing.T) {
 			defer wg.Done()
 			<-start
 			_, err := CreatePaymentIntent(ctx, &PaymentIntent{
-				UserID: userID, IntentToken: fmt.Sprintf("intent_race_%d_%d", telegramID, i), ActionType: "buy", AmountToman: 1000,
+				UserID: userID, IntentToken: fmt.Sprintf("intent_race_%d_%d", telegramID, i), ActionType: "topup", AmountToman: 1000,
 			})
 			results <- err
 		}(i)
@@ -235,7 +235,7 @@ func TestExplicitPaymentIntentCancellationAllowsNewCheckout(t *testing.T) {
 	}
 	second, err := CreatePaymentIntent(ctx, &PaymentIntent{
 		UserID: userID, IntentToken: fmt.Sprintf("intent_cancel_second_%d", telegramID),
-		ActionType: "buy", AmountToman: 140000, Status: IntentStatusAwaitingReceipt,
+		ActionType: "topup", AmountToman: 140000, Status: IntentStatusAwaitingReceipt,
 	})
 	if err != nil {
 		t.Fatalf("new checkout after explicit cancellation was rejected: %v", err)

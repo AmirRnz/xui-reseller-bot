@@ -13,14 +13,15 @@ import (
 
 // Supported reconciliation kinds
 const (
-	KindPendingRefund                    = "pending_refund"
-	KindPurchaseProvisioningUnknown      = "purchase_provisioning_unknown"
-	KindPurchaseRemoteCreatedDbFailed    = "purchase_remote_created_db_failed"
-	KindSubscriptionUpdateDbFailed       = "subscription_update_db_failed"
-	KindSubscriptionDeleteUnknown        = "subscription_delete_unknown"
-	KindSubscriptionCancellationDbFailed = "subscription_cancellation_db_failure"
-	KindDirectPaymentProvisioningRetry   = "direct_payment_provisioning_retry"
-	KindSubscriptionRemoteMissing        = "subscription_remote_missing"
+	KindPendingRefund                     = "pending_refund"
+	KindPurchaseProvisioningUnknown       = "purchase_provisioning_unknown"
+	KindPurchaseRemoteCreatedDbFailed     = "purchase_remote_created_db_failed"
+	KindSubscriptionUpdateDbFailed        = "subscription_update_db_failed"
+	KindSubscriptionDeleteUnknown         = "subscription_delete_unknown"
+	KindSubscriptionCancellationDbFailed  = "subscription_cancellation_db_failure"
+	KindSubscriptionCancellationRequested = "subscription_cancellation_requested"
+	KindDirectPaymentProvisioningRetry    = "direct_payment_provisioning_retry"
+	KindSubscriptionRemoteMissing         = "subscription_remote_missing"
 )
 
 func toMap(v any) map[string]any {
@@ -150,6 +151,32 @@ type SubscriptionDeletePayload struct {
 	RefundAmount       int64  `json:"refund_amount,omitempty"`
 	RefundOperationKey string `json:"refund_operation_key,omitempty"`
 	Reason             string `json:"reason,omitempty"`
+}
+
+// SubscriptionCancellationRequestPayload is created before any remote delete.
+type SubscriptionCancellationRequestPayload struct {
+	SubscriptionID  int64  `json:"subscription_id"`
+	UserID          int64  `json:"user_id"`
+	ClientEmail     string `json:"client_email"`
+	RefundRequestID int64  `json:"refund_request_id,omitempty"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+func (p *SubscriptionCancellationRequestPayload) Validate() error {
+	if p.SubscriptionID <= 0 || p.UserID <= 0 {
+		return errors.New("subscription_id and user_id must be greater than 0")
+	}
+	if strings.TrimSpace(p.ClientEmail) == "" {
+		return errors.New("client_email is required")
+	}
+	if p.RefundRequestID < 0 {
+		return errors.New("refund_request_id must not be negative")
+	}
+	return nil
+}
+
+func (p *SubscriptionCancellationRequestPayload) ToMap() map[string]any {
+	return toMap(p)
 }
 
 func (p *SubscriptionDeletePayload) Validate() error {
@@ -637,6 +664,30 @@ func DecodeSubscriptionDelete(raw map[string]any, fallbackSubID *int64, fallback
 
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid subscription delete payload: %w", err)
+	}
+	return p, nil
+}
+
+func DecodeSubscriptionCancellationRequest(raw map[string]any, fallbackSubID, fallbackUserID *int64) (*SubscriptionCancellationRequestPayload, error) {
+	if raw == nil {
+		raw = make(map[string]any)
+	}
+	p := &SubscriptionCancellationRequestPayload{}
+	if id, ok := coerceInt64(raw["subscription_id"]); ok && id > 0 {
+		p.SubscriptionID = id
+	} else if fallbackSubID != nil {
+		p.SubscriptionID = *fallbackSubID
+	}
+	if id, ok := coerceInt64(raw["user_id"]); ok && id > 0 {
+		p.UserID = id
+	} else if fallbackUserID != nil {
+		p.UserID = *fallbackUserID
+	}
+	p.ClientEmail = coerceString(raw["client_email"])
+	p.RefundRequestID, _ = coerceInt64(raw["refund_request_id"])
+	p.Reason = coerceString(raw["reason"])
+	if err := p.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid subscription cancellation request payload: %w", err)
 	}
 	return p, nil
 }

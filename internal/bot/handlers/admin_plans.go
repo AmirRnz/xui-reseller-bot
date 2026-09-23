@@ -61,9 +61,9 @@ func HandleAdminPlans(c telebot.Context) error {
 		}
 		var ipLabel string
 		if p.BaseIPLimit == 0 && p.MaxIPLimit == 0 {
-			ipLabel = "کاربر همزمان نامحدود"
+			ipLabel = "IP همزمان نامحدود"
 		} else {
-			ipLabel = fmt.Sprintf("%d-%d کاربر همزمان", p.BaseIPLimit, p.MaxIPLimit)
+			ipLabel = fmt.Sprintf("%d-%d IP همزمان", p.BaseIPLimit, p.MaxIPLimit)
 		}
 		text.WriteString(fmt.Sprintf("%s #%d %s (قیمت پایه %s، %s)\n",
 			enabledMark, p.ID, p.Name, persian.FormatMoney(p.BasePriceToman), ipLabel))
@@ -257,7 +257,7 @@ func showAdminDraftTestPlanMenu(c telebot.Context, draft map[string]interface{})
 		dataLabel = fmt.Sprintf("%.2f گیگابایت", float64(maxDataBytes)/1073741824)
 	}
 
-	ipLimitLabel := fmt.Sprintf("%d کاربر همزمان", ipLimit)
+	ipLimitLabel := fmt.Sprintf("%d IP همزمان", ipLimit)
 	if ipLimit == 0 {
 		ipLimitLabel = "نامحدود"
 	}
@@ -273,7 +273,7 @@ func showAdminDraftTestPlanMenu(c telebot.Context, draft map[string]interface{})
 		"📊 سقف مجاز روزانه: %d\n"+
 		"👥 سطح دسترسی: %s\n"+
 		"🔄 همگام‌سازی اشتراک‌های فعال: %t\n"+
-		"🌐 محدودیت کاربران همزمان: %s\n",
+		"🌐 محدودیت اتصال‌های IP همزمان: %s\n",
 		nonEmpty(name, "(تنظیم نشده)"),
 		nonEmpty(description, "(تنظیم نشده)"),
 		nonEmpty(usageDescription, "(تنظیم نشده)"),
@@ -292,7 +292,7 @@ func showAdminDraftTestPlanMenu(c telebot.Context, draft map[string]interface{})
 		menu.Row(menu.Data("📡 اینباندها", "admin_draft_inbounds", "test"), menu.Data("⏱️ مدت اعتبار", "admin_draft_edit", "test:duration")),
 		menu.Row(menu.Data("💾 حجم مجاز", "admin_draft_edit", "test:max_data"), menu.Data("⚡ فلو", "admin_draft_edit", "test:flow")),
 		menu.Row(menu.Data("📊 سقف روزانه", "admin_draft_edit", "test:max_per_day"), menu.Data("👥 دسترسی", "admin_draft_edit", "test:access")),
-		menu.Row(menu.Data("🌐 کاربر همزمان", "admin_draft_edit", "test:ip_limit"), menu.Data("🔄 همگام‌سازی: "+toggleEmoji(syncSubs), "admin_draft_toggle_sync", "test")),
+		menu.Row(menu.Data("🌐 IP همزمان", "admin_draft_edit", "test:ip_limit"), menu.Data("🔄 همگام‌سازی: "+toggleEmoji(syncSubs), "admin_draft_toggle_sync", "test")),
 		menu.Row(menu.Data("💾 ذخیره طرح", "admin_draft_action", "test:save"), menu.Data("❌ انصراف", "admin_draft_action", "test:cancel")),
 	)
 	return maybeEditOrSend(c, text, menu)
@@ -333,7 +333,7 @@ func showAdminDraftPaidPlanMenu(c telebot.Context, draft map[string]interface{})
 
 	var ipLimitsLabel string
 	if baseIP == 0 && maxIP == 0 {
-		ipLimitsLabel = "کاربر همزمان نامحدود"
+		ipLimitsLabel = "IP همزمان نامحدود"
 	} else {
 		ipLimitsLabel = fmt.Sprintf("پایه %d - حداکثر %d", baseIP, maxIP)
 	}
@@ -350,7 +350,7 @@ func showAdminDraftPaidPlanMenu(c telebot.Context, draft map[string]interface{})
 		"📡 اینباندها: %s\n"+
 		"📊 نوع طرح: %s\n"+
 		"%s"+
-		"🌐 محدودیت کاربران همزمان: %s\n"+
+		"🌐 محدودیت اتصال‌های IP همزمان: %s\n"+
 		"💲 قیمت هر کاربر اضافی: %s\n"+
 		"⚡ فلو: %s\n"+
 		"🏷️ تخفیف‌های دوره‌ای: %s\n"+
@@ -387,7 +387,7 @@ func showAdminDraftPaidPlanMenu(c telebot.Context, draft map[string]interface{})
 		rows = append(rows, menu.Row(menu.Data("💵 قیمت پایه", "admin_draft_edit", "paid:price"), menu.Data("⚡ فلو", "admin_draft_edit", "paid:flow")))
 	}
 
-	rows = append(rows, menu.Row(menu.Data("🌐 کاربران همزمان", "admin_draft_edit", "paid:ip_limits"), menu.Data("💲 قیمت کاربر اضافی", "admin_draft_edit", "paid:extra_ip")))
+	rows = append(rows, menu.Row(menu.Data("🌐 سقف IP همزمان", "admin_draft_edit", "paid:ip_limits"), menu.Data("💲 قیمت IP همزمان اضافه", "admin_draft_edit", "paid:extra_ip")))
 	rows = append(rows, menu.Row(menu.Data("🏷️ تخفیف‌ها", "admin_draft_edit", "paid:discounts"), menu.Data("👥 دسترسی", "admin_draft_edit", "paid:access")))
 	rows = append(rows, menu.Row(menu.Data("🔄 همگام‌سازی: "+toggleEmoji(syncSubs), "admin_draft_toggle_sync", "paid")))
 	rows = append(rows, menu.Row(menu.Data("💾 ذخیره طرح", "admin_draft_action", "paid:save"), menu.Data("❌ انصراف", "admin_draft_action", "paid:cancel")))
@@ -484,9 +484,9 @@ func HandleAdminDraftEdit(c telebot.Context) error {
 	case "price_per_extra_month":
 		prompt = "⏱️ قیمت هر ماه اضافی را به تومان ارسال کنید (مثال: '20000'):"
 	case "ip_limits":
-		prompt = "🌐 محدودیت تعداد کاربر همزمان را به صورت 'پایه-حداکثر' (مثال: '1-6' یا '2-2') یا عدد '0' برای نامحدود ارسال کنید:"
+		prompt = "🌐 محدودیت تعداد IP همزمان را به صورت 'پایه-حداکثر' (مثال: '1-6' یا '2-2') یا عدد '0' برای نامحدود ارسال کنید:"
 	case "ip_limit":
-		prompt = "🌐 محدودیت تعداد کاربر همزمان (مثال: '1' یا '2') یا عدد '0' برای نامحدود را ارسال کنید:"
+		prompt = "🌐 محدودیت تعداد IP همزمان (مثال: '1' یا '2') یا عدد '0' برای نامحدود را ارسال کنید:"
 	case "extra_ip":
 		prompt = "💲 قیمت هر کاربر اضافی را به تومان ارسال کنید (مثال: '50000'):"
 	case "discounts":
@@ -577,28 +577,28 @@ func ProcessAdminDraftInput(c telebot.Context, text string) error {
 		}
 		parts := strings.Split(text, "-")
 		if len(parts) != 2 {
-			return c.Send("محدودیت تعداد کاربر باید به صورت 'پایه-حداکثر' (مثلاً '1-6') یا '0' برای نامحدود باشد. مجدداً تلاش کنید:")
+			return c.Send("سقف IP همزمان باید به صورت 'پایه-حداکثر' (مثلاً '1-6') یا '0' برای نامحدود باشد. مجدداً تلاش کنید:")
 		}
 		baseIP, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
 		maxIP, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
 		if err1 != nil || err2 != nil || baseIP < 0 || maxIP < baseIP {
-			return c.Send("محدودیت تعداد کاربر نامعتبر است. حداکثر کاربر باید بزرگتر یا مساوی پایه و نامنفی باشد:")
+			return c.Send("سقف IP همزمان نامعتبر است. حداکثر باید بزرگتر یا مساوی مقدار پایه و نامنفی باشد:")
 		}
 		if baseIP == 0 && maxIP != 0 {
-			return c.Send("اگر حداقل کاربر ۰ (نامحدود) باشد، حداکثر کاربر نیز باید ۰ باشد. مجدداً تلاش کنید:")
+			return c.Send("اگر مقدار پایه ۰ (نامحدود) باشد، حداکثر نیز باید ۰ باشد. مجدداً تلاش کنید:")
 		}
 		draft["base_ip_limit"] = baseIP
 		draft["max_ip_limit"] = maxIP
 	case "ip_limit":
 		val, err := strconv.Atoi(text)
 		if err != nil || val < 0 {
-			return c.Send("محدودیت تعداد کاربر باید صفر (نامحدود) یا عدد صحیح مثبت باشد. مجدداً تلاش کنید:")
+			return c.Send("سقف IP همزمان باید صفر (نامحدود) یا عدد صحیح مثبت باشد. مجدداً تلاش کنید:")
 		}
 		draft["ip_limit"] = val
 	case "extra_ip":
 		val, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || val < 0 {
-			return c.Send("قیمت هر کاربر اضافی باید صفر یا عددی مثبت باشد. مجدداً تلاش کنید:")
+			return c.Send("قیمت هر IP همزمان اضافه باید صفر یا عددی مثبت باشد. مجدداً تلاش کنید:")
 		}
 		draft["price_per_extra_ip_toman"] = val
 	case "flow":
@@ -1281,14 +1281,14 @@ func showAdminViewPlan(c telebot.Context, planType string, planID int64) error {
 		}
 		enabled = plan.Enabled
 		access, _ := db.GetPlanUserAccess(context.Background(), planType, planID)
-		ipLimitLabel := fmt.Sprintf("%d کاربر همزمان", plan.IPLimit)
+		ipLimitLabel := fmt.Sprintf("%d IP همزمان", plan.IPLimit)
 		if plan.IPLimit == 0 {
 			ipLimitLabel = "نامحدود"
 		}
 		text = fmt.Sprintf("🧪 **طرح تست شماره %d**\n"+
 			"نام: %s\nتوضیحات: %s\nنکات کاربری: %s\nوضعیت فعال: %t\nدسترسی عمومی: %t\n"+
 			"اینباندها: %s\nمدت اعتبار: %s\nسقف حجم: %.2f گیگابایت\n"+
-			"فلو: %s\nسقف روزانه: %d\nمحدودیت کاربران همزمان: %s\nکاربران اختصاصی: %s",
+			"فلو: %s\nسقف روزانه: %d\nمحدودیت اتصال‌های IP همزمان: %s\nکاربران اختصاصی: %s",
 			plan.ID, plan.Name, plan.Description, plan.UsageDescription, plan.Enabled, plan.IsGlobal,
 			inboundLabel(plan.InboundIDs), humanDuration(plan.ExpireSeconds),
 			float64(plan.MaxDataBytes)/1073741824, nonEmpty(plan.Flow, "پیش‌فرض/خالی"), plan.MaxPerDay, ipLimitLabel, formatAccessLabel(plan.IsGlobal, access))
@@ -1308,15 +1308,15 @@ func showAdminViewPlan(c telebot.Context, planType string, planID int64) error {
 			priceBlock = fmt.Sprintf("نوع طرح: نامحدود\nقیمت پایه: %s", persian.FormatMoney(plan.BasePriceToman))
 		}
 
-		ipLabel := fmt.Sprintf("%d-%d کاربر همزمان", plan.BaseIPLimit, plan.MaxIPLimit)
+		ipLabel := fmt.Sprintf("%d-%d IP همزمان", plan.BaseIPLimit, plan.MaxIPLimit)
 		if plan.BaseIPLimit == 0 && plan.MaxIPLimit == 0 {
-			ipLabel = "کاربر همزمان نامحدود"
+			ipLabel = "IP همزمان نامحدود"
 		}
 
 		text = fmt.Sprintf("💼 **طرح خرید شماره %d**\n"+
 			"نام: %s\nتوضیحات: %s\nنکات کاربری: %s\nوضعیت فعال: %t\nدسترسی عمومی: %t\n"+
-			"اینباندها: %s\n%s\nمحدودیت کاربران: %s\n"+
-			"قیمت کاربر اضافی: %s\nفلو: %s\nتخفیف‌ها: %s\nکاربران اختصاصی: %s",
+			"اینباندها: %s\n%s\nمحدودیت IP همزمان: %s\n"+
+			"قیمت IP همزمان اضافه: %s\nفلو: %s\nتخفیف‌ها: %s\nکاربران اختصاصی: %s",
 			plan.ID, plan.Name, plan.Description, plan.UsageDescription, plan.Enabled, plan.IsGlobal,
 			inboundLabel(plan.InboundIDs), priceBlock, ipLabel,
 			persian.FormatMoney(plan.PricePerExtraIPToman), nonEmpty(plan.Flow, "پیش‌فرض/خالی"), formatDiscountLabel(plan.DiscountTiers), formatAccessLabel(plan.IsGlobal, access))

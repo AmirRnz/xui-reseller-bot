@@ -92,7 +92,12 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     desired_ip_limit INT,
     desired_expire_time BIGINT,
     desired_is_active BOOLEAN,
-    reconciliation_note TEXT NOT NULL DEFAULT ''
+    reconciliation_note TEXT NOT NULL DEFAULT '',
+    CONSTRAINT subscriptions_lifecycle_status_active_check CHECK (
+        (status <> 'active' OR is_active = TRUE)
+        AND (status NOT IN ('disabled', 'expired', 'cancelled', 'deleted') OR is_active = FALSE)
+        AND (status NOT IN ('cancellation_requested', 'deprovisioning') OR is_active = TRUE)
+    )
 );
 
 CREATE TABLE IF NOT EXISTS topup_requests (

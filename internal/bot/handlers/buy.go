@@ -56,10 +56,10 @@ func HandleBuySubFlow(c telebot.Context) error {
 	rows := make([]telebot.Row, 0, len(plans)+1)
 	for _, plan := range plans {
 		if plan.IsLimited {
-			text.WriteString(fmt.Sprintf("📦 **%s** (محدود)\nقیمت هر گیگابایت: %s\nحداقل ترافیک: %d گیگابایت\nماهانه اضافه: +%s\nدستگاه همزمان: %d تا سقف %d\nهزینه کاربر اضافه: +%s/کاربر/ماه\n",
+			text.WriteString(fmt.Sprintf("📦 **%s** (محدود)\nقیمت هر گیگابایت: %s\nحداقل ترافیک: %d گیگابایت\nماهانه اضافه: +%s\nاتصال IP همزمان: %d تا سقف %d\nهزینه هر اتصال IP همزمان اضافه: +%s/اتصال/ماه\n",
 				plan.Name, persian.FormatMoney(plan.PricePerGBToman), plan.MinDataGB, persian.FormatMoney(plan.PricePerExtraMonthToman), plan.BaseIPLimit, plan.MaxIPLimit, persian.FormatMoney(plan.PricePerExtraIPToman)))
 		} else {
-			text.WriteString(fmt.Sprintf("📦 **%s** (نامحدود)\nقیمت پایه: %s/ماهانه\nدستگاه همزمان: %d تا سقف %d\nهزینه کاربر اضافه: +%s/کاربر/ماه\n",
+			text.WriteString(fmt.Sprintf("📦 **%s** (نامحدود)\nقیمت پایه: %s/ماهانه\nاتصال IP همزمان: %d تا سقف %d\nهزینه هر اتصال IP همزمان اضافه: +%s/اتصال/ماه\n",
 				plan.Name, persian.FormatMoney(plan.BasePriceToman), plan.BaseIPLimit, plan.MaxIPLimit, persian.FormatMoney(plan.PricePerExtraIPToman)))
 		}
 		if plan.Description != "" {
@@ -155,9 +155,9 @@ func handlePostDuration(c telebot.Context, plan *db.PaidPlan, months int) error 
 		)
 		var ipLimitLabel string
 		if plan.BaseIPLimit == 0 {
-			ipLimitLabel = "کاربر همزمان نامحدود"
+			ipLimitLabel = "IP همزمان نامحدود"
 		} else {
-			ipLimitLabel = fmt.Sprintf("%d کاربر همزمان", plan.BaseIPLimit)
+			ipLimitLabel = fmt.Sprintf("%d IP همزمان", plan.BaseIPLimit)
 		}
 		return maybeEditOrSend(c, fmt.Sprintf(
 			"📦 **%s**\n%d ماهه، %s\nقیمت: %s\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
@@ -303,14 +303,14 @@ func showIPChoicesLimited(c telebot.Context, plan *db.PaidPlan, months int, gb i
 	var rows []telebot.Row
 	for ip := plan.BaseIPLimit; ip <= plan.MaxIPLimit; ip++ {
 		price := calculatePaidPrice(plan, months, ip, gb)
-		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("%d کاربر همزمان — %s", ip, persian.FormatMoney(price)), "buy_ip_run_limited", fmt.Sprintf("%d:%d:%d:%d", ip, plan.ID, months, gb))))
+		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("%d IP همزمان — %s", ip, persian.FormatMoney(price)), "buy_ip_run_limited", fmt.Sprintf("%d:%d:%d:%d", ip, plan.ID, months, gb))))
 		if len(rows) >= 10 {
 			break
 		}
 	}
 	rows = append(rows, menu.Row(menu.Data("« بازگشت", "buy_months", fmt.Sprintf("%d:%d", months, plan.ID))))
 	menu.Inline(rows...)
-	return maybeEditOrSend(c, fmt.Sprintf("📦 **%s** — %d گیگابایت، %d ماهه\nتعداد کاربر همزمان (محدودیت دستگاه) را انتخاب کنید:", plan.Name, gb, months), menu)
+	return maybeEditOrSend(c, fmt.Sprintf("📦 **%s** — %d گیگابایت، %d ماهه\nتعداد IP همزمان (محدودیت IP) را انتخاب کنید:", plan.Name, gb, months), menu)
 }
 
 func HandleBuyIPRunLimited(c telebot.Context) error {
@@ -348,9 +348,9 @@ func HandleBuyIPRunLimited(c telebot.Context) error {
 	)
 	var ipLimitLabel string
 	if ipLimit == 0 {
-		ipLimitLabel = "کاربر همزمان نامحدود"
+		ipLimitLabel = "IP همزمان نامحدود"
 	} else {
-		ipLimitLabel = fmt.Sprintf("%d کاربر همزمان", ipLimit)
+		ipLimitLabel = fmt.Sprintf("%d IP همزمان", ipLimit)
 	}
 	return maybeEditOrSend(c, fmt.Sprintf(
 		"📦 **%s**\n%d گیگابایت، %d ماهه، %s\nقیمت: %s\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
@@ -374,14 +374,14 @@ func showIPChoices(c telebot.Context, planID int64, months int) error {
 	var rows []telebot.Row
 	for ip := plan.BaseIPLimit; ip <= plan.MaxIPLimit; ip++ {
 		price := calculatePaidPrice(plan, months, ip, 0)
-		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("%d کاربر همزمان — %s", ip, persian.FormatMoney(price)), "buy_ip_run", fmt.Sprintf("%d:%d:%d", ip, plan.ID, months))))
+		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("%d IP همزمان — %s", ip, persian.FormatMoney(price)), "buy_ip_run", fmt.Sprintf("%d:%d:%d", ip, plan.ID, months))))
 		if len(rows) >= 10 {
 			break
 		}
 	}
 	rows = append(rows, menu.Row(menu.Data("« بازگشت", "select_buy_plan", fmt.Sprintf("%d", planID))))
 	menu.Inline(rows...)
-	return maybeEditOrSend(c, fmt.Sprintf("📦 **%s** — %d ماهه\nتعداد کاربر همزمان (محدودیت دستگاه) را انتخاب کنید:", plan.Name, months), menu)
+	return maybeEditOrSend(c, fmt.Sprintf("📦 **%s** — %d ماهه\nتعداد IP همزمان (محدودیت IP) را انتخاب کنید:", plan.Name, months), menu)
 }
 
 func HandleBuyIPRun(c telebot.Context) error {
@@ -412,10 +412,10 @@ func HandleBuyIPRun(c telebot.Context) error {
 		return c.Send("طرح مورد نظر یافت نشد.")
 	}
 	if ipLimit < plan.BaseIPLimit {
-		return c.Send(fmt.Sprintf("حداقل کاربر همزمان برای این طرح %d است.", plan.BaseIPLimit))
+		return c.Send(fmt.Sprintf("حداقل IP همزمان برای این طرح %d است.", plan.BaseIPLimit))
 	}
 	if ipLimit > plan.MaxIPLimit {
-		return c.Send(fmt.Sprintf("حداکثر کاربر همزمان برای این طرح %d است.", plan.MaxIPLimit))
+		return c.Send(fmt.Sprintf("حداکثر IP همزمان برای این طرح %d است.", plan.MaxIPLimit))
 	}
 
 	price := calculatePaidPrice(plan, months, ipLimit, 0)
@@ -433,9 +433,9 @@ func HandleBuyIPRun(c telebot.Context) error {
 	)
 	var ipLimitLabel string
 	if ipLimit == 0 {
-		ipLimitLabel = "کاربر همزمان نامحدود"
+		ipLimitLabel = "IP همزمان نامحدود"
 	} else {
-		ipLimitLabel = fmt.Sprintf("%d کاربر همزمان", ipLimit)
+		ipLimitLabel = fmt.Sprintf("%d IP همزمان", ipLimit)
 	}
 	return maybeEditOrSend(c, fmt.Sprintf(
 		"📦 **%s**\n%d ماهه، %s\nقیمت: %s\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
@@ -528,7 +528,7 @@ func ProcessBuyCustomName(c telebot.Context, customName string) error {
 		),
 	)
 	return maybeEditOrSend(c, fmt.Sprintf(
-		"🧾 **خلاصه فاکتور خرید**\n\nطرح: %s\nاشتراک: %s\nمدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\nکاربر همزمان: %s\nسقف ترافیک: %s\nمبلغ کل: %s\n\nموجودی کیف پول شما: %s\n\nنحوه پرداخت را انتخاب کنید:",
+		"🧾 **خلاصه فاکتور خرید**\n\nطرح: %s\nاشتراک: %s\nمدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\nIP همزمان: %s\nسقف ترافیک: %s\nمبلغ کل: %s\n\nموجودی کیف پول شما: %s\n\nنحوه پرداخت را انتخاب کنید:",
 		plan.Name, email, months, persian.FormatIPLimit(ipLimit), dataLabel,
 		persian.FormatMoney(quote.FinalPriceToman),
 		persian.FormatMoney(user.WalletBalance),
@@ -631,7 +631,7 @@ func HandleBuyAutoName(c telebot.Context) error {
 		),
 	)
 	return maybeEditOrSend(c, fmt.Sprintf(
-		"🧾 **خلاصه فاکتور خرید**\n\nطرح: %s\nاشتراک: %s\nمدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\nکاربر همزمان: %s\nسقف ترافیک: %s\nمبلغ کل: %s\n\nموجودی کیف پول شما: %s\n\nنحوه پرداخت را انتخاب کنید:",
+		"🧾 **خلاصه فاکتور خرید**\n\nطرح: %s\nاشتراک: %s\nمدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\nIP همزمان: %s\nسقف ترافیک: %s\nمبلغ کل: %s\n\nموجودی کیف پول شما: %s\n\nنحوه پرداخت را انتخاب کنید:",
 		plan.Name, email, months, persian.FormatIPLimit(ipLimit), dataLabel,
 		persian.FormatMoney(quote.FinalPriceToman),
 		persian.FormatMoney(user.WalletBalance),

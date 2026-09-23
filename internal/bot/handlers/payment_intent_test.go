@@ -61,7 +61,7 @@ func TestCancelCommandOffersRecoveryAndKeepsActiveIntent(t *testing.T) {
 		_, _ = db.Pool.Exec(ctx, `DELETE FROM bot_users WHERE id = $1`, userID)
 	}()
 	intent, err := db.CreatePaymentIntent(ctx, &db.PaymentIntent{
-		UserID: userID, IntentToken: fmt.Sprintf("cancel_cmd_%d", tgID), ActionType: "buy", AmountToman: 125000,
+		UserID: userID, IntentToken: fmt.Sprintf("cancel_cmd_%d", tgID), ActionType: "topup", AmountToman: 125000,
 		Status: db.IntentStatusAwaitingReceipt,
 	})
 	if err != nil {
