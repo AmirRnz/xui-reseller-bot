@@ -56,10 +56,10 @@ func HandleBuySubFlow(c telebot.Context) error {
 	rows := make([]telebot.Row, 0, len(plans)+1)
 	for _, plan := range plans {
 		if plan.IsLimited {
-			text.WriteString(fmt.Sprintf("📦 **%s** (محدود)\nقیمت هر گیگابایت: %s تومان\nحداقل ترافیک: %d گیگابایت\nماهانه اضافه: +%s تومان\nدستگاه همزمان: %d تا سقف %d\nهزینه کاربر اضافه: +%s تومان/کاربر/ماه\n",
+			text.WriteString(fmt.Sprintf("📦 **%s** (محدود)\nقیمت هر گیگابایت: %s\nحداقل ترافیک: %d گیگابایت\nماهانه اضافه: +%s\nدستگاه همزمان: %d تا سقف %d\nهزینه کاربر اضافه: +%s/کاربر/ماه\n",
 				plan.Name, persian.FormatMoney(plan.PricePerGBToman), plan.MinDataGB, persian.FormatMoney(plan.PricePerExtraMonthToman), plan.BaseIPLimit, plan.MaxIPLimit, persian.FormatMoney(plan.PricePerExtraIPToman)))
 		} else {
-			text.WriteString(fmt.Sprintf("📦 **%s** (نامحدود)\nقیمت پایه: %s تومان/ماهانه\nدستگاه همزمان: %d تا سقف %d\nهزینه کاربر اضافه: +%s تومان/کاربر/ماه\n",
+			text.WriteString(fmt.Sprintf("📦 **%s** (نامحدود)\nقیمت پایه: %s/ماهانه\nدستگاه همزمان: %d تا سقف %d\nهزینه کاربر اضافه: +%s/کاربر/ماه\n",
 				plan.Name, persian.FormatMoney(plan.BasePriceToman), plan.BaseIPLimit, plan.MaxIPLimit, persian.FormatMoney(plan.PricePerExtraIPToman)))
 		}
 		if plan.Description != "" {
@@ -103,9 +103,9 @@ func HandleSelectBuyPlan(c telebot.Context) error {
 		menu.Row(menu.Data("« بازگشت", "menu_buy_sub")),
 	)
 
-	priceLabel := fmt.Sprintf("قیمت پایه: %s تومان/ماهانه", persian.FormatMoney(plan.BasePriceToman))
+	priceLabel := fmt.Sprintf("قیمت پایه: %s/ماهانه", persian.FormatMoney(plan.BasePriceToman))
 	if plan.IsLimited {
-		priceLabel = fmt.Sprintf("قیمت هر گیگابایت: %s تومان\nحداقل ترافیک: %d گیگابایت\nهزینه تمدید ماهانه اضافه: +%s تومان", persian.FormatMoney(plan.PricePerGBToman), plan.MinDataGB, persian.FormatMoney(plan.PricePerExtraMonthToman))
+		priceLabel = fmt.Sprintf("قیمت هر گیگابایت: %s\nحداقل ترافیک: %d گیگابایت\nهزینه تمدید ماهانه اضافه: +%s", persian.FormatMoney(plan.PricePerGBToman), plan.MinDataGB, persian.FormatMoney(plan.PricePerExtraMonthToman))
 	}
 
 	descText := ""
@@ -160,7 +160,7 @@ func handlePostDuration(c telebot.Context, plan *db.PaidPlan, months int) error 
 			ipLimitLabel = fmt.Sprintf("%d کاربر همزمان", plan.BaseIPLimit)
 		}
 		return maybeEditOrSend(c, fmt.Sprintf(
-			"📦 **%s**\n%d ماهه، %s\nقیمت: %s تومان\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
+			"📦 **%s**\n%d ماهه، %s\nقیمت: %s\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
 			plan.Name, months, ipLimitLabel, persian.FormatMoney(price)), menu)
 	}
 
@@ -303,7 +303,7 @@ func showIPChoicesLimited(c telebot.Context, plan *db.PaidPlan, months int, gb i
 	var rows []telebot.Row
 	for ip := plan.BaseIPLimit; ip <= plan.MaxIPLimit; ip++ {
 		price := calculatePaidPrice(plan, months, ip, gb)
-		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("%d کاربر همزمان — %s تومان", ip, persian.FormatMoney(price)), "buy_ip_run_limited", fmt.Sprintf("%d:%d:%d:%d", ip, plan.ID, months, gb))))
+		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("%d کاربر همزمان — %s", ip, persian.FormatMoney(price)), "buy_ip_run_limited", fmt.Sprintf("%d:%d:%d:%d", ip, plan.ID, months, gb))))
 		if len(rows) >= 10 {
 			break
 		}
@@ -353,7 +353,7 @@ func HandleBuyIPRunLimited(c telebot.Context) error {
 		ipLimitLabel = fmt.Sprintf("%d کاربر همزمان", ipLimit)
 	}
 	return maybeEditOrSend(c, fmt.Sprintf(
-		"📦 **%s**\n%d گیگابایت، %d ماهه، %s\nقیمت: %s تومان\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
+		"📦 **%s**\n%d گیگابایت، %d ماهه، %s\nقیمت: %s\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
 		plan.Name, gb, months, ipLimitLabel, persian.FormatMoney(price)), menu)
 }
 
@@ -374,7 +374,7 @@ func showIPChoices(c telebot.Context, planID int64, months int) error {
 	var rows []telebot.Row
 	for ip := plan.BaseIPLimit; ip <= plan.MaxIPLimit; ip++ {
 		price := calculatePaidPrice(plan, months, ip, 0)
-		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("%d کاربر همزمان — %s تومان", ip, persian.FormatMoney(price)), "buy_ip_run", fmt.Sprintf("%d:%d:%d", ip, plan.ID, months))))
+		rows = append(rows, menu.Row(menu.Data(fmt.Sprintf("%d کاربر همزمان — %s", ip, persian.FormatMoney(price)), "buy_ip_run", fmt.Sprintf("%d:%d:%d", ip, plan.ID, months))))
 		if len(rows) >= 10 {
 			break
 		}
@@ -438,7 +438,7 @@ func HandleBuyIPRun(c telebot.Context) error {
 		ipLimitLabel = fmt.Sprintf("%d کاربر همزمان", ipLimit)
 	}
 	return maybeEditOrSend(c, fmt.Sprintf(
-		"📦 **%s**\n%d ماهه، %s\nقیمت: %s تومان\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
+		"📦 **%s**\n%d ماهه، %s\nقیمت: %s\n\nلطفا نام دلخواه برای اشتراک خود را ارسال کنید (فقط حروف و عدد انگلیسی):\n(یک پسوند تصادفی ۶ کاراکتری به انتهای نام انتخابی شما اضافه خواهد شد)",
 		plan.Name, months, ipLimitLabel, persian.FormatMoney(price)), menu)
 }
 
@@ -737,9 +737,37 @@ func HandleBuyConfirm(c telebot.Context) error {
 	processor := reconcile.NewProcessor("wallet_buy", bot.XUIClient)
 	_, _ = processor.ProcessOnce(context.Background())
 	if subscription, lookupErr := db.GetSubscriptionByEmail(context.Background(), email); lookupErr == nil && subscription != nil {
-		return c.Send("اشتراک با موفقیت فعال شد.")
+		return sendProvisionedPurchaseResult(c, user, plan, subscription, months, priceToman, dataGB)
 	}
 	return c.Send("درخواست خرید و برداشت کیف پول به‌صورت امن ثبت شد. فعال‌سازی سرویس پس از آماده‌شدن پنل ادامه می‌یابد.")
+}
+
+func sendProvisionedPurchaseResult(c telebot.Context, user *db.User, plan *db.PaidPlan, sub *db.Subscription, months int, priceToman int64, dataGB int) error {
+	links, _ := bot.XUIClient.GetSubscriptionLinks(sub.SubID)
+	var subLink string
+	for _, link := range links {
+		if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
+			subLink = link
+			break
+		}
+	}
+	if subLink == "" {
+		subLink = bot.XUIClient.SubscriptionURLFor(sub.SubID)
+	}
+
+	dataLabel := "نامحدود"
+	if plan.IsLimited {
+		dataLabel = fmt.Sprintf("%d گیگابایت", dataGB)
+	}
+	details := fmt.Sprintf("✅ اشتراک شما با موفقیت فعال شد!\n📦 طرح: %s\n⏱️ مدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\n📊 سقف ترافیک: %s\n💰 هزینه پرداخت شده: %s",
+		plan.Name, months, dataLabel, persian.FormatMoney(priceToman))
+	if plan.UsageDescription != "" {
+		details += fmt.Sprintf("\n\nنکات استفاده:\n%s", plan.UsageDescription)
+	}
+	if err := sendSubscriptionResult(c, subLink, details); err != nil {
+		_ = c.Send(details+"\n"+subLink, telebot.ModeMarkdown)
+	}
+	return showMainMenu(c, user)
 }
 
 func HandleBuyDirectPayment(c telebot.Context) error {

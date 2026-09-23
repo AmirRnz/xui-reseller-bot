@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -50,6 +51,19 @@ type ReconciliationStats struct {
 	ProvisioningUnknownCount int64 `json:"provisioning_unknown_count"`
 	ManualReviewCount        int64 `json:"manual_review_count"`
 	OldestPendingAgeSeconds  int64 `json:"oldest_pending_age_seconds"`
+}
+
+func decodeReconciliationState(data []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	var state map[string]any
+	if err := decoder.Decode(&state); err != nil {
+		return nil, err
+	}
+	if state == nil {
+		state = make(map[string]any)
+	}
+	return state, nil
 }
 
 func CreateReconciliationRecord(ctx context.Context, record *ReconciliationRecord) error {
@@ -245,8 +259,14 @@ func ClaimPendingReconciliationRecords(ctx context.Context, lockedBy string, lim
 		if err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(desiredBytes, &r.DesiredState)
-		_ = json.Unmarshal(observedBytes, &r.ObservedState)
+		r.DesiredState, err = decodeReconciliationState(desiredBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode reconciliation desired state: %w", err)
+		}
+		r.ObservedState, err = decodeReconciliationState(observedBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode reconciliation observed state: %w", err)
+		}
 		records = append(records, r)
 	}
 	return records, rows.Err()
@@ -411,6 +431,9 @@ func anyInt64(value any) (int64, bool) {
 		return int64(n), true
 	case float64:
 		return int64(n), true
+	case json.Number:
+		parsed, err := n.Int64()
+		return parsed, err == nil
 	case string:
 		parsed, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
 		return parsed, err == nil
@@ -515,6 +538,9 @@ func pendingRefundIdentity(rec *ReconciliationRecord) (int64, int64, string, err
 			return int64(n), true
 		case float64:
 			return int64(n), true
+		case json.Number:
+			parsed, err := n.Int64()
+			return parsed, err == nil
 		case string:
 			v, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
 			return v, err == nil
@@ -685,8 +711,14 @@ func GetManualReviewReconciliationRecords(ctx context.Context, limit int) ([]*Re
 		if err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(desiredBytes, &r.DesiredState)
-		_ = json.Unmarshal(observedBytes, &r.ObservedState)
+		r.DesiredState, err = decodeReconciliationState(desiredBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode reconciliation desired state: %w", err)
+		}
+		r.ObservedState, err = decodeReconciliationState(observedBytes)
+		if err != nil {
+			return nil, fmt.Errorf("decode reconciliation observed state: %w", err)
+		}
 		records = append(records, r)
 	}
 	return records, rows.Err()
@@ -723,8 +755,14 @@ func GetReconciliationRecordByID(ctx context.Context, id int64) (*Reconciliation
 		}
 		return nil, err
 	}
-	_ = json.Unmarshal(desiredBytes, &r.DesiredState)
-	_ = json.Unmarshal(observedBytes, &r.ObservedState)
+	r.DesiredState, err = decodeReconciliationState(desiredBytes)
+	if err != nil {
+		return nil, fmt.Errorf("decode reconciliation desired state: %w", err)
+	}
+	r.ObservedState, err = decodeReconciliationState(observedBytes)
+	if err != nil {
+		return nil, fmt.Errorf("decode reconciliation observed state: %w", err)
+	}
 	return r, nil
 }
 

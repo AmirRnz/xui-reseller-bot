@@ -54,7 +54,7 @@ func HandleWalletFlow(c telebot.Context) error {
 	}
 	rows := append(row, menu.Row(menu.Data("« بازگشت", "menu_main")))
 	menu.Inline(rows...)
-	return maybeEditOrSend(c, fmt.Sprintf("👛 **موجودی کیف پول شما:** %s تومان", persian.FormatMoney(user.WalletBalance)), menu)
+	return maybeEditOrSend(c, fmt.Sprintf("👛 **موجودی کیف پول شما:** %s", persian.FormatMoney(user.WalletBalance)), menu)
 }
 
 func HandleTopupInstructions(c telebot.Context) error {
@@ -503,7 +503,7 @@ func HandleAdminRejectPurchase(c telebot.Context) error {
 		case "claim":
 			actionLabel = "ثبت اشتراک قدیمی"
 		}
-		msg := fmt.Sprintf("❌ درخواست پرداخت مستقیم شما برای **%s** به مبلغ %s تومان توسط ادمین رد شد. لطفا رسید واریزی خود را بررسی کنید یا با پشتیبانی در ارتباط باشید.", actionLabel, persian.FormatMoney(purchaseAmountToman(req)))
+		msg := fmt.Sprintf("❌ درخواست پرداخت مستقیم شما برای **%s** به مبلغ %s توسط ادمین رد شد. لطفا رسید واریزی خود را بررسی کنید یا با پشتیبانی در ارتباط باشید.", actionLabel, persian.FormatMoney(purchaseAmountToman(req)))
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
 	}
 
@@ -534,10 +534,10 @@ func HandleAdminApproveRefund(c telebot.Context) error {
 	menu := &telebot.ReplyMarkup{}
 	if req.CalculatedAmount > 0 {
 		menu.Inline(menu.Row(
-			menu.Data(fmt.Sprintf("تایید مبلغ پیشنهادی %s تومان", persian.FormatMoney(req.CalculatedAmount)), "admin_refund_accept", fmt.Sprintf("%d", reqID)),
+			menu.Data(fmt.Sprintf("تایید مبلغ پیشنهادی %s", persian.FormatMoney(req.CalculatedAmount)), "admin_refund_accept", fmt.Sprintf("%d", reqID)),
 			menu.Data("ویرایش مبلغ", "admin_refund_edit", fmt.Sprintf("%d", reqID)),
 		))
-		return c.Edit(fmt.Sprintf("مبلغ پیشنهادی استرداد #%d: %s تومان\n\nمبلغ را تایید کنید یا ویرایش کنید.", reqID, persian.FormatMoney(req.CalculatedAmount)), menu)
+		return c.Edit(fmt.Sprintf("مبلغ پیشنهادی استرداد #%d: %s\n\nمبلغ را تایید کنید یا ویرایش کنید.", reqID, persian.FormatMoney(req.CalculatedAmount)), menu)
 	}
 	menu.Inline(menu.Row(menu.Data("وارد کردن مبلغ استرداد", "admin_refund_edit", fmt.Sprintf("%d", reqID))))
 	return c.Edit(fmt.Sprintf("درخواست استرداد #%d فاقد مبلغ پیشنهادی است. برای درخواست قدیمی، مبلغ را به تومان وارد کنید.", reqID), menu)
@@ -609,7 +609,7 @@ func ProcessAdminRefundNoteText(c telebot.Context, note string) error {
 	bot.FSM.SetState(admin.TelegramID, "awaiting_admin_refund_confirm", map[string]interface{}{"request_id": reqID, "amount": amount, "audit_note": note})
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(menu.Row(menu.Data("تایید و واریز به کیف پول", "admin_refund_confirm", fmt.Sprintf("%d", reqID))))
-	return c.Send(fmt.Sprintf("تایید نهایی استرداد #%d\nمبلغ: %s تومان\nیادداشت: %s", reqID, persian.FormatMoney(amount), note), menu)
+	return c.Send(fmt.Sprintf("تایید نهایی استرداد #%d\nمبلغ: %s\nیادداشت: %s", reqID, persian.FormatMoney(amount), note), menu)
 }
 
 func HandleAdminRefundConfirm(c telebot.Context) error {
@@ -648,10 +648,10 @@ func completeRefundApproval(c telebot.Context, reqID, amount int64, note string)
 		return c.Send("درخواست استرداد قبلا پردازش شده یا یافت نشد.")
 	}
 	if user, _ := db.GetUserByID(context.Background(), req.UserID); user != nil {
-		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ مبلغ %s تومان بابت لغو سرویس به کیف پول شما اضافه شد.", persian.FormatMoney(amount)))
+		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ مبلغ %s بابت لغو سرویس به کیف پول شما اضافه شد.", persian.FormatMoney(amount)))
 	}
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ درخواست استرداد #%d تایید شد.", reqID)})
-	return c.Edit(fmt.Sprintf("✅ درخواست استرداد #%d با مبلغ %s تومان تایید و به کیف پول واریز شد.", reqID, persian.FormatMoney(amount)))
+	return c.Edit(fmt.Sprintf("✅ درخواست استرداد #%d با مبلغ %s تایید و به کیف پول واریز شد.", reqID, persian.FormatMoney(amount)))
 }
 
 func HandleAdminRejectRefund(c telebot.Context) error {
@@ -736,7 +736,7 @@ func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, 
 		return fmt.Errorf("خطا در ذخیره‌سازی دیتابیس: %w", err)
 	}
 
-	msg := fmt.Sprintf("✅ پرداخت شما تایید و اشتراک **%s** به مدت %d ماه تمدید شد.\nتاریخ انقضای جدید: %s\nمبلغ پرداخت شده: %s تومان.",
+	msg := fmt.Sprintf("✅ پرداخت شما تایید و اشتراک **%s** به مدت %d ماه تمدید شد.\nتاریخ انقضای جدید: %s\nمبلغ پرداخت شده: %s.",
 		sub.DisplayName, req.Months, newExpiryLabel, persian.FormatMoney(purchaseAmountToman(req)))
 	_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
 	return nil
@@ -765,7 +765,7 @@ func upgradeSubscriptionIPFromApprovedRequest(user *db.User, sub *db.Subscriptio
 		return fmt.Errorf("خطا در ذخیره‌سازی دیتابیس: %w", err)
 	}
 
-	msg := fmt.Sprintf("✅ پرداخت شما تایید و سقف کاربر همزمان اشتراک **%s** به %d دستگاه ارتقا یافت.\nهزینه ارتقا پرداخت شده: %s تومان.",
+	msg := fmt.Sprintf("✅ پرداخت شما تایید و سقف کاربر همزمان اشتراک **%s** به %d دستگاه ارتقا یافت.\nهزینه ارتقا پرداخت شده: %s.",
 		sub.DisplayName, req.IPLimit, persian.FormatMoney(purchaseAmountToman(req)))
 	_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
 	return nil

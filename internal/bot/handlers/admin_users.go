@@ -136,7 +136,7 @@ func showAdminViewUser(c telebot.Context, user *db.User) error {
 	text.WriteString(fmt.Sprintf("📝 **نام**: %s %s\n", user.FirstName, user.LastName))
 	text.WriteString(fmt.Sprintf("⚡ **وضعیت حساب**: %s\n", statusText))
 	text.WriteString(fmt.Sprintf("💼 **نام برند نماینده**: %s\n", user.ServiceNameValue()))
-	text.WriteString(fmt.Sprintf("👛 **موجودی کیف پول**: %s تومان\n", persian.FormatMoney(int64(user.WalletBalance))))
+	text.WriteString(fmt.Sprintf("👛 **موجودی کیف پول**: %s\n", persian.FormatMoney(int64(user.WalletBalance))))
 	text.WriteString(fmt.Sprintf("📦 **تعداد اشتراک‌ها**: %d\n", len(subs)))
 
 	menu := &telebot.ReplyMarkup{}
@@ -269,7 +269,7 @@ func ProcessBulkCredit(c telebot.Context, amountStr string) error {
 		return c.Send("خطا در افزایش موجودی همگانی کاربران.")
 	}
 	bot.FSM.ClearState(admin.TelegramID)
-	_ = c.Send(fmt.Sprintf("✅ مبلغ %s تومان با موفقیت به حساب %d کاربر تایید شده افزوده شد.", persian.FormatMoney(amount), count))
+	_ = c.Send(fmt.Sprintf("✅ مبلغ %s با موفقیت به حساب %d کاربر تایید شده افزوده شد.", persian.FormatMoney(amount), count))
 	return HandleAdminUsers(c)
 }
 

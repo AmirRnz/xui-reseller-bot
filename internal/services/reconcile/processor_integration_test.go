@@ -430,6 +430,20 @@ func TestWalletRemoteCreateBeforeLocalInsertIsAdoptedWithoutSecondCreate(t *test
 		Flow: "restart-flow", Group: "restart-group", TgID: f.telegramID,
 		Comment: "Restart plan", InboundIDs: []int{4, 9},
 	}}
+	if !walletRemoteMatches(panel.client, payload) {
+		t.Fatalf("test setup has a non-matching wallet remote client: remote=%#v payload=%#v", panel.client, payload)
+	}
+	persisted, err := db.GetReconciliationRecordByID(ctx, workItem.ID)
+	if err != nil || persisted == nil {
+		t.Fatalf("load durable wallet work item: record=%#v err=%v", persisted, err)
+	}
+	decoded, err := DecodePurchaseProvisioning(persisted.DesiredState, &f.userID, workItem.OperationKey)
+	if err != nil || !walletRemoteMatches(panel.client, decoded) {
+		t.Fatalf("persisted wallet snapshot does not match the remote client: remote=%#v expected_telegram_id=%d decoded=%#v err=%v", panel.client, f.telegramID, decoded, err)
+	}
+	if decoded.TelegramID != f.telegramID {
+		t.Fatalf("durable Telegram ID changed during JSONB round-trip: got %d, want %d", decoded.TelegramID, f.telegramID)
+	}
 	worker := NewProcessor("wallet_after_create_worker", panel)
 	worker.BatchSize = 100
 	if _, err := worker.ProcessOnce(ctx); err != nil {

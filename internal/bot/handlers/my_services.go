@@ -609,7 +609,7 @@ func HandleDeleteSubscription(c telebot.Context) error {
 				)
 				var caption string
 				if refundAmount > 0 {
-					caption = fmt.Sprintf("📥 **درخواست استرداد وجه حذف سرویس #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک حذف شده: `%s`\nمبلغ درخواستی: %s تومان",
+					caption = fmt.Sprintf("📥 **درخواست استرداد وجه حذف سرویس #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک حذف شده: `%s`\nمبلغ درخواستی: %s",
 						req.ID, user.Username, user.TelegramID, sub.ClientEmail, persian.FormatMoney(refundAmount))
 				} else {
 					caption = fmt.Sprintf("📥 **درخواست بررسی دستی استرداد وجه سرویس قدیمی #%d**\n\nکاربر: @%s (%d)\nایمیل اشتراک حذف شده: `%s`\nمبلغ: فاقد فاکتور سیستمی (نیازمند تعیین دستی)",
@@ -691,7 +691,7 @@ func HandleSubscriptionLimitMenu(c telebot.Context) error {
 		}
 		cost := calculateIPUpgradePrice(plan, displayIPLimit, ip, months)
 		rows = append(rows, menu.Row(menu.Data(
-			fmt.Sprintf("%d کاربر همزمان — هزینه: %s تومان", ip, persian.FormatMoney(cost)),
+			fmt.Sprintf("%d کاربر همزمان — هزینه: %s", ip, persian.FormatMoney(cost)),
 			"sub_limit_set", fmt.Sprintf("%d:%d", ip, sub.ID),
 		)))
 	}
@@ -743,7 +743,7 @@ func HandleSubscriptionLimitConfirmPrompt(c telebot.Context) error {
 	)
 
 	return maybeEditOrSend(c, fmt.Sprintf(
-		"🧾 **ارتقای کاربر همزمان سرویس %s**\n\nتعداد کاربر جدید: %d دستگاه همزمان\nتعداد کاربر فعلی: %d دستگاه همزمان\nهزینه ارتقا (تا پایان دوره): **%s تومان**\n\nموجودی کیف پول شما: %s تومان\n\nنحوه پرداخت ارتقا را انتخاب کنید:",
+		"🧾 **ارتقای کاربر همزمان سرویس %s**\n\nتعداد کاربر جدید: %d دستگاه همزمان\nتعداد کاربر فعلی: %d دستگاه همزمان\nهزینه ارتقا (تا پایان دوره): **%s**\n\nموجودی کیف پول شما: %s\n\nنحوه پرداخت ارتقا را انتخاب کنید:",
 		sub.DisplayName, newLimit, displayIPLimit, persian.FormatMoney(cost), persian.FormatMoney(user.WalletBalance),
 	), menu)
 }
@@ -786,7 +786,7 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 		if errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
 			return c.Send("این ارتقا قبلا پردازش شده یا در وضعیت تطبیق قرار دارد.")
 		}
-		return c.Send(fmt.Sprintf("موجودی کیف پول شما کافی نیست. هزینه این ارتقا %s تومان می‌باشد.", persian.FormatMoney(cost)))
+		return c.Send(fmt.Sprintf("موجودی کیف پول شما کافی نیست. هزینه این ارتقا %s می‌باشد.", persian.FormatMoney(cost)))
 	}
 
 	oldLimit := sub.IPLimit
@@ -822,7 +822,7 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 	}
 
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ تعداد کاربر همزمان به %d افزایش یافت.", newLimit)})
-	_ = c.Send(fmt.Sprintf("✅ ارتقا با موفقیت انجام شد. سقف کاربر همزمان به %d کاربر افزایش یافت. هزینه کسر شده: %s تومان.", newLimit, persian.FormatMoney(cost)))
+	_ = c.Send(fmt.Sprintf("✅ ارتقا با موفقیت انجام شد. سقف کاربر همزمان به %d کاربر افزایش یافت. هزینه کسر شده: %s.", newLimit, persian.FormatMoney(cost)))
 	return showSubscriptionDetail(c, user, sub)
 }
 
@@ -885,7 +885,7 @@ func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 
 	var text strings.Builder
 	text.WriteString("💳 **پرداخت مستقیم برای ارتقای تعداد کاربران همزمان**\n\n")
-	text.WriteString(fmt.Sprintf("مبلغ قابل پرداخت: **%s تومان**\n\n", persian.FormatMoney(cost)))
+	text.WriteString(fmt.Sprintf("مبلغ قابل پرداخت: **%s**\n\n", persian.FormatMoney(cost)))
 	if card != "" {
 		text.WriteString(fmt.Sprintf("شماره کارت جهت واریز:\n`%s`\n", card))
 	}
@@ -924,11 +924,11 @@ func HandleSubscriptionExtendMenu(c telebot.Context) error {
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
 		menu.Row(
-			menu.Data(fmt.Sprintf("۱ ماهه — %s تومان", persian.FormatMoney(priceFor(1))), "sub_extend_run", fmt.Sprintf("1:%d", sub.ID)),
-			menu.Data(fmt.Sprintf("۳ ماهه — %s تومان", persian.FormatMoney(priceFor(3))), "sub_extend_run", fmt.Sprintf("3:%d", sub.ID)),
+			menu.Data(fmt.Sprintf("۱ ماهه — %s", persian.FormatMoney(priceFor(1))), "sub_extend_run", fmt.Sprintf("1:%d", sub.ID)),
+			menu.Data(fmt.Sprintf("۳ ماهه — %s", persian.FormatMoney(priceFor(3))), "sub_extend_run", fmt.Sprintf("3:%d", sub.ID)),
 		),
 		menu.Row(
-			menu.Data(fmt.Sprintf("۶ ماهه — %s تومان", persian.FormatMoney(priceFor(6))), "sub_extend_run", fmt.Sprintf("6:%d", sub.ID)),
+			menu.Data(fmt.Sprintf("۶ ماهه — %s", persian.FormatMoney(priceFor(6))), "sub_extend_run", fmt.Sprintf("6:%d", sub.ID)),
 			menu.Data("✏️ مدت دلخواه", "sub_extend_custom", fmt.Sprintf("%d", sub.ID)),
 		),
 		menu.Row(menu.Data("« بازگشت", "view_sub", fmt.Sprintf("%d", sub.ID))),
@@ -1028,7 +1028,7 @@ func showExtendConfirmation(c telebot.Context, user *db.User, subID int, months 
 	)
 
 	return maybeEditOrSend(c, fmt.Sprintf(
-		"🧾 **تمدید سرویس %s**\n\nمدت تمدید: %d ماه\nهزینه تمدید: **%s تومان**\n\nموجودی کیف پول شما: %s تومان\n\nنحوه پرداخت هزینه تمدید را انتخاب کنید:",
+		"🧾 **تمدید سرویس %s**\n\nمدت تمدید: %d ماه\nهزینه تمدید: **%s**\n\nموجودی کیف پول شما: %s\n\nنحوه پرداخت هزینه تمدید را انتخاب کنید:",
 		sub.DisplayName, months, persian.FormatMoney(cost), persian.FormatMoney(user.WalletBalance),
 	), menu)
 }
@@ -1073,7 +1073,7 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		if errors.Is(err, db.ErrWalletOperationAlreadyApplied) {
 			return c.Send("این تمدید قبلا پردازش شده یا در وضعیت تطبیق قرار دارد.")
 		}
-		return c.Send(fmt.Sprintf("موجودی کیف پول شما کافی نیست. هزینه تمدید %s تومان می‌باشد.", persian.FormatMoney(cost)))
+		return c.Send(fmt.Sprintf("موجودی کیف پول شما کافی نیست. هزینه تمدید %s می‌باشد.", persian.FormatMoney(cost)))
 	}
 
 	oldEnd := sub.EndDate
@@ -1140,7 +1140,7 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		return c.Send("تمدید در پنل انجام شد اما ثبت آن در دیتابیس ناموفق بود؛ مبلغ بازگردانده نشد و وضعیت برای تطبیق ثبت شد.")
 	}
 
-	_ = c.Send(fmt.Sprintf("✅ سرویس با موفقیت تمدید شد. انقضای جدید: %s\nمبلغ پرداخت شده: %s تومان.",
+	_ = c.Send(fmt.Sprintf("✅ سرویس با موفقیت تمدید شد. انقضای جدید: %s\nمبلغ پرداخت شده: %s.",
 		newExpiryLabel, persian.FormatMoney(cost)))
 	return showSubscriptionDetail(c, user, sub)
 }
@@ -1210,7 +1210,7 @@ func HandleExtendSubscriptionDirect(c telebot.Context) error {
 
 	var text strings.Builder
 	text.WriteString("💳 **پرداخت مستقیم برای تمدید سرویس**\n\n")
-	text.WriteString(fmt.Sprintf("مبلغ قابل پرداخت: **%s تومان**\n\n", persian.FormatMoney(cost)))
+	text.WriteString(fmt.Sprintf("مبلغ قابل پرداخت: **%s**\n\n", persian.FormatMoney(cost)))
 	if card != "" {
 		text.WriteString(fmt.Sprintf("شماره کارت جهت واریز:\n`%s`\n", card))
 	}

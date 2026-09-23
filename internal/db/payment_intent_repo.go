@@ -258,7 +258,7 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 		INSERT INTO purchase_requests (
 			user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, operation_key, provisioning_snapshot
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULLIF($16, ''), $17::jsonb)
-		ON CONFLICT (operation_key) DO UPDATE SET updated_at = NOW()
+		ON CONFLICT (operation_key) WHERE operation_key IS NOT NULL DO UPDATE SET updated_at = NOW()
 		RETURNING id, created_at, updated_at
 	`, request.UserID, request.Type, request.PlanID, request.SubscriptionID, request.QuoteID, request.PriceToman, request.Price, request.Months, request.IPLimit, request.DataGB, request.CustomName, request.ClientEmail, request.TelegramFileID, request.Status, request.ProvisioningStatus, request.OperationKey, snapshotBytes).
 		Scan(&request.ID, &request.CreatedAt, &request.UpdatedAt)

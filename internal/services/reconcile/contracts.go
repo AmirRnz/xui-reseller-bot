@@ -1,6 +1,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +29,9 @@ func toMap(v any) map[string]any {
 		return map[string]any{}
 	}
 	var res map[string]any
-	if err := json.Unmarshal(b, &res); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(b))
+	decoder.UseNumber()
+	if err := decoder.Decode(&res); err != nil {
 		return map[string]any{}
 	}
 	return res

@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -158,7 +159,7 @@ func HandleAdminReconcileDetail(c telebot.Context) error {
 		sb.WriteString(fmt.Sprintf("▫️ توضیح اقدام: %s\n", r.ManualActionReason))
 	}
 	if r.ManualActionAmount != nil {
-		sb.WriteString(fmt.Sprintf("▫️ مبلغ اقدام: %s تومان\n", persian.FormatMoney(*r.ManualActionAmount)))
+		sb.WriteString(fmt.Sprintf("▫️ مبلغ اقدام: %s\n", persian.FormatMoney(*r.ManualActionAmount)))
 	}
 	if r.ManualActionOperationKey != "" {
 		sb.WriteString(fmt.Sprintf("▫️ کلید مالی: `%s`\n", r.ManualActionOperationKey))
@@ -438,11 +439,11 @@ func formatStateSummary(state map[string]any) string {
 		lines = append(lines, fmt.Sprintf("▫️ ایمیل: `%s`", email))
 	}
 	if amt, ok := coerceAnyInt64(state["amount"]); ok && amt > 0 {
-		lines = append(lines, fmt.Sprintf("▫️ مبلغ: %s تومان", persian.FormatMoney(amt)))
+		lines = append(lines, fmt.Sprintf("▫️ مبلغ: %s", persian.FormatMoney(amt)))
 	} else if amt, ok := coerceAnyInt64(state["price"]); ok && amt > 0 {
-		lines = append(lines, fmt.Sprintf("▫️ مبلغ: %s تومان", persian.FormatMoney(amt)))
+		lines = append(lines, fmt.Sprintf("▫️ مبلغ: %s", persian.FormatMoney(amt)))
 	} else if amt, ok := coerceAnyInt64(state["refund_amount"]); ok && amt > 0 {
-		lines = append(lines, fmt.Sprintf("▫️ مبلغ استرداد: %s تومان", persian.FormatMoney(amt)))
+		lines = append(lines, fmt.Sprintf("▫️ مبلغ استرداد: %s", persian.FormatMoney(amt)))
 	}
 	if months, ok := coerceAnyInt64(state["months"]); ok && months > 0 {
 		lines = append(lines, fmt.Sprintf("▫️ مدت: %d ماه", months))
@@ -487,6 +488,9 @@ func coerceAnyInt64(v any) (int64, bool) {
 		return int64(val), true
 	case float64:
 		return int64(val), true
+	case json.Number:
+		n, err := val.Int64()
+		return n, err == nil
 	case string:
 		n, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64)
 		return n, err == nil

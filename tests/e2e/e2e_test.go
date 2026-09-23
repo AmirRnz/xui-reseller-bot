@@ -19,6 +19,7 @@ import (
 	"xui-reseller-bot/internal/config"
 	"xui-reseller-bot/internal/db"
 	"xui-reseller-bot/internal/scheduler"
+	"xui-reseller-bot/internal/services/reconcile"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -235,15 +236,18 @@ responsesDrained:
 
 // MockXUIServer mocks the X-UI Panel API server.
 type MockXUIServer struct {
-	Server  *httptest.Server
-	Fail    bool
-	Clients map[string]xui.ClientConfig
-	mu      sync.Mutex
+	Server         *httptest.Server
+	Fail           bool
+	Clients        map[string]xui.ClientConfig
+	InboundIDs     map[string][]int
+	AddClientCalls int
+	mu             sync.Mutex
 }
 
 func NewMockXUIServer() *MockXUIServer {
 	m := &MockXUIServer{
-		Clients: make(map[string]xui.ClientConfig),
+		Clients:    make(map[string]xui.ClientConfig),
+		InboundIDs: make(map[string][]int),
 	}
 	m.Server = httptest.NewServer(m)
 	return m
@@ -259,14 +263,20 @@ func (m *MockXUIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasSuffix(r.URL.Path, "/panel/api/server/getPanelUpdateInfo") {
+		w.Write([]byte(`{"success":true,"msg":"","obj":{"currentVersion":"3.8.5","latestVersion":"v3.8.5","updateAvailable":false}}`))
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/panel/api/inbounds/options") {
 		w.Write([]byte(`{"success":true,"msg":"","obj":[{"id":1,"port":443,"protocol":"vless","remark":"Test Inbound","tag":"vless-inbound","tlsFlowCapable":true}]}`))
 		return
 	}
 	if strings.HasSuffix(r.URL.Path, "/panel/api/clients/add") {
+		m.AddClientCalls++
 		var req xui.AddClientRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
 			m.Clients[req.Client.Email] = req.Client
+			m.InboundIDs[req.Client.Email] = append([]int(nil), req.InboundIDs...)
 		}
 		w.Write([]byte(`{"success":true,"msg":"Client added"}`))
 		return
@@ -287,6 +297,8 @@ func (m *MockXUIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				TgID:       client.TgID,
 				Group:      client.Group,
 				Flow:       client.Flow,
+				Comment:    client.Comment,
+				InboundIDs: append([]int(nil), m.InboundIDs[email]...),
 			}
 			objJSON, _ := json.Marshal(info)
 			w.Write([]byte(fmt.Sprintf(`{"success":true,"msg":"","obj":%s}`, string(objJSON))))
@@ -323,6 +335,10 @@ func (m *MockXUIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				delete(m.Clients, email)
 				client.Email = req.Client.Email
 				m.Clients[req.Client.Email] = client
+				if inboundIDs, ok := m.InboundIDs[email]; ok {
+					delete(m.InboundIDs, email)
+					m.InboundIDs[req.Client.Email] = inboundIDs
+				}
 			} else {
 				m.Clients[email] = client
 			}
@@ -356,6 +372,8 @@ func (m *MockXUIServer) Clear() {
 	m.mu.Lock()
 	m.Fail = false
 	m.Clients = make(map[string]xui.ClientConfig)
+	m.InboundIDs = make(map[string][]int)
+	m.AddClientCalls = 0
 	m.mu.Unlock()
 }
 
@@ -502,8 +520,8 @@ func cleanDB(ctx context.Context, t *testing.T) {
 
 	// Seed paid plans
 	_, err = db.Pool.Exec(ctx, `
-		INSERT INTO paid_plans (id, name, inbound_ids, base_price, base_ip_limit, max_ip_limit, price_per_extra_ip, flow, discount_tiers, is_global, enabled)
-		VALUES (1, 'Paid Plan A', '[1]', 1000, 1, 3, 200, '', '[{"months":3,"percent":10}]', true, true)
+		INSERT INTO paid_plans (id, name, inbound_ids, base_price, base_price_toman, base_ip_limit, max_ip_limit, price_per_extra_ip, price_per_extra_ip_toman, flow, discount_tiers, is_global, enabled)
+		VALUES (1, 'Paid Plan A', '[1]', 1000, 1000, 1, 3, 200, 200, '', '[{"months":3,"basis_points":1000}]', true, true)
 	`)
 	if err != nil {
 		t.Fatalf("Failed to seed paid plans: %v", err)
@@ -555,6 +573,7 @@ func setupE2E(t *testing.T) (*TestEnv, func()) {
 	config.Global.Admin.AdminIDs = []int64{96937669}
 	config.Global.XUI.BaseURL = mockXUI.Server.URL
 	config.Global.XUI.URL = mockXUI.Server.URL
+	config.Global.XUI.APIToken = "e2e-test-token"
 	config.Global.XUI.SubscriptionBaseURL = "https://test-sub.com"
 	if testDBURL := os.Getenv("TEST_DATABASE_URL"); testDBURL != "" {
 		config.Global.Database.URL = testDBURL
@@ -579,6 +598,9 @@ func setupE2E(t *testing.T) (*TestEnv, func()) {
 	xuiClient, err := xui.NewClient(&config.Global.XUI)
 	if err != nil {
 		t.Fatalf("Failed to init x-ui client: %v", err)
+	}
+	if _, err := xuiClient.CheckReadiness(ctx); err != nil {
+		t.Fatalf("E2E XUI mock is not ready: %v", err)
 	}
 	cache := xui.NewInboundCache(xuiClient, time.Minute)
 	xuiClient.Cache = cache
@@ -1403,10 +1425,27 @@ func TestE2ESuite(t *testing.T) {
 			}
 		})
 
-		// 40. DB Save error during buy sub (rolled back and refunded)
+		// 40. A remote create is adopted after the local insert recovers
 		t.Run("DBSaveErrorPaidSub", func(t *testing.T) {
 			setupApprovedUser()
-			env.mockXUI.Fail = true
+			if _, err := db.Pool.Exec(env.ctx, `
+				CREATE OR REPLACE FUNCTION e2e_fail_paid_subscription_insert() RETURNS trigger
+				LANGUAGE plpgsql AS $$
+				BEGIN
+					IF NEW.client_email LIKE 'faileddev_%' THEN
+						RAISE EXCEPTION 'injected local subscription insert failure';
+					END IF;
+					RETURN NEW;
+				END $$;
+				CREATE TRIGGER e2e_fail_paid_subscription_insert
+				BEFORE INSERT ON subscriptions
+				FOR EACH ROW EXECUTE FUNCTION e2e_fail_paid_subscription_insert()
+			`); err != nil {
+				t.Fatalf("install local insert failure: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = db.Pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS e2e_fail_paid_subscription_insert ON subscriptions; DROP FUNCTION IF EXISTS e2e_fail_paid_subscription_insert()`)
+			})
 			env.SendCallback(userTGID, userUsername, 999, "\fselect_buy_plan|1")
 			_ = env.ExpectResponse(t, 2*time.Second)
 			env.SendCallback(userTGID, userUsername, 999, "\fbuy_months|1:1")
@@ -1421,14 +1460,46 @@ func TestE2ESuite(t *testing.T) {
 			}
 			env.SendCallback(userTGID, userUsername, 999, confirmData)
 			respFail := env.ExpectResponse(t, 5*time.Second)
-			if !strings.Contains(getStr(respFail, "text"), "خطا") && !strings.Contains(getStr(respFail, "text"), "عودت") {
-				t.Fatalf("Expected panel creation failed / refunded message, got: %+v", respFail)
+			if !strings.Contains(getStr(respFail, "text"), "ادامه می‌یابد") {
+				t.Fatalf("expected durable pending provisioning notice, got: %+v", respFail)
 			}
 
-			// Verify wallet balance is still 2000 (fully refunded)
 			u, _ := db.GetUserByTelegramID(env.ctx, userTGID)
-			if u.WalletBalance != 2000 {
-				t.Fatalf("Expected fully refunded balance, got %d", u.WalletBalance)
+			if u.WalletBalance != 1000 || env.mockXUI.AddClientCalls != 1 || len(env.mockXUI.Clients) != 1 {
+				t.Fatalf("expected one debit and one remote create before local recovery: user=%+v add_calls=%d clients=%d", u, env.mockXUI.AddClientCalls, len(env.mockXUI.Clients))
+			}
+			var email string
+			for candidate := range env.mockXUI.Clients {
+				email = candidate
+			}
+			if !strings.HasPrefix(email, "faileddev_") {
+				t.Fatalf("unexpected remote email %q", email)
+			}
+			if sub, err := db.GetSubscriptionByEmail(env.ctx, email); err != nil || sub != nil {
+				t.Fatalf("local subscription should still be absent before recovery: sub=%+v err=%v", sub, err)
+			}
+			var workID int64
+			if err := db.Pool.QueryRow(env.ctx, `SELECT id FROM reconciliation_records WHERE user_id=$1 AND kind='purchase_provisioning_unknown' ORDER BY id DESC LIMIT 1`, u.ID).Scan(&workID); err != nil {
+				t.Fatalf("read durable provisioning work: %v", err)
+			}
+			if _, err := db.Pool.Exec(env.ctx, `DROP TRIGGER e2e_fail_paid_subscription_insert ON subscriptions; DROP FUNCTION e2e_fail_paid_subscription_insert()`); err != nil {
+				t.Fatalf("remove local insert failure: %v", err)
+			}
+			if _, err := db.Pool.Exec(env.ctx, `UPDATE reconciliation_records SET next_attempt_at=NOW() WHERE id=$1`, workID); err != nil {
+				t.Fatalf("make durable work retryable: %v", err)
+			}
+			worker := reconcile.NewProcessor("e2e-local-insert-recovery", bot.XUIClient)
+			if _, err := worker.ProcessOnce(env.ctx); err != nil {
+				t.Fatalf("recover after local insert failure: %v", err)
+			}
+			sub, err := db.GetSubscriptionByEmail(env.ctx, email)
+			work, workErr := db.GetReconciliationRecordByID(env.ctx, workID)
+			if err != nil || workErr != nil || sub == nil || work == nil || work.Status != db.ReconciliationStatusResolvedVerified || env.mockXUI.AddClientCalls != 1 {
+				t.Fatalf("expected exact remote client adoption without duplicate create: sub=%+v work=%+v add_calls=%d errs=(%v,%v)", sub, work, env.mockXUI.AddClientCalls, err, workErr)
+			}
+			u, _ = db.GetUserByTelegramID(env.ctx, userTGID)
+			if u.WalletBalance != 1000 {
+				t.Fatalf("recovery must not debit or refund a second time: balance=%d", u.WalletBalance)
 			}
 		})
 
@@ -2036,47 +2107,52 @@ func TestE2ESuite(t *testing.T) {
 			}
 			env.SendCallback(userTGID, userUsername, 999, confirmData)
 			respFail := env.ExpectResponse(t, 5*time.Second)
-			if !strings.Contains(getStr(respFail, "text"), "خطا") && !strings.Contains(getStr(respFail, "text"), "عودت") {
-				t.Fatalf("Expected panel outage failure message, got: %+v", respFail)
+			if !strings.Contains(getStr(respFail, "text"), "ادامه می‌یابد") {
+				t.Fatalf("expected durable pending provisioning notice, got: %+v", respFail)
 			}
 
-			// Verify refund occurred
 			u, _ := db.GetUserByTelegramID(env.ctx, userTGID)
-			if u.WalletBalance != 2000 {
-				t.Fatalf("Balance should have been refunded, got %d", u.WalletBalance)
+			if u.WalletBalance != 1000 || len(env.mockXUI.Clients) != 0 || env.mockXUI.AddClientCalls != 0 {
+				t.Fatalf("unready XUI must leave one debited, durable order without a mutation: user=%+v clients=%d add_calls=%d", u, len(env.mockXUI.Clients), env.mockXUI.AddClientCalls)
+			}
+			var workID int64
+			if err := db.Pool.QueryRow(env.ctx, `SELECT id FROM reconciliation_records WHERE user_id=$1 AND kind='purchase_provisioning_unknown' ORDER BY id DESC LIMIT 1`, u.ID).Scan(&workID); err != nil {
+				t.Fatalf("read durable pending work: %v", err)
+			}
+			work, err := db.GetReconciliationRecordByID(env.ctx, workID)
+			if err != nil || work == nil || (work.Status != db.ReconciliationStatusPending && work.Status != "retryable") {
+				t.Fatalf("expected retryable durable provisioning work: work=%+v err=%v", work, err)
+			}
+			payload, err := reconcile.DecodePurchaseProvisioning(work.DesiredState, work.UserID, work.OperationKey)
+			if err != nil || payload.ExpectedUUID == "" || payload.ExpectedSubID == "" {
+				t.Fatalf("provisioning identity was not durable before panel recovery: payload=%+v err=%v", payload, err)
 			}
 
-			// Panel comes back online
 			env.mockXUI.Fail = false
+			if _, err := db.Pool.Exec(env.ctx, "UPDATE reconciliation_records SET next_attempt_at=NOW() WHERE id=$1", workID); err != nil {
+				t.Fatalf("make durable work retryable after panel recovery: %v", err)
+			}
+			worker := reconcile.NewProcessor("e2e-panel-restart", bot.XUIClient)
+			if _, err := worker.ProcessOnce(env.ctx); err != nil {
+				t.Fatalf("restart worker could not complete pending purchase: %v", err)
+			}
+			if _, err := worker.ProcessOnce(env.ctx); err != nil {
+				t.Fatalf("duplicate worker pass failed: %v", err)
+			}
 
-			// User purchases again (succeeds)
-			env.SendCallback(userTGID, userUsername, 999, "\fselect_buy_plan|1")
-			_ = env.ExpectResponse(t, 2*time.Second)
-			env.SendCallback(userTGID, userUsername, 999, "\fbuy_months|1:1")
-			_ = env.ExpectResponse(t, 2*time.Second)
-			env.SendCallback(userTGID, userUsername, 999, "\fbuy_ip_run|1:1:1")
-			_ = env.ExpectResponse(t, 2*time.Second)
-			env.SendMessage(userTGID, userUsername, "succeeds")
-			respInvoice2 := env.ExpectResponse(t, 2*time.Second)
-			confirmData2 := extractCallbackData(respInvoice2, "\fbuy_confirm")
-			if confirmData2 == "" {
-				t.Fatalf("Expected buy_confirm in invoice: %+v", respInvoice2)
+			sub, err := db.GetSubscriptionByEmail(env.ctx, payload.Email)
+			work, workErr := db.GetReconciliationRecordByID(env.ctx, workID)
+			remote, remoteExists := env.mockXUI.Clients[payload.Email]
+			var debitCount int
+			_ = db.Pool.QueryRow(env.ctx, "SELECT COUNT(*) FROM transactions WHERE user_id=$1 AND type='debit' AND status='completed'", u.ID).Scan(&debitCount)
+			if err != nil || workErr != nil || sub == nil || work == nil || work.Status != db.ReconciliationStatusResolvedVerified ||
+				!remoteExists || remote.ID != payload.ExpectedUUID || remote.SubID != payload.ExpectedSubID ||
+				env.mockXUI.AddClientCalls != 1 || debitCount != 1 {
+				t.Fatalf("recovered order must keep its identity and economic outcome: sub=%+v work=%+v remote=%+v add_calls=%d debits=%d errs=(%v,%v)", sub, work, remote, env.mockXUI.AddClientCalls, debitCount, err, workErr)
 			}
-			env.SendCallback(userTGID, userUsername, 999, confirmData2)
-			respSuccess := env.ExpectResponse(t, 2*time.Second)
-			if !strings.Contains(getStr(respSuccess, "caption"), "test-sub.com") {
-				t.Fatalf("Expected QR code with sub link, got: %+v", respSuccess)
-			}
-			_ = env.ExpectResponse(t, 2*time.Second) // details text
-			_ = env.ExpectResponse(t, 2*time.Second) // main menu
-
-			// Verify in DB & Panel
-			subs, _ := db.GetManageableSubscriptionsByUserID(env.ctx, u.ID)
-			if len(subs) == 0 {
-				t.Fatalf("Subscription should be in DB")
-			}
-			if len(env.mockXUI.Clients) == 0 {
-				t.Fatalf("Client should be on panel")
+			u, _ = db.GetUserByTelegramID(env.ctx, userTGID)
+			if u.WalletBalance != 1000 {
+				t.Fatalf("worker restart must not debit or refund again: balance=%d", u.WalletBalance)
 			}
 		})
 
@@ -2256,9 +2332,14 @@ func TestE2ESuite(t *testing.T) {
 		}
 
 		env.SendCallback(adminTGID, adminUsername, 999, confirm)
-		_ = env.ExpectResponse(t, 2*time.Second) // user wallet-credit notice
-		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "با مبلغ ۴۳٬۲۱۰ تومان") && !strings.Contains(getStr(resp, "text"), "با مبلغ 43,210 تومان") {
-			t.Fatalf("expected admin approval result with the entered amount: %+v", resp)
+		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "۴۳٬۲۱۰ تومان") && !strings.Contains(getStr(resp, "text"), "43,210 تومان") {
+			t.Fatalf("expected user wallet-credit notice with the entered amount: %+v", resp)
+		}
+		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "تایید شد") {
+			t.Fatalf("expected admin callback approval result: %+v", resp)
+		}
+		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "43,210 تومان") && !strings.Contains(getStr(resp, "text"), "۴۳٬۲۱۰ تومان") {
+			t.Fatalf("expected admin approval message with the entered amount: %+v", resp)
 		}
 		env.SendCallback(adminTGID, adminUsername, 999, confirm)
 		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "منقضی") {
