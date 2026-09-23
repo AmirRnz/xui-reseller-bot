@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,6 +186,95 @@ INSERT INTO bot_users (telegram_id, username, wallet_balance) VALUES (818181818,
 	if planPrice != 0 {
 		t.Fatalf("migration guessed an integer price before operator approval: %d", planPrice)
 	}
+	var legacyUserID int64
+	if err := Pool.QueryRow(ctx, `SELECT id FROM bot_users WHERE telegram_id=818181818`).Scan(&legacyUserID); err != nil {
+		t.Fatalf("find relational money fixture user: %v", err)
+	}
+	if _, err := Pool.Exec(ctx, `UPDATE bot_users SET wallet_balance=750000 WHERE id=$1`, legacyUserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Pool.Exec(ctx, `INSERT INTO transactions (user_id, amount, type) VALUES ($1, 5000, 'credit')`, legacyUserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Pool.Exec(ctx, `INSERT INTO topup_requests (user_id, amount) VALUES ($1, 2500)`, legacyUserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Pool.Exec(ctx, `INSERT INTO refund_requests (user_id, calculated_amount, approved_amount) VALUES ($1, 9000, 5000)`, legacyUserID); err != nil {
+		t.Fatal(err)
+	}
+	preflightCases := []struct {
+		name, field string
+		invalid     func() error
+		correct     func() error
+	}{
+		{"paid plan price", "base_price", func() error {
+			_, e := Pool.Exec(ctx, `UPDATE paid_plans SET base_price=1000005 WHERE name='Legacy Rial plan'`)
+			return e
+		}, func() error {
+			_, e := Pool.Exec(ctx, `UPDATE paid_plans SET base_price=1000000 WHERE name='Legacy Rial plan'`)
+			return e
+		}},
+		{"wallet balance", "wallet_balance", func() error {
+			_, e := Pool.Exec(ctx, `UPDATE bot_users SET wallet_balance=750005 WHERE id=$1`, legacyUserID)
+			return e
+		}, func() error {
+			_, e := Pool.Exec(ctx, `UPDATE bot_users SET wallet_balance=750000 WHERE id=$1`, legacyUserID)
+			return e
+		}},
+		{"transaction amount", "amount", func() error {
+			_, e := Pool.Exec(ctx, `UPDATE transactions SET amount=5005 WHERE user_id=$1`, legacyUserID)
+			return e
+		}, func() error {
+			_, e := Pool.Exec(ctx, `UPDATE transactions SET amount=5000 WHERE user_id=$1`, legacyUserID)
+			return e
+		}},
+		{"topup amount", "amount", func() error {
+			_, e := Pool.Exec(ctx, `UPDATE topup_requests SET amount=2505 WHERE user_id=$1`, legacyUserID)
+			return e
+		}, func() error {
+			_, e := Pool.Exec(ctx, `UPDATE topup_requests SET amount=2500 WHERE user_id=$1`, legacyUserID)
+			return e
+		}},
+		{"refund calculated amount", "calculated_amount", func() error {
+			_, e := Pool.Exec(ctx, `UPDATE refund_requests SET calculated_amount=9005 WHERE user_id=$1`, legacyUserID)
+			return e
+		}, func() error {
+			_, e := Pool.Exec(ctx, `UPDATE refund_requests SET calculated_amount=9000 WHERE user_id=$1`, legacyUserID)
+			return e
+		}},
+		{"refund approved amount", "approved_amount", func() error {
+			_, e := Pool.Exec(ctx, `UPDATE refund_requests SET approved_amount=5005 WHERE user_id=$1`, legacyUserID)
+			return e
+		}, func() error {
+			_, e := Pool.Exec(ctx, `UPDATE refund_requests SET approved_amount=5000 WHERE user_id=$1`, legacyUserID)
+			return e
+		}},
+	}
+	for _, tc := range preflightCases {
+		if err := tc.invalid(); err != nil {
+			t.Fatalf("set invalid %s: %v", tc.name, err)
+		}
+		if _, err := NormalizeLegacyMoney(ctx, "rial", "test-operator", state.ConfirmationToken); err == nil || !strings.Contains(err.Error(), tc.field) || !strings.Contains(err.Error(), "non-divisible") {
+			t.Fatalf("Rial preflight did not identify %s, got %v", tc.name, err)
+		}
+		state, err = GetMoneyNormalizationState(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var unchangedPriceToman, unchangedWallet int64
+		if err := Pool.QueryRow(ctx, `SELECT base_price_toman FROM paid_plans WHERE name='Legacy Rial plan'`).Scan(&unchangedPriceToman); err != nil {
+			t.Fatal(err)
+		}
+		if err := Pool.QueryRow(ctx, `SELECT wallet_balance FROM bot_users WHERE id=$1`, legacyUserID).Scan(&unchangedWallet); err != nil {
+			t.Fatal(err)
+		}
+		if state.NormalizedAt != nil || unchangedPriceToman != 0 || (tc.name != "wallet balance" && unchangedWallet != 750000) || (tc.name == "wallet balance" && unchangedWallet != 750005) {
+			t.Fatalf("failed %s preflight partially applied conversion: normalized_at=%v plan_toman=%d wallet=%d", tc.name, state.NormalizedAt, unchangedPriceToman, unchangedWallet)
+		}
+		if err := tc.correct(); err != nil {
+			t.Fatalf("correct %s fixture for retry: %v", tc.name, err)
+		}
+	}
 	if _, err := NormalizeLegacyMoney(ctx, "rial", "test-operator", state.ConfirmationToken); err != nil {
 		t.Fatalf("apply explicit Rial decision: %v", err)
 	}
@@ -196,6 +286,22 @@ INSERT INTO bot_users (telegram_id, username, wallet_balance) VALUES (818181818,
 	}
 	if planPrice != 100000 {
 		t.Fatalf("operator-selected Rial conversion produced %d, want 100000", planPrice)
+	}
+	var walletToman, transactionToman, topupToman, refundCalculatedToman, refundApprovedToman int64
+	if err := Pool.QueryRow(ctx, `SELECT wallet_balance FROM bot_users WHERE id=$1`, legacyUserID).Scan(&walletToman); err != nil {
+		t.Fatal(err)
+	}
+	if err := Pool.QueryRow(ctx, `SELECT amount FROM transactions WHERE user_id=$1`, legacyUserID).Scan(&transactionToman); err != nil {
+		t.Fatal(err)
+	}
+	if err := Pool.QueryRow(ctx, `SELECT amount FROM topup_requests WHERE user_id=$1`, legacyUserID).Scan(&topupToman); err != nil {
+		t.Fatal(err)
+	}
+	if err := Pool.QueryRow(ctx, `SELECT calculated_amount, approved_amount FROM refund_requests WHERE user_id=$1`, legacyUserID).Scan(&refundCalculatedToman, &refundApprovedToman); err != nil {
+		t.Fatal(err)
+	}
+	if walletToman != 75000 || transactionToman != 500 || topupToman != 250 || refundCalculatedToman != 900 || refundApprovedToman != 500 {
+		t.Fatalf("corrected relational values did not normalize exactly: wallet=%d tx=%d topup=%d refund=(%d,%d)", walletToman, transactionToman, topupToman, refundCalculatedToman, refundApprovedToman)
 	}
 	var topupMinimum, currencyName string
 	if err := Pool.QueryRow(ctx, `SELECT value FROM bot_settings WHERE key = 'min_topup_amount'`).Scan(&topupMinimum); err != nil {

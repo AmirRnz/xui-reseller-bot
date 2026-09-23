@@ -30,6 +30,7 @@ func RegisterWallet(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.M
 	b.Handle("\fadmin_reject_topup", HandleAdminRejectTopup, auth, admin)
 	b.Handle("\fadmin_approve_purchase", HandleAdminApprovePurchase, auth, admin)
 	b.Handle("\fadmin_reject_purchase", HandleAdminRejectPurchase, auth, admin)
+	b.Handle("\fadmin_manual_payment_reviews", HandleAdminManualPaymentReviews, auth, admin)
 	b.Handle("\fadmin_refund_accept", HandleAdminRefundAcceptSuggested, auth, admin)
 	b.Handle("\fadmin_refund_edit", HandleAdminRefundEditAmount, auth, admin)
 	b.Handle("\fadmin_refund_confirm", HandleAdminRefundConfirm, auth, admin)
@@ -187,6 +188,10 @@ func HandleReceiptPhoto(c telebot.Context) error {
 	bot.FSM.ClearState(user.TelegramID)
 
 	if res.IsDuplicate {
+		if res.NeedsManualReview {
+			_ = c.Send("رسید شما قبلاً به‌صورت پایدار ذخیره شده است. فعال‌سازی همچنان متوقف و درخواست در صف بررسی دستی مدیریت قرار دارد.")
+			return showMainMenu(c, user)
+		}
 		_ = c.Send("رسید پرداخت شما قبلاً دریافت شده است و در انتظار تایید ادمین می‌باشد.")
 		return showMainMenu(c, user)
 	}
@@ -204,10 +209,14 @@ func HandleReceiptPhoto(c telebot.Context) error {
 	if walletAdminCfg != nil {
 		for _, adminID := range walletAdminCfg.AdminIDs {
 			menu := &telebot.ReplyMarkup{}
-			menu.Inline(menu.Row(
-				menu.Data("تایید خرید", "admin_approve_purchase", fmt.Sprintf("%d", req.ID)),
-				menu.Data("رد خرید", "admin_reject_purchase", fmt.Sprintf("%d", req.ID)),
-			))
+			if req.Status == db.PurchaseStatusNeedsManualReview || res.NeedsManualReview {
+				menu.Inline(menu.Row(menu.Data("رد درخواست", "admin_reject_purchase", fmt.Sprintf("%d", req.ID))))
+			} else {
+				menu.Inline(menu.Row(
+					menu.Data("تایید خرید", "admin_approve_purchase", fmt.Sprintf("%d", req.ID)),
+					menu.Data("رد خرید", "admin_reject_purchase", fmt.Sprintf("%d", req.ID)),
+				))
+			}
 
 			var details string
 			switch pType {
@@ -229,12 +238,19 @@ func HandleReceiptPhoto(c telebot.Context) error {
 
 			caption := fmt.Sprintf("📥 درخواست خرید مستقیم #%d\nکاربر: @%s (%d)\nنوع: %s\nمبلغ: %s\n\nجزئیات:\n%s",
 				req.ID, user.Username, user.TelegramID, pType, persian.FormatMoney(priceToman), details)
+			if req.Status == db.PurchaseStatusNeedsManualReview || res.NeedsManualReview {
+				caption += "\n\n⚠️ رسید ثبت شد، اما شرایط تجاری تغییر کرده است؛ فعال‌سازی مسدود و بررسی دستی لازم است."
+			}
 
 			_, _ = bot.Bot.Send(&telebot.User{ID: adminID}, &telebot.Photo{File: telebot.File{FileID: fileID}, Caption: caption}, menu)
 		}
 	}
 
-	_ = c.Send("رسید پرداخت شما دریافت شد. پس از بررسی ادمین، سرویس شما فعال شده و مشخصات آن برایتان ارسال خواهد شد.")
+	if req.Status == db.PurchaseStatusNeedsManualReview || res.NeedsManualReview {
+		_ = c.Send("رسید پرداخت شما به‌صورت پایدار ذخیره شد. شرایط طرح یا سرویس تغییر کرده است و فعال‌سازی متوقف مانده؛ درخواست برای بررسی دستی به مدیریت ارسال شد.")
+	} else {
+		_ = c.Send("رسید پرداخت شما دریافت شد. پس از بررسی ادمین، سرویس شما فعال شده و مشخصات آن برایتان ارسال خواهد شد.")
+	}
 	return showMainMenu(c, user)
 }
 
@@ -349,6 +365,9 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 
 	req, err := db.GetPurchaseRequestByID(context.Background(), reqID)
 	if err != nil || req == nil || req.Status != "pending" {
+		if req != nil && req.Status == db.PurchaseStatusNeedsManualReview {
+			return c.Send("این رسید به دلیل تغییر شرایط طرح یا سرویس نیازمند بررسی دستی است و قابل تایید خودکار نیست.")
+		}
 		return c.Send("درخواست خرید یافت نشد یا قبلا پردازش شده است.")
 	}
 
@@ -403,14 +422,9 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 			payload.ExpiryTimeMilli = *sub.ExpireTime
 		}
 		if payload.ActionType == "extend" {
-			if payload.ExpiryTimeMilli < 0 {
-				payload.ExpiryTimeMilli -= int64(req.Months) * 30 * 24 * 3600 * 1000
-			} else {
-				end := sub.EndDate
-				if end.Before(nowUTC()) {
-					end = nowUTC()
-				}
-				payload.ExpiryTimeMilli = end.Add(time.Duration(req.Months) * 30 * 24 * time.Hour).UnixMilli()
+			payload.ExpiryTimeMilli, err = db.CalculateExtendedExpiry(sub.ExpireTime, req.Months, nowUTC())
+			if err != nil {
+				return c.Send("تاریخ انقضای فعلی برای تمدید معتبر نیست؛ درخواست تایید نشد.")
 			}
 		} else if payload.ActionType == "upgrade_ip" {
 			desiredLimit := req.IPLimit
@@ -420,6 +434,9 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 	workItem := reconcile.NewDirectPaymentProvisioningRecord(payload)
 	approved, err := db.ApprovePurchaseRequest(context.Background(), reqID, c.Sender().ID, workItem)
 	if err != nil || approved == nil {
+		if errors.Is(err, db.ErrSubscriptionMutationStale) || errors.Is(err, db.ErrSubscriptionMutationInvalid) || errors.Is(err, db.ErrSubscriptionMutationInProgress) {
+			return c.Send("شرایط طرح یا سرویس پس از ثبت رسید تغییر کرده است؛ درخواست به بررسی دستی منتقل شد و فعال‌سازی انجام نشد.")
+		}
 		return c.Send("خطا در ثبت تایید و کار فعال‌سازی درخواست خرید.")
 	}
 	if bot.XUIClient != nil {
@@ -509,6 +526,31 @@ func HandleAdminRejectPurchase(c telebot.Context) error {
 
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("❌ درخواست خرید #%d رد شد.", reqID)})
 	return c.Edit(fmt.Sprintf("❌ درخواست خرید #%d رد شد.", reqID))
+}
+
+func HandleAdminManualPaymentReviews(c telebot.Context) error {
+	if !isConfiguredAdmin(c.Sender().ID) {
+		return c.Send("شما دسترسی لازم برای این کار را ندارید.")
+	}
+	reqs, err := db.GetPurchaseRequestsNeedingManualReview(context.Background())
+	if err != nil {
+		return c.Send("خطا در دریافت رسیدهای نیازمند بررسی دستی.")
+	}
+	if len(reqs) == 0 {
+		return c.Send("رسیدی برای بررسی دستی وجود ندارد.")
+	}
+	for _, req := range reqs {
+		user, _ := db.GetUserByID(context.Background(), req.UserID)
+		username := "unknown"
+		if user != nil {
+			username = user.Username
+		}
+		caption := fmt.Sprintf("⚠️ رسید پرداخت نیازمند بررسی دستی #%d\nکاربر: @%s (%d)\nنوع: %s\nمبلغ: %s\nایمیل: %s\nشناسه intent: %v\nدلیل: شرایط تجاری پس از صدور پرداخت تغییر کرده است؛ فعال‌سازی خودکار مسدود است.", req.ID, username, req.UserID, req.Type, persian.FormatMoney(purchaseAmountToman(req)), req.ClientEmail, req.PaymentIntentID)
+		menu := &telebot.ReplyMarkup{}
+		menu.Inline(menu.Row(menu.Data("رد درخواست", "admin_reject_purchase", fmt.Sprintf("%d", req.ID))))
+		_, _ = bot.Bot.Send(c.Sender(), &telebot.Photo{File: telebot.File{FileID: req.TelegramFileID}, Caption: caption}, menu)
+	}
+	return nil
 }
 
 func purchaseAmountToman(req *db.PurchaseRequest) int64 {

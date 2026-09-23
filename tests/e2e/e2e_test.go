@@ -1082,7 +1082,7 @@ func TestE2ESuite(t *testing.T) {
 			resetState()
 			_, _ = db.Pool.Exec(env.ctx, `INSERT INTO bot_users (telegram_id, username, first_name, last_name, service_name, status, language, wallet_balance) VALUES ($1, $2, 'Test', 'User', 'myservice', 'approved', 'en', 20000)`, userTGID, userUsername)
 			// Seed a subscription
-			_, _ = db.Pool.Exec(env.ctx, `INSERT INTO subscriptions (id, user_id, plan_id, plan_type, client_email, sub_id, display_name, ip_limit, expire_time, is_active) VALUES (1, 1, 1, 'paid', 'myservice_deviceA', 'sub12345', 'Device A', 1, 1900000000000, true)`)
+			_, _ = db.Pool.Exec(env.ctx, `INSERT INTO subscriptions (id, user_id, plan_id, plan_type, client_email, client_uuid, sub_id, display_name, ip_limit, expire_time, is_active) VALUES (1, 1, 1, 'paid', 'myservice_deviceA', 'client-uuid-1', 'sub12345', 'Device A', 1, 1900000000000, true)`)
 			// Seed client on Mock XUI
 			env.mockXUI.Clients["myservice_deviceA"] = xui.ClientConfig{
 				ID:         "client-uuid-1",
@@ -1108,12 +1108,16 @@ func TestE2ESuite(t *testing.T) {
 		t.Run("ToggleServiceState", func(t *testing.T) {
 			setupApprovedUserWithSub()
 			env.SendCallback(userTGID, userUsername, 999, "\fview_sub|1")
-			_ = env.ExpectResponse(t, 2*time.Second) // details page
+			details := env.ExpectResponse(t, 2*time.Second)
 
 			// Disable
-			env.SendCallback(userTGID, userUsername, 999, "\fsub_toggle|1")
+			toggleData := extractCallbackData(details, "\fsub_toggle")
+			if toggleData == "" {
+				t.Fatalf("expected tokenized toggle callback in service details: %+v", details)
+			}
+			env.SendCallback(userTGID, userUsername, 999, toggleData)
 			_ = env.ExpectResponse(t, 2*time.Second) // callback response
-			_ = env.ExpectResponse(t, 2*time.Second) // details page
+			details = env.ExpectResponse(t, 2*time.Second)
 
 			// Check DB and XUI
 			sub, _ := db.GetSubscriptionByID(env.ctx, 1)
@@ -1125,7 +1129,11 @@ func TestE2ESuite(t *testing.T) {
 			}
 
 			// Enable back
-			env.SendCallback(userTGID, userUsername, 999, "\fsub_toggle|1")
+			toggleData = extractCallbackData(details, "\fsub_toggle")
+			if toggleData == "" {
+				t.Fatalf("expected tokenized enable callback in service details: %+v", details)
+			}
+			env.SendCallback(userTGID, userUsername, 999, toggleData)
 			_ = env.ExpectResponse(t, 2*time.Second) // callback response
 			_ = env.ExpectResponse(t, 2*time.Second) // details page
 
@@ -1180,6 +1188,83 @@ func TestE2ESuite(t *testing.T) {
 			u, _ := db.GetUserByTelegramID(env.ctx, userTGID)
 			if u.WalletBalance >= 20000 {
 				t.Fatalf("Balance should have been deducted for IP upgrade")
+			}
+		})
+
+		t.Run("DirectIPUpgradeReceiptApproval", func(t *testing.T) {
+			setupApprovedUserWithSub()
+			const clientUUID = "direct-ip-e2e-uuid"
+			if _, err := db.Pool.Exec(env.ctx, `UPDATE subscriptions SET client_uuid=$1 WHERE id=1`, clientUUID); err != nil {
+				t.Fatal(err)
+			}
+			remote := env.mockXUI.Clients["myservice_deviceA"]
+			remote.ID = clientUUID
+			remote.SubID = "sub12345"
+			remote.LimitIP = 1
+			remote.Enable = true
+			env.mockXUI.Clients["myservice_deviceA"] = remote
+
+			env.SendCallback(userTGID, userUsername, 999, "\fview_sub|1")
+			_ = env.ExpectResponse(t, 2*time.Second)
+			env.SendCallback(userTGID, userUsername, 999, "\fsub_limit|1")
+			_ = env.ExpectResponse(t, 2*time.Second)
+			env.SendCallback(userTGID, userUsername, 999, "\fsub_limit_set|2:1")
+			paymentMethods := env.ExpectResponse(t, 2*time.Second)
+			directCallback := extractCallbackData(paymentMethods, "\fsub_limit_direct")
+			if directCallback == "" {
+				t.Fatalf("expected direct-payment IP upgrade option: %+v", paymentMethods)
+			}
+			env.SendCallback(userTGID, userUsername, 999, directCallback)
+			instructions := env.ExpectResponse(t, 2*time.Second)
+			if !strings.Contains(getStr(instructions, "text"), "پرداخت مستقیم") {
+				t.Fatalf("expected direct-payment instructions, got: %+v", instructions)
+			}
+
+			var intentID int64
+			var intentPlanID *int64
+			if err := db.Pool.QueryRow(env.ctx, `SELECT id, plan_id FROM payment_intents WHERE action_type='upgrade_ip' AND user_id=1`).Scan(&intentID, &intentPlanID); err != nil || intentPlanID == nil || *intentPlanID != 1 {
+				t.Fatalf("direct IP intent must persist its current paid plan: id=%d plan=%v err=%v", intentID, intentPlanID, err)
+			}
+
+			env.SendPhoto(userTGID, userUsername, "direct-ip-receipt-file")
+			adminReceipt := env.ExpectResponse(t, 2*time.Second)
+			if getStr(adminReceipt, "photo") == "" || !strings.Contains(getStr(adminReceipt, "caption"), "درخواست خرید مستقیم") {
+				t.Fatalf("admin was not shown the customer's direct-payment receipt: %+v", adminReceipt)
+			}
+			_ = env.ExpectResponse(t, 2*time.Second) // user receipt acknowledgment
+			_ = env.ExpectResponse(t, 2*time.Second) // user main menu
+
+			var purchaseID int64
+			var purchasePlanID *int64
+			var receiptFileID, purchaseStatus string
+			var linkedIntentID *int64
+			if err := db.Pool.QueryRow(env.ctx, `SELECT id, plan_id, telegram_file_id, status, payment_intent_id FROM purchase_requests WHERE payment_intent_id=$1`, intentID).
+				Scan(&purchaseID, &purchasePlanID, &receiptFileID, &purchaseStatus, &linkedIntentID); err != nil || purchasePlanID == nil || *purchasePlanID != 1 ||
+				receiptFileID != "direct-ip-receipt-file" || purchaseStatus != "pending" || linkedIntentID == nil || *linkedIntentID != intentID {
+				t.Fatalf("durable receipt request lost the quoted plan or payment evidence: id=%d plan=%v file=%q status=%q intent=%v err=%v", purchaseID, purchasePlanID, receiptFileID, purchaseStatus, linkedIntentID, err)
+			}
+
+			env.SendCallback(adminTGID, adminUsername, 999, fmt.Sprintf("\fadmin_approve_purchase|%d", purchaseID))
+			_ = env.ExpectResponse(t, 2*time.Second) // callback acknowledgment
+			_ = env.ExpectResponse(t, 2*time.Second) // admin approval result
+
+			finalRequest, err := db.GetPurchaseRequestByID(env.ctx, purchaseID)
+			if err != nil || finalRequest == nil || finalRequest.ProvisioningStatus != db.PurchaseProvisioningSucceeded {
+				t.Fatalf("valid direct IP request did not complete approval and provisioning: request=%+v err=%v", finalRequest, err)
+			}
+			finalSub, err := db.GetSubscriptionByID(env.ctx, 1)
+			if err != nil || finalSub == nil || finalSub.Status != db.SubscriptionStatusActive || !finalSub.IsActive || finalSub.IPLimit != 2 || finalSub.DesiredIPLimit != nil {
+				t.Fatalf("direct IP approval did not converge desired/current DB state: sub=%+v err=%v", finalSub, err)
+			}
+			var auditCount, resolvedWorkCount int
+			if err := db.Pool.QueryRow(env.ctx, `SELECT count(*) FROM transactions WHERE reference_type='purchase_request' AND reference_id=$1`, purchaseID).Scan(&auditCount); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Pool.QueryRow(env.ctx, `SELECT count(*) FROM reconciliation_records WHERE purchase_request_id=$1 AND status=$2`, purchaseID, db.ReconciliationStatusResolvedVerified).Scan(&resolvedWorkCount); err != nil {
+				t.Fatal(err)
+			}
+			if auditCount != 1 || resolvedWorkCount != 1 || env.mockXUI.Clients["myservice_deviceA"].LimitIP != 2 {
+				t.Fatalf("approval effects are not exactly-once/verified: audit=%d work=%d remote=%+v", auditCount, resolvedWorkCount, env.mockXUI.Clients["myservice_deviceA"])
 			}
 		})
 
@@ -1774,8 +1859,12 @@ func TestE2ESuite(t *testing.T) {
 
 			// View and toggle paid subscription (ID 2)
 			env.SendCallback(userTGID, userUsername, 999, "\fview_sub|2")
-			_ = env.ExpectResponse(t, 2*time.Second)
-			env.SendCallback(userTGID, userUsername, 999, "\fsub_toggle|2")
+			details := env.ExpectResponse(t, 2*time.Second)
+			toggleData := extractCallbackData(details, "\fsub_toggle")
+			if toggleData == "" {
+				t.Fatalf("expected tokenized toggle callback for purchased service: %+v", details)
+			}
+			env.SendCallback(userTGID, userUsername, 999, toggleData)
 			_ = env.ExpectResponse(t, 2*time.Second) // callback answer
 			_ = env.ExpectResponse(t, 2*time.Second) // details page
 		})

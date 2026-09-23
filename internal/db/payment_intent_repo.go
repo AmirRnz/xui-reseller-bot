@@ -233,7 +233,7 @@ func sameIntIDs(left, right []int) bool {
 }
 
 func validateAndSnapshotDirectSubscriptionIntent(ctx context.Context, tx pgx.Tx, intent *PaymentIntent) error {
-	if intent.SubscriptionID == nil || *intent.SubscriptionID <= 0 || intent.AmountToman <= 0 {
+	if intent.SubscriptionID == nil || *intent.SubscriptionID <= 0 || intent.AmountToman <= 0 || intent.PlanID == nil || *intent.PlanID <= 0 {
 		return ErrSubscriptionMutationInvalid
 	}
 	if (intent.ActionType == "extend" && (intent.Months < 1 || intent.Months > 120)) ||
@@ -259,9 +259,26 @@ func validateAndSnapshotDirectSubscriptionIntent(ctx context.Context, tx pgx.Tx,
 	if err != nil {
 		return fmt.Errorf("failed to lock direct-payment subscription: %w", err)
 	}
-	if ownerID != intent.UserID || email != intent.ClientEmail || planType != PlanTypePaid || planID == nil ||
-		status != SubscriptionStatusActive || !active || desiredIP != nil || desiredExpiry != nil || desiredActive != nil {
+	if ownerID != intent.UserID || email != intent.ClientEmail || planType != PlanTypePaid || planID == nil || *planID != *intent.PlanID ||
+		desiredIP != nil || desiredExpiry != nil || desiredActive != nil {
 		return ErrSubscriptionMutationStale
+	}
+	if intent.ActionType == "extend" {
+		if !IsExtensionEligibleState(status, active, expireTime, time.Now().UTC()) {
+			return ErrSubscriptionMutationStale
+		}
+	} else if status != SubscriptionStatusActive || !active {
+		return ErrSubscriptionMutationStale
+	}
+	excludePurchaseRequestID := int64(0)
+	if intent.ID > 0 {
+		lookupErr := tx.QueryRow(ctx, `SELECT id FROM purchase_requests WHERE payment_intent_id = $1`, intent.ID).Scan(&excludePurchaseRequestID)
+		if lookupErr != nil && !errors.Is(lookupErr, pgx.ErrNoRows) {
+			return fmt.Errorf("find receipt reservation for payment intent: %w", lookupErr)
+		}
+	}
+	if err := ensureNoUnresolvedDirectMutationTx(ctx, tx, *intent.SubscriptionID, intent.ID, excludePurchaseRequestID); err != nil {
+		return err
 	}
 	var enabled bool
 	var maxIP int
@@ -270,7 +287,7 @@ func validateAndSnapshotDirectSubscriptionIntent(ctx context.Context, tx pgx.Tx,
 		Scan(&enabled, &maxIP, &planUpdatedAt); err != nil {
 		return fmt.Errorf("failed to lock direct-payment plan: %w", err)
 	}
-	if !enabled || (intent.PlanID != nil && *intent.PlanID != *planID) {
+	if !enabled || *intent.PlanID != *planID {
 		return ErrSubscriptionMutationStale
 	}
 	expectedSubUpdatedAt, subTimeOK := snapshotTime(intent.ProvisioningSnapshot, "expected_subscription_updated_at")
@@ -303,6 +320,36 @@ func validateAndSnapshotDirectSubscriptionIntent(ctx context.Context, tx pgx.Tx,
 	return nil
 }
 
+// ensureNoUnresolvedDirectMutationTx serializes direct commercial mutations
+// through the subscription row lock acquired by the caller. Durable payment
+// and purchase rows reserve a service across all PostgreSQL-backed processes.
+func ensureNoUnresolvedDirectMutationTx(ctx context.Context, tx pgx.Tx, subscriptionID, excludeIntentID, excludePurchaseRequestID int64) error {
+	var exists bool
+	err := tx.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM payment_intents pi
+			WHERE pi.subscription_id = $1
+			  AND pi.action_type IN ('extend', 'upgrade_ip')
+			  AND (pi.status = 'awaiting_receipt' OR (pi.status = 'receipt_submitted' AND NOT EXISTS (SELECT 1 FROM purchase_requests linked WHERE linked.payment_intent_id = pi.id)))
+			  AND ($2 = 0 OR pi.id <> $2)
+			UNION ALL
+			SELECT 1 FROM purchase_requests pr
+			WHERE pr.subscription_id = $1
+			  AND pr.type IN ('extend', 'upgrade_ip')
+			  AND pr.status IN ('pending', 'needs_manual_review', 'approved')
+			  AND (pr.status <> 'approved' OR pr.provisioning_status <> 'succeeded')
+			  AND ($3 = 0 OR pr.id <> $3)
+		)
+	`, subscriptionID, excludeIntentID, excludePurchaseRequestID).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("check unresolved direct subscription mutation: %w", err)
+	}
+	if exists {
+		return ErrSubscriptionMutationInProgress
+	}
+	return nil
+}
+
 func snapshotTime(snapshot map[string]any, key string) (time.Time, bool) {
 	value, ok := snapshot[key].(string)
 	if !ok || strings.TrimSpace(value) == "" {
@@ -332,14 +379,18 @@ func snapshotInt64Value(value any) (int64, bool) {
 }
 
 type ReceiptSubmissionResult struct {
-	PurchaseRequest *PurchaseRequest
-	TopupRequest    *TopupRequest
-	IsDuplicate     bool
+	PurchaseRequest   *PurchaseRequest
+	TopupRequest      *TopupRequest
+	IsDuplicate       bool
+	NeedsManualReview bool
 }
 
 func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID int64, fileID string, reqDetails *PurchaseRequest) (*ReceiptSubmissionResult, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
+	if strings.TrimSpace(fileID) == "" {
+		return nil, errors.New("receipt file ID is required")
+	}
 
 	tx, err := Pool.Begin(ctx)
 	if err != nil {
@@ -380,16 +431,6 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 			return nil, fmt.Errorf("invalid durable provisioning snapshot: %w", err)
 		}
 	}
-	if intent.Status == IntentStatusAwaitingReceipt && intent.ActionType == "buy" {
-		if err := validateDirectBuyIntentTx(ctx, tx, &intent); err != nil {
-			return nil, err
-		}
-	} else if intent.Status == IntentStatusAwaitingReceipt && (intent.ActionType == "extend" || intent.ActionType == "upgrade_ip") {
-		if err := validateAndSnapshotDirectSubscriptionIntent(ctx, tx, &intent); err != nil {
-			return nil, err
-		}
-	}
-
 	isTopup := intent.ActionType == "topup"
 	opKey := fmt.Sprintf("direct_purchase_intent:%s", intent.IntentToken)
 	if isTopup {
@@ -412,13 +453,13 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 		} else {
 			var pr PurchaseRequest
 			err := tx.QueryRow(ctx, `
-				SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at, provisioning_snapshot
+				SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at, provisioning_snapshot, payment_intent_id, receipt_submitted_at, review_reason
 				FROM purchase_requests
 				WHERE operation_key = $1
-			`, opKey).Scan(&pr.ID, &pr.UserID, &pr.Type, &pr.PlanID, &pr.SubscriptionID, &pr.QuoteID, &pr.PriceToman, &pr.Price, &pr.Months, &pr.IPLimit, &pr.DataGB, &pr.CustomName, &pr.ClientEmail, &pr.TelegramFileID, &pr.Status, &pr.ProvisioningStatus, &pr.OperationKey, &pr.AdminID, &pr.CreatedAt, &pr.UpdatedAt, &pr.ProvisioningSnapshot)
+			`, opKey).Scan(&pr.ID, &pr.UserID, &pr.Type, &pr.PlanID, &pr.SubscriptionID, &pr.QuoteID, &pr.PriceToman, &pr.Price, &pr.Months, &pr.IPLimit, &pr.DataGB, &pr.CustomName, &pr.ClientEmail, &pr.TelegramFileID, &pr.Status, &pr.ProvisioningStatus, &pr.OperationKey, &pr.AdminID, &pr.CreatedAt, &pr.UpdatedAt, &pr.ProvisioningSnapshot, &pr.PaymentIntentID, &pr.ReceiptSubmittedAt, &pr.ReviewReason)
 			if err == nil {
 				_ = tx.Commit(ctx)
-				return &ReceiptSubmissionResult{PurchaseRequest: &pr, IsDuplicate: true}, nil
+				return &ReceiptSubmissionResult{PurchaseRequest: &pr, IsDuplicate: true, NeedsManualReview: pr.Status == PurchaseStatusNeedsManualReview}, nil
 			}
 		}
 	}
@@ -475,17 +516,18 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 		Status:               "pending",
 		ProvisioningStatus:   PurchaseProvisioningPending,
 		OperationKey:         opKey,
+		PaymentIntentID:      &intent.ID,
 		ProvisioningSnapshot: intent.ProvisioningSnapshot,
 	}
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO purchase_requests (
-			user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, operation_key, provisioning_snapshot
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULLIF($16, ''), $17::jsonb)
+			user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, operation_key, payment_intent_id, receipt_submitted_at, review_reason, provisioning_snapshot
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULLIF($16, ''), $17, NOW(), '', $18::jsonb)
 		ON CONFLICT (operation_key) WHERE operation_key IS NOT NULL DO UPDATE SET updated_at = NOW()
-		RETURNING id, created_at, updated_at
-	`, request.UserID, request.Type, request.PlanID, request.SubscriptionID, request.QuoteID, request.PriceToman, request.Price, request.Months, request.IPLimit, request.DataGB, request.CustomName, request.ClientEmail, request.TelegramFileID, request.Status, request.ProvisioningStatus, request.OperationKey, snapshotBytes).
-		Scan(&request.ID, &request.CreatedAt, &request.UpdatedAt)
+		RETURNING id, created_at, updated_at, payment_intent_id, receipt_submitted_at
+	`, request.UserID, request.Type, request.PlanID, request.SubscriptionID, request.QuoteID, request.PriceToman, request.Price, request.Months, request.IPLimit, request.DataGB, request.CustomName, request.ClientEmail, request.TelegramFileID, request.Status, request.ProvisioningStatus, request.OperationKey, intent.ID, snapshotBytes).
+		Scan(&request.ID, &request.CreatedAt, &request.UpdatedAt, &request.PaymentIntentID, &request.ReceiptSubmittedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create purchase request: %w", err)
 	}
@@ -498,7 +540,67 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
+	needsReview, reviewReason, validationErr := validateSubmittedPurchaseReceipt(ctx, &intent, request.ID)
+	if needsReview {
+		request.Status = PurchaseStatusNeedsManualReview
+		request.ReviewReason = reviewReason
+		if validationErr != nil {
+			request.ReviewReason = "receipt_revalidation_unavailable"
+		}
+		return &ReceiptSubmissionResult{PurchaseRequest: request, IsDuplicate: false, NeedsManualReview: true}, nil
+	}
 	return &ReceiptSubmissionResult{PurchaseRequest: request, IsDuplicate: false}, nil
+}
+
+// Receipt evidence is committed before commercial revalidation. A stale or
+// temporarily unavailable plan/service check can block fulfillment, but cannot
+// roll back the authenticated user's receipt file ID or quoted intent.
+func validateSubmittedPurchaseReceipt(ctx context.Context, intent *PaymentIntent, requestID int64) (bool, string, error) {
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		return true, "receipt_revalidation_unavailable", err
+	}
+	defer tx.Rollback(ctx)
+	var requestStatus string
+	if err := tx.QueryRow(ctx, "SELECT status FROM purchase_requests WHERE id = $1 FOR UPDATE", requestID).Scan(&requestStatus); err != nil {
+		return true, "receipt_revalidation_unavailable", err
+	}
+	if requestStatus != "pending" {
+		return requestStatus == PurchaseStatusNeedsManualReview, "", nil
+	}
+	var validationErr error
+	switch intent.ActionType {
+	case "buy":
+		validationErr = validateDirectBuyIntentTx(ctx, tx, intent)
+	case "extend", "upgrade_ip":
+		validationErr = validateAndSnapshotDirectSubscriptionIntent(ctx, tx, intent)
+	default:
+		return false, "", nil
+	}
+	if validationErr == nil {
+		return false, "", nil
+	}
+	reason := directPurchaseReviewReason(validationErr)
+	if _, err := tx.Exec(ctx, "UPDATE purchase_requests SET status = $1, review_reason = $2, updated_at = NOW() WHERE id = $3 AND status = 'pending'", PurchaseStatusNeedsManualReview, reason, requestID); err != nil {
+		return true, "receipt_revalidation_unavailable", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return true, "receipt_revalidation_unavailable", err
+	}
+	return true, reason, validationErr
+}
+
+func directPurchaseReviewReason(err error) string {
+	switch {
+	case errors.Is(err, ErrSubscriptionMutationStale):
+		return "commercial_state_changed_after_quote"
+	case errors.Is(err, ErrSubscriptionMutationInProgress):
+		return "another_subscription_mutation_is_unresolved"
+	case errors.Is(err, ErrSubscriptionMutationInvalid):
+		return "quoted_terms_are_no_longer_eligible"
+	default:
+		return "receipt_revalidation_failed"
+	}
 }
 
 func canonicalPurchaseAction(action string) string {

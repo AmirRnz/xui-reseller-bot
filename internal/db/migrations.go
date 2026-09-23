@@ -379,6 +379,20 @@ BEGIN
 END $$;
 `,
 	},
+	{
+		Version: 16,
+		Name:    "durable_receipt_review_and_intent_link",
+		SQL: `
+ALTER TABLE purchase_requests
+    ADD COLUMN IF NOT EXISTS payment_intent_id BIGINT,
+    ADD COLUMN IF NOT EXISTS receipt_submitted_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS review_reason TEXT NOT NULL DEFAULT '';
+
+CREATE UNIQUE INDEX IF NOT EXISTS purchase_requests_payment_intent_id_uq
+    ON purchase_requests (payment_intent_id)
+    WHERE payment_intent_id IS NOT NULL;
+`,
+	},
 }
 
 func runMigrations(ctx context.Context) (retErr error) {

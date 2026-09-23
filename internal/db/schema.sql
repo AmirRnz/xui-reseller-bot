@@ -274,6 +274,9 @@ CREATE TABLE IF NOT EXISTS purchase_requests (
     status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'approved', 'rejected'
     provisioning_status TEXT NOT NULL DEFAULT 'pending',
     operation_key TEXT,
+    payment_intent_id BIGINT,
+    receipt_submitted_at TIMESTAMPTZ,
+    review_reason TEXT NOT NULL DEFAULT '',
     admin_id BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

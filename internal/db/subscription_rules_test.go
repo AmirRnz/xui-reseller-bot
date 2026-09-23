@@ -91,7 +91,7 @@ func TestDirectPaymentIntentRevalidatesIPUpgradeAgainstLockedState(t *testing.T)
 
 	makeIntent := func(token string, target int, updatedAt time.Time) *PaymentIntent {
 		subID64 := int64(subID)
-		return &PaymentIntent{UserID: userID, IntentToken: token, ActionType: "upgrade_ip", SubscriptionID: &subID64,
+		return &PaymentIntent{UserID: userID, IntentToken: token, ActionType: "upgrade_ip", PlanID: &planID, SubscriptionID: &subID64,
 			AmountToman: 1000, Months: 1, IPLimit: target, ClientEmail: fmt.Sprintf("direct_rules_%d@example.test", tgID),
 			ProvisioningSnapshot: map[string]any{
 				"expected_ip_limit": 2, "expected_expire_time_milli": expiry, "expected_is_active": true,
@@ -105,6 +105,9 @@ func TestDirectPaymentIntentRevalidatesIPUpgradeAgainstLockedState(t *testing.T)
 	}
 	if valid.ProvisioningSnapshot["expected_plan_id"] == nil {
 		t.Fatalf("locked plan identity was not saved: %#v", valid.ProvisioningSnapshot)
+	}
+	if err := CancelPaymentIntent(ctx, valid.ID, userID, "regression_validation_test"); err != nil {
+		t.Fatalf("cancel test intent before creating another validation case: %v", err)
 	}
 	if _, err := CreatePaymentIntent(ctx, makeIntent(fmt.Sprintf("direct_over_max_%d", tgID), 5, subUpdatedAt)); !errors.Is(err, ErrSubscriptionMutationInvalid) {
 		t.Fatalf("over-limit callback should fail business validation, got %v", err)

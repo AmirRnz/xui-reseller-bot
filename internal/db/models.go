@@ -5,6 +5,40 @@ import (
 	"time"
 )
 
+// IsExtensionEligibleState preserves legacy renewals for active and manually
+// disabled paid services, and allows expired services to restart from now.
+// Cancelled, deleted, and reconciliation-conflicted rows remain ineligible.
+func IsExtensionEligibleState(status string, active bool, expireTime *int64, now time.Time) bool {
+	if status == SubscriptionStatusActive && active {
+		return true
+	}
+	if active || expireTime == nil || *expireTime <= 0 {
+		return false
+	}
+	if status == SubscriptionStatusDisabled {
+		return true
+	}
+	return status == SubscriptionStatusExpired && *expireTime <= now.UTC().UnixMilli()
+}
+
+// CalculateExtendedExpiry uses the current paid-service rule: months are fixed
+// 30-day periods; an unstarted negative expiry keeps its first-use countdown,
+// and an already expired positive expiry resumes from now.
+func CalculateExtendedExpiry(expireTime *int64, months int, now time.Time) (int64, error) {
+	if expireTime == nil || *expireTime == 0 || months < 1 || months > 120 {
+		return 0, ErrSubscriptionMutationInvalid
+	}
+	monthMillis := int64(months) * 30 * 24 * 60 * 60 * 1000
+	if *expireTime < 0 {
+		return *expireTime - monthMillis, nil
+	}
+	base := *expireTime
+	if nowMillis := now.UTC().UnixMilli(); base < nowMillis {
+		base = nowMillis
+	}
+	return base + monthMillis, nil
+}
+
 const (
 	UserStatusPending             = "pending"
 	UserStatusApprovedNamePending = "approved_name_pending"
@@ -24,10 +58,11 @@ const (
 	SubscriptionStatusCancelRequested = "cancellation_requested"
 	SubscriptionStatusDeprovisioning  = "deprovisioning"
 
-	PurchaseProvisioningPending   = "pending"
-	PurchaseProvisioningSucceeded = "succeeded"
-	PurchaseProvisioningRetryable = "retryable"
-	PurchaseProvisioningFailed    = "failed"
+	PurchaseProvisioningPending     = "pending"
+	PurchaseProvisioningSucceeded   = "succeeded"
+	PurchaseProvisioningFailed      = "failed"
+	PurchaseProvisioningRetryable   = "retryable"
+	PurchaseStatusNeedsManualReview = "needs_manual_review"
 )
 
 type User struct {
@@ -231,6 +266,9 @@ type PurchaseRequest struct {
 	Status               string         `json:"status"` // 'pending', 'approved', 'rejected'
 	ProvisioningStatus   string         `json:"provisioning_status"`
 	OperationKey         string         `json:"operation_key"`
+	PaymentIntentID      *int64         `json:"payment_intent_id,omitempty"`
+	ReceiptSubmittedAt   *time.Time     `json:"receipt_submitted_at,omitempty"`
+	ReviewReason         string         `json:"review_reason,omitempty"`
 	ProvisioningSnapshot map[string]any `json:"provisioning_snapshot,omitempty"`
 	AdminID              *int64         `json:"admin_id"`
 	CreatedAt            time.Time      `json:"created_at"`

@@ -15,6 +15,7 @@ import (
 	"xui-reseller-bot/internal/config"
 	"xui-reseller-bot/internal/db"
 	"xui-reseller-bot/internal/services/pricing"
+	"xui-reseller-bot/internal/services/reconcile"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -325,7 +326,7 @@ func showSubscriptionDetail(c telebot.Context, user *db.User, sub *db.Subscripti
 		toggleText = "🟢 فعال کردن"
 	}
 	rows = append(rows, menu.Row(
-		menu.Data(toggleText, "sub_toggle", fmt.Sprintf("%d", sub.ID)),
+		menu.Data(toggleText, "sub_toggle", fmt.Sprintf("%d:%s", sub.ID, newOperationToken())),
 		menu.Data("🗑 حذف سرویس", "sub_delete_confirm", fmt.Sprintf("%d", sub.ID)),
 	))
 	rows = append(rows,
@@ -371,42 +372,60 @@ func HandleGetLink(c telebot.Context) error {
 // ─── Toggle ───────────────────────────────────────────────────────────────────
 
 func HandleToggleSubscription(c telebot.Context) error {
-	sub, user, ok := loadOwnedSubscription(c)
-	if !ok {
-		return nil
+	parts := strings.Split(callbackPayload(c), ":")
+	if len(parts) != 2 || strings.TrimSpace(parts[1]) == "" {
+		return c.Send("این دکمه تغییر وضعیت قدیمی است؛ لطفا منوی سرویس را دوباره باز کنید.")
 	}
-	sub.IsActive = !sub.IsActive
-	if !sub.IsActive {
-		sub.Status = db.SubscriptionStatusDisabled
-	} else {
-		if sub.ExpireTime != nil && *sub.ExpireTime > 0 && *sub.ExpireTime <= time.Now().UnixMilli() {
-			return c.Send("این سرویس منقضی شده است؛ برای فعال‌سازی دوباره آن را تمدید کنید.")
-		}
-		sub.Status = db.SubscriptionStatusActive
+	subID, err := parseInt64(parts[0])
+	if err != nil || subID <= 0 {
+		return c.Send("اشتراک نامعتبر است.")
 	}
-	if err := updateXUIFromSubscription(sub); err != nil {
-		if xui.IsUnknownOutcome(err) {
-			desiredActive := sub.IsActive
-			if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &sub.IPLimit, sub.ExpireTime, &desiredActive, "toggle has unknown 3x-ui outcome"); recErr != nil {
-				log.Printf("[CRITICAL] failed to mark toggle reconciliation for subscription %d: %v", sub.ID, recErr)
-			}
-		}
-		return c.Send("خطا در اعمال تغییرات در پنل. لطفا مجددا تلاش کنید.")
+	user := userFromContext(c)
+	if user == nil {
+		return c.Send("کاربر یافت نشد.")
 	}
-	if err := db.UpdateSubscription(context.Background(), sub); err != nil {
-		desiredActive := sub.IsActive
-		if recErr := db.MarkSubscriptionReconciliationRequired(context.Background(), sub.ID, &sub.IPLimit, sub.ExpireTime, &desiredActive, "3x-ui toggle succeeded but database update failed"); recErr != nil {
-			log.Printf("[CRITICAL] failed to mark DB-after-remote toggle reconciliation for subscription %d: %v", sub.ID, recErr)
+	sub, err := db.GetSubscriptionByID(context.Background(), int(subID))
+	if err != nil || sub == nil || sub.UserID != user.ID {
+		return c.Send("اشتراک یافت نشد.")
+	}
+	desiredActive := !sub.IsActive
+	opKey := fmt.Sprintf("subscription_toggle:%d:%s", sub.ID, strings.TrimSpace(parts[1]))
+	duplicate, err := db.QueueSubscriptionToggle(context.Background(), sub.ID, user.ID, desiredActive, sub.UpdatedAt, opKey)
+	if err != nil {
+		switch {
+		case errors.Is(err, db.ErrSubscriptionMutationInProgress):
+			return c.Send("تغییر قبلی این سرویس هنوز در حال بررسی است؛ پس از تکمیل آن دوباره تلاش کنید.")
+		case errors.Is(err, db.ErrSubscriptionMutationInvalid):
+			return c.Send("سرویس منقضی یا در وضعیت نامناسب است؛ ابتدا آن را تمدید کنید یا با پشتیبانی تماس بگیرید.")
+		case errors.Is(err, db.ErrSubscriptionMutationStale):
+			return c.Send("وضعیت سرویس تغییر کرده است؛ منو را دوباره باز کنید.")
+		default:
+			log.Printf("[ERROR] failed to queue toggle for subscription %d: %v", sub.ID, err)
+			return c.Send("ثبت امن تغییر وضعیت ناموفق بود؛ لطفا کمی بعد دوباره تلاش کنید.")
 		}
-		return c.Send("خطا در ذخیره‌سازی وضعیت.")
+	}
+	if duplicate {
+		return c.Send("این درخواست قبلا ثبت شده است؛ بررسی وضعیت پنل ادامه دارد.")
 	}
 
-	state := "غیرفعال"
-	if sub.IsActive {
-		state = "فعال"
+	if bot.XUIClient != nil {
+		worker := reconcile.NewProcessor("subscription_toggle", bot.XUIClient)
+		if _, err := worker.ProcessOnce(context.Background()); err != nil {
+			log.Printf("[ERROR] toggle reconciliation pass failed for subscription %d: %v", sub.ID, err)
+		}
 	}
-	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("سرویس شما %s شد.", state)})
-	return showSubscriptionDetail(c, user, sub)
+	updated, err := db.GetSubscriptionByID(context.Background(), sub.ID)
+	if err == nil && updated != nil && updated.IsActive == desiredActive && updated.DesiredIsActive == nil &&
+		((desiredActive && updated.Status == db.SubscriptionStatusActive) || (!desiredActive && updated.Status == db.SubscriptionStatusDisabled)) {
+		state := "غیرفعال"
+		if desiredActive {
+			state = "فعال"
+		}
+		_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("سرویس شما %s شد.", state)})
+		return showSubscriptionDetail(c, user, updated)
+	}
+	_ = c.Respond(&telebot.CallbackResponse{Text: "درخواست تغییر وضعیت برای بررسی پنل ثبت شد."})
+	return c.Send("درخواست تغییر وضعیت ذخیره شد؛ پس از تایید وضعیت پنل اعمال می‌شود.")
 }
 
 // ─── Rename ───────────────────────────────────────────────────────────────────
@@ -712,7 +731,9 @@ func HandleSubscriptionLimitSetWallet(c telebot.Context) error {
 		case errors.Is(err, db.ErrWalletOperationConflict):
 			log.Printf("[CRITICAL] wallet operation key collision while upgrading subscription %d for user %d: %v", sub.ID, user.ID, err)
 			return c.Send("شناسه مالی با عملیات دیگری برخورد کرده است؛ برای جلوگیری از برداشت تکراری، این درخواست متوقف شد و نیازمند بررسی پشتیبانی است.")
-		case errors.Is(err, db.ErrSubscriptionMutationStale), errors.Is(err, db.ErrSubscriptionMutationInProgress), errors.Is(err, db.ErrSubscriptionMutationInvalid):
+		case errors.Is(err, db.ErrSubscriptionMutationInProgress):
+			return c.Send("پرداخت یا تغییر قبلی این سرویس هنوز در حال بررسی یا همگام‌سازی است. موجودی کسر نشد؛ لطفاً تا پایان همان درخواست صبر کنید.")
+		case errors.Is(err, db.ErrSubscriptionMutationStale), errors.Is(err, db.ErrSubscriptionMutationInvalid):
 			return c.Send("وضعیت سرویس یا طرح تغییر کرده است؛ موجودی کسر نشد. لطفا منو را دوباره باز کنید.")
 		default:
 			log.Printf("[ERROR] failed to queue wallet IP upgrade for subscription %d: %v", sub.ID, err)
@@ -763,6 +784,7 @@ func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 
 	callbackToken := newOperationToken()
 	subID64 := int64(sub.ID)
+	planID64 := int64(plan.ID)
 	expectedExpiry := int64(0)
 	if sub.ExpireTime != nil {
 		expectedExpiry = *sub.ExpireTime
@@ -785,6 +807,7 @@ func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 		IntentToken:          callbackToken,
 		ActionType:           "upgrade_ip",
 		SubscriptionID:       &subID64,
+		PlanID:               &planID64,
 		AmountToman:          cost,
 		Months:               months,
 		IPLimit:              newLimit,
@@ -794,7 +817,7 @@ func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 	}
 	if _, err := db.CreatePaymentIntent(context.Background(), intent); err != nil {
 		log.Printf("[INTENT] Failed to create payment intent for user %d IP upgrade: %v", user.ID, err)
-		return paymentIntentCreateFailure(c, user, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.")
+		return paymentIntentCreateFailureForError(c, user, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.", err)
 	}
 	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", fsmData)
 
@@ -824,6 +847,9 @@ func HandleSubscriptionExtendMenu(c telebot.Context) error {
 	}
 	if sub.PlanType != db.PlanTypePaid {
 		return c.Send("تمدید فقط برای سرویس‌های خریداری شده امکان‌پذیر است.")
+	}
+	if !db.IsExtensionEligibleState(sub.Status, sub.IsActive, sub.ExpireTime, nowUTC()) {
+		return c.Send("وضعیت سرویس برای تمدید مناسب نیست؛ سرویس‌های لغو شده یا در حال تغییر قابل تمدید نیستند.")
 	}
 	plan, err := paidPlanForSub(sub)
 	if err != nil || plan == nil {
@@ -919,6 +945,9 @@ func showExtendConfirmation(c telebot.Context, user *db.User, subID int, months 
 	if err != nil || sub == nil || sub.UserID != user.ID {
 		return c.Send("اشتراک یافت نشد.")
 	}
+	if !db.IsExtensionEligibleState(sub.Status, sub.IsActive, sub.ExpireTime, nowUTC()) {
+		return c.Send("وضعیت سرویس برای تمدید مناسب نیست؛ سرویس‌های لغو شده یا در حال تغییر قابل تمدید نیستند.")
+	}
 	if sub.PlanType != db.PlanTypePaid {
 		return c.Send("تمدید فقط برای سرویس‌های خریداری شده امکان‌پذیر است.")
 	}
@@ -983,19 +1012,16 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		return c.Send("هزینه تمدید نامعتبر است.")
 	}
 	now := nowUTC()
-	var newExpiryMilli int64
+	newExpiryMilli, err := db.CalculateExtendedExpiry(sub.ExpireTime, months, now)
+	if err != nil {
+		return c.Send("تاریخ انقضای فعلی برای تمدید معتبر نیست؛ درخواست ثبت نشد.")
+	}
 	var newExpiryLabel string
-	if sub.ExpireTime != nil && *sub.ExpireTime < 0 {
-		newDuration := -(*sub.ExpireTime) + int64(months)*30*24*3600*1000
-		newExpiryMilli = -newDuration
+	if newExpiryMilli < 0 {
+		newDuration := -newExpiryMilli
 		newExpiryLabel = fmt.Sprintf("شروع پس از اولین اتصال (مدت زمان %d روز)", newDuration/(24*3600*1000))
 	} else {
-		endDate := sub.EndDate
-		if endDate.Before(now) {
-			endDate = now
-		}
-		endDate = endDate.Add(time.Duration(months) * 30 * 24 * time.Hour)
-		newExpiryMilli = endDate.UnixMilli()
+		endDate := time.UnixMilli(newExpiryMilli).UTC()
 		newExpiryLabel = endDate.Format("2006-01-02")
 	}
 	desiredActive := true
@@ -1016,7 +1042,9 @@ func HandleExtendSubscriptionWallet(c telebot.Context) error {
 		case errors.Is(err, db.ErrWalletOperationConflict):
 			log.Printf("[CRITICAL] wallet operation key collision while extending subscription %d for user %d: %v", sub.ID, user.ID, err)
 			return c.Send("شناسه مالی با عملیات دیگری برخورد کرده است؛ برای جلوگیری از برداشت تکراری، این درخواست متوقف شد و نیازمند بررسی پشتیبانی است.")
-		case errors.Is(err, db.ErrSubscriptionMutationStale), errors.Is(err, db.ErrSubscriptionMutationInProgress), errors.Is(err, db.ErrSubscriptionMutationInvalid):
+		case errors.Is(err, db.ErrSubscriptionMutationInProgress):
+			return c.Send("پرداخت یا تغییر قبلی این سرویس هنوز در حال بررسی یا همگام‌سازی است. موجودی کسر نشد؛ لطفاً تا پایان همان درخواست صبر کنید.")
+		case errors.Is(err, db.ErrSubscriptionMutationStale), errors.Is(err, db.ErrSubscriptionMutationInvalid):
 			return c.Send("وضعیت سرویس یا طرح تغییر کرده است؛ موجودی کسر نشد. لطفا فرآیند تمدید را دوباره آغاز کنید.")
 		default:
 			log.Printf("[ERROR] failed to queue wallet extension for subscription %d: %v", sub.ID, err)
@@ -1049,7 +1077,7 @@ func HandleExtendSubscriptionDirect(c telebot.Context) error {
 	if err != nil || sub == nil || sub.UserID != user.ID || sub.ID != int(subID) {
 		return c.Send("اشتراک یافت نشد.")
 	}
-	if sub.Status != db.SubscriptionStatusActive || !sub.IsActive || sub.PlanType != db.PlanTypePaid {
+	if sub.PlanType != db.PlanTypePaid || !db.IsExtensionEligibleState(sub.Status, sub.IsActive, sub.ExpireTime, nowUTC()) {
 		return c.Send("وضعیت سرویس برای تمدید مناسب نیست؛ لطفا منو را دوباره باز کنید.")
 	}
 	plan, err := paidPlanForSub(sub)
@@ -1104,7 +1132,7 @@ func HandleExtendSubscriptionDirect(c telebot.Context) error {
 	}
 	if _, err := db.CreatePaymentIntent(context.Background(), extendIntent); err != nil {
 		log.Printf("[INTENT] Failed to create payment intent for user %d extend: %v", user.ID, err)
-		return paymentIntentCreateFailure(c, user, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.")
+		return paymentIntentCreateFailureForError(c, user, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.", err)
 	}
 	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", extendData)
 

@@ -96,6 +96,20 @@ func NormalizeLegacyMoney(ctx context.Context, unit, operator, confirmationToken
 	if _, err := tx.Exec(ctx, `LOCK TABLE paid_plans, bot_users, transactions, topup_requests, bulk_credit_operations, purchase_quotes, purchase_requests, payment_intents, reconciliation_records, bot_settings IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 		return nil, fmt.Errorf("lock monetary data for normalization: %w", err)
 	}
+	if unit == "rial" {
+		var hasRefundRequests bool
+		if err := tx.QueryRow(ctx, `SELECT to_regclass('refund_requests') IS NOT NULL`).Scan(&hasRefundRequests); err != nil {
+			return nil, fmt.Errorf("check refund request table: %w", err)
+		}
+		if hasRefundRequests {
+			if _, err := tx.Exec(ctx, `LOCK TABLE refund_requests IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+				return nil, fmt.Errorf("lock refund requests for normalization: %w", err)
+			}
+		}
+		if err := preflightRialMoneyConversion(ctx, tx, hasRefundRequests); err != nil {
+			return nil, err
+		}
+	}
 
 	if err := applyLegacyMoneyUnit(ctx, tx, unit); err != nil {
 		return nil, err

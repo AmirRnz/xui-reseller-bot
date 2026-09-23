@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"gopkg.in/telebot.v3"
@@ -112,4 +113,11 @@ func paymentIntentCreateFailure(c telebot.Context, user *db.User, fallback strin
 		}
 	}
 	return maybeEditOrSend(c, fallback)
+}
+
+func paymentIntentCreateFailureForError(c telebot.Context, user *db.User, fallback string, cause error) error {
+	if errors.Is(cause, db.ErrSubscriptionMutationInProgress) {
+		return maybeEditOrSend(c, "پرداخت یا تغییر قبلی این سرویس هنوز در حال بررسی یا همگام‌سازی است. لطفاً تا پایان همان درخواست صبر کنید.")
+	}
+	return paymentIntentCreateFailure(c, user, fallback)
 }

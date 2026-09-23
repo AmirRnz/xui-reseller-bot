@@ -59,6 +59,8 @@ func TestPayloadRoundTrips(t *testing.T) {
 		SubscriptionID:    201,
 		UserID:            103,
 		ClientEmail:       "update@test.com",
+		ClientUUID:        "update-uuid",
+		PanelSubID:        "update-panel-sub",
 		DesiredIPLimit:    &desiredIP,
 		DesiredExpireTime: &desiredExp,
 		DesiredIsActive:   &desiredActive,
@@ -69,6 +71,7 @@ func TestPayloadRoundTrips(t *testing.T) {
 		t.Fatalf("DecodeSubscriptionUpdate failed: %v", err)
 	}
 	if decodedUpdate.SubscriptionID != 201 || decodedUpdate.ClientEmail != "update@test.com" ||
+		decodedUpdate.ClientUUID != "update-uuid" || decodedUpdate.PanelSubID != "update-panel-sub" ||
 		*decodedUpdate.DesiredIPLimit != 3 || *decodedUpdate.DesiredExpireTime != desiredExp || !*decodedUpdate.DesiredIsActive {
 		t.Fatalf("SubscriptionUpdate mismatch: %+v", decodedUpdate)
 	}

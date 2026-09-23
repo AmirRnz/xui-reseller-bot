@@ -72,6 +72,7 @@ type Processor struct {
 	GetSubscriptionByIDFn          func(ctx context.Context, id int) (*db.Subscription, error)
 	GetSubscriptionByEmailFn       func(ctx context.Context, email string) (*db.Subscription, error)
 	GetPurchaseRequestByIDFn       func(ctx context.Context, id int64) (*db.PurchaseRequest, error)
+	UpdateSubscriptionFn           func(ctx context.Context, sub *db.Subscription) error
 	CreateRefundRequestFn          func(ctx context.Context, r *db.RefundRequest) error
 	BatchSize                      int
 	MaxRetry                       int
@@ -113,6 +114,13 @@ func (p *Processor) updateSubStatus(ctx context.Context, id int, status string) 
 		fn = db.UpdateSubscriptionStatus
 	}
 	return fn(ctx, id, status)
+}
+
+func (p *Processor) updateSubscription(ctx context.Context, sub *db.Subscription) error {
+	if p.UpdateSubscriptionFn != nil {
+		return p.UpdateSubscriptionFn(ctx, sub)
+	}
+	return db.UpdateSubscription(ctx, sub)
 }
 
 func (p *Processor) getSubByID(ctx context.Context, id int) (*db.Subscription, error) {
@@ -902,6 +910,11 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 			Err:  fmt.Errorf("subscription %d not found in db: %w", payload.SubscriptionID, err),
 		}
 	}
+	if (payload.UserID > 0 && sub.UserID != payload.UserID) || sub.ClientEmail != payload.ClientEmail ||
+		(payload.ClientUUID != "" && sub.ClientUUID != payload.ClientUUID) ||
+		(payload.PanelSubID != "" && sub.SubID != payload.PanelSubID) {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "durable subscription update identity does not match the local service"}
+	}
 
 	if p.XUI == nil {
 		return ProcessOutcome{
@@ -917,6 +930,11 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 			Kind: OutcomeRetry,
 			Err:  fmt.Errorf("remote client %s not present or check inconclusive: %w", payload.ClientEmail, err),
 		}
+	}
+	if remote.Email != payload.ClientEmail ||
+		(payload.ClientUUID != "" && remote.UUID != payload.ClientUUID) ||
+		(payload.PanelSubID != "" && remote.SubID != payload.PanelSubID) {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "remote subscription identity does not match the durable update request"}
 	}
 
 	// Compare: Desired vs Observed Remote vs Current DB
@@ -962,7 +980,7 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 		sub.DesiredIsActive = nil
 		sub.ReconciliationNote = ""
 
-		if err := db.UpdateSubscription(ctx, sub); err != nil {
+		if err := p.updateSubscription(ctx, sub); err != nil {
 			return ProcessOutcome{
 				Kind: OutcomeRetry,
 				Err:  fmt.Errorf("failed to commit db subscription %d: %w", sub.ID, err),
@@ -984,6 +1002,7 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 		// Retry the remote mutation once
 		updateCfg := xui.ClientConfig{
 			Email:      remote.Email,
+			SubID:      remote.SubID,
 			Enable:     desiredActive,
 			ExpiryTime: desiredExpiry,
 			LimitIP:    desiredIP,
@@ -1017,7 +1036,7 @@ func (p *Processor) handleUpdateReconciliation(ctx context.Context, rec *db.Reco
 				sub.DesiredExpireTime = nil
 				sub.DesiredIsActive = nil
 				sub.ReconciliationNote = ""
-				if err := db.UpdateSubscription(ctx, sub); err != nil {
+				if err := p.updateSubscription(ctx, sub); err != nil {
 					return ProcessOutcome{
 						Kind: OutcomeRetry,
 						Err:  fmt.Errorf("failed to commit db subscription %d after retry: %w", sub.ID, err),

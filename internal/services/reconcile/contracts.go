@@ -118,6 +118,8 @@ type SubscriptionUpdateDbFailedPayload struct {
 	SubscriptionID     int64  `json:"subscription_id"`
 	UserID             int64  `json:"user_id"`
 	ClientEmail        string `json:"client_email"`
+	ClientUUID         string `json:"client_uuid,omitempty"`
+	PanelSubID         string `json:"panel_sub_id,omitempty"`
 	DesiredIPLimit     *int   `json:"desired_ip_limit,omitempty"`
 	DesiredExpireTime  *int64 `json:"desired_expire_time,omitempty"`
 	DesiredIsActive    *bool  `json:"desired_is_active,omitempty"`
@@ -712,6 +714,8 @@ func DecodeSubscriptionUpdate(raw map[string]any, fallbackSubID *int64) (*Subscr
 	if p.ClientEmail == "" {
 		p.ClientEmail = coerceString(raw["email"])
 	}
+	p.ClientUUID = coerceString(raw["client_uuid"])
+	p.PanelSubID = coerceString(raw["panel_sub_id"])
 
 	if v, ok := coerceInt64(raw["desired_ip_limit"]); ok {
 		ip := int(v)

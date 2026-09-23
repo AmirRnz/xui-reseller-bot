@@ -407,6 +407,115 @@ func MarkSubscriptionReconciliationRequired(ctx context.Context, id int, desired
 	return err
 }
 
+// QueueSubscriptionToggle commits the desired toggle and executable update work
+// atomically before any remote write. The operation key makes the callback
+// replay-safe across bot processes and restarts.
+func QueueSubscriptionToggle(ctx context.Context, subscriptionID int, userID int64, targetActive bool, expectedUpdatedAt time.Time, operationKey string) (bool, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	if Pool == nil {
+		return false, errors.New("database pool is not initialized")
+	}
+	if subscriptionID <= 0 || userID <= 0 || strings.TrimSpace(operationKey) == "" {
+		return false, errors.New("subscription, user, and operation key are required")
+	}
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var existingSubID *int64
+	var existingUserID *int64
+	var existingKind string
+	err = tx.QueryRow(ctx, `
+		SELECT subscription_id, user_id, kind FROM reconciliation_records WHERE operation_key = $1
+	`, operationKey).Scan(&existingSubID, &existingUserID, &existingKind)
+	if err == nil {
+		if existingSubID == nil || *existingSubID != int64(subscriptionID) || existingUserID == nil || *existingUserID != userID || existingKind != "subscription_update_db_failed" {
+			return false, errors.New("toggle operation key conflicts with different durable work")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return false, err
+	}
+
+	var ownerID int64
+	var clientEmail, clientUUID, panelSubID, status string
+	var ipLimit int
+	var expireTime *int64
+	var active bool
+	var desiredIP *int
+	var desiredExpiry *int64
+	var desiredActive *bool
+	var updatedAt time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT user_id, client_email, client_uuid, sub_id, status, ip_limit, expire_time, is_active,
+		       desired_ip_limit, desired_expire_time, desired_is_active, updated_at
+		FROM subscriptions WHERE id = $1 FOR UPDATE
+	`, subscriptionID).Scan(&ownerID, &clientEmail, &clientUUID, &panelSubID, &status, &ipLimit, &expireTime, &active,
+		&desiredIP, &desiredExpiry, &desiredActive, &updatedAt)
+	if err != nil {
+		return false, err
+	}
+	if ownerID != userID || strings.TrimSpace(clientEmail) == "" || strings.TrimSpace(clientUUID) == "" || strings.TrimSpace(panelSubID) == "" {
+		return false, errors.New("toggle subscription ownership or remote identity is incomplete")
+	}
+	if !expectedUpdatedAt.IsZero() && !updatedAt.Equal(expectedUpdatedAt) {
+		return false, ErrSubscriptionMutationStale
+	}
+	if desiredIP != nil || desiredExpiry != nil || desiredActive != nil || status == SubscriptionStatusReconciliation ||
+		status == SubscriptionStatusCancelRequested || status == SubscriptionStatusDeprovisioning ||
+		status == SubscriptionStatusCancelled || status == SubscriptionStatusDeleted {
+		return false, ErrSubscriptionMutationInProgress
+	}
+	if targetActive == active {
+		return false, ErrSubscriptionMutationStale
+	}
+	if targetActive {
+		if status != SubscriptionStatusDisabled || active ||
+			(expireTime != nil && *expireTime > 0 && *expireTime <= time.Now().UTC().UnixMilli()) {
+			return false, ErrSubscriptionMutationInvalid
+		}
+	} else if status != SubscriptionStatusActive || !active {
+		return false, ErrSubscriptionMutationInvalid
+	}
+
+	userIDCopy, subIDCopy := userID, int64(subscriptionID)
+	desired := map[string]any{
+		"subscription_id": subscriptionID, "user_id": userID, "client_email": clientEmail,
+		"client_uuid": clientUUID, "panel_sub_id": panelSubID, "desired_is_active": targetActive,
+		"previous_ip_limit": ipLimit, "previous_expire_time": int64(0), "previous_is_active": active,
+	}
+	if expireTime != nil {
+		desired["previous_expire_time"] = *expireTime
+	}
+	record := &ReconciliationRecord{
+		OperationKey: operationKey, Kind: "subscription_update_db_failed", UserID: &userIDCopy,
+		SubscriptionID: &subIDCopy, DesiredState: desired,
+		ObservedState: map[string]any{"origin": "user_subscription_toggle", "phase": "queued"},
+		Status:        ReconciliationStatusPending,
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE subscriptions
+		SET status = $1, desired_is_active = $2, reconciliation_note = $3, updated_at = NOW()
+		WHERE id = $4 AND user_id = $5
+	`, SubscriptionStatusReconciliation, targetActive, "toggle awaits verified 3x-ui reconciliation", subscriptionID, userID); err != nil {
+		return false, err
+	}
+	if err := createReconciliationRecordTx(ctx, tx, record); err != nil {
+		return false, fmt.Errorf("persist toggle reconciliation work: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 func DeleteSubscription(ctx context.Context, id int) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()

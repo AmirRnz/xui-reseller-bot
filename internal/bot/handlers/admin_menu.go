@@ -26,6 +26,7 @@ func HandleAdminMenu(c telebot.Context) error {
 		menu.Row(
 			menu.Data(persian.BtnAdminTopups, "admin_pending_topups"),
 		),
+		menu.Row(menu.Data("🧾 رسیدهای نیازمند بررسی دستی", "admin_manual_payment_reviews")),
 		menu.Row(menu.Data(persian.BtnAdminReconcile, "admin_reconcile")),
 		menu.Row(menu.Data(persian.BtnBack, "menu_main")),
 	)

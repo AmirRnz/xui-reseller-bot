@@ -148,3 +148,102 @@ func TestConcurrentWalletSubscriptionMutationsChargeOnlyOneProcess(t *testing.T)
 		t.Fatalf("concurrent service operations must debit once: count=%d balance=%d", debitCount, balance)
 	}
 }
+
+func TestWalletExtensionSupportsActiveAndExpiredPaidSubscriptions(t *testing.T) {
+	for _, lifecycle := range []string{SubscriptionStatusActive, SubscriptionStatusExpired, SubscriptionStatusDisabled} {
+		t.Run(lifecycle, func(t *testing.T) {
+			ctx, userID, subID, planUpdated, expiry := createWalletMutationFixture(t)
+			wasActive := lifecycle == SubscriptionStatusActive
+			if lifecycle == SubscriptionStatusExpired {
+				past := time.Now().Add(-7 * 24 * time.Hour).UnixMilli()
+				expiry = &past
+				if _, err := Pool.Exec(ctx, `UPDATE subscriptions SET status='expired', is_active=FALSE, expire_time=$1, end_date=NOW()-INTERVAL '7 days' WHERE id=$2`, past, subID); err != nil {
+					t.Fatalf("mark service expired: %v", err)
+				}
+			} else if lifecycle == SubscriptionStatusDisabled {
+				if _, err := Pool.Exec(ctx, `UPDATE subscriptions SET status='disabled', is_active=FALSE WHERE id=$1`, subID); err != nil {
+					t.Fatalf("mark service disabled: %v", err)
+				}
+			}
+			desiredExpiry, err := CalculateExtendedExpiry(expiry, 1, time.Now().UTC())
+			if err != nil {
+				t.Fatalf("calculate renewal expiry: %v", err)
+			}
+			desiredActive := true
+			opKey := fmt.Sprintf("wallet-extension:%s:%d", lifecycle, time.Now().UnixNano())
+			intent := WalletSubscriptionMutationIntent{
+				UserID: userID, SubscriptionID: subID, Amount: 500, Description: "one-month extension",
+				OperationKey: opKey, ExpectedIPLimit: 1, ExpectedExpireTime: expiry, ExpectedIsActive: wasActive,
+				ExpectedPlanUpdatedAt: planUpdated, DesiredExpireTime: &desiredExpiry, DesiredIsActive: &desiredActive,
+			}
+			if err := DebitWalletForSubscriptionMutation(ctx, intent); err != nil {
+				t.Fatalf("renew %s service from wallet: %v", lifecycle, err)
+			}
+			var status string
+			var currentActive bool
+			var storedDesiredExpiry *int64
+			var storedDesiredActive *bool
+			if err := Pool.QueryRow(ctx, `SELECT status, is_active, desired_expire_time, desired_is_active FROM subscriptions WHERE id=$1`, subID).Scan(&status, &currentActive, &storedDesiredExpiry, &storedDesiredActive); err != nil {
+				t.Fatal(err)
+			}
+			var balance int64
+			if err := Pool.QueryRow(ctx, `SELECT wallet_balance FROM bot_users WHERE id=$1`, userID).Scan(&balance); err != nil {
+				t.Fatal(err)
+			}
+			var ledgerCount, workCount int
+			if err := Pool.QueryRow(ctx, `SELECT count(*) FROM transactions WHERE operation_key=$1 AND amount=-500 AND type='debit'`, opKey).Scan(&ledgerCount); err != nil {
+				t.Fatal(err)
+			}
+			if err := Pool.QueryRow(ctx, `SELECT count(*) FROM reconciliation_records WHERE operation_key=$1 AND status='pending'`, opKey+":subscription-mutation").Scan(&workCount); err != nil {
+				t.Fatal(err)
+			}
+			if status != SubscriptionStatusReconciliation || currentActive != wasActive || storedDesiredExpiry == nil || storedDesiredActive == nil || !*storedDesiredActive || absInt64(*storedDesiredExpiry-desiredExpiry) > 2000 || balance != 99500 || ledgerCount != 1 || workCount != 1 {
+				t.Fatalf("renewal did not atomically reserve the same policy: status=%s active=%t desired_expiry=%v desired_active=%v balance=%d ledger=%d work=%d", status, currentActive, storedDesiredExpiry, storedDesiredActive, balance, ledgerCount, workCount)
+			}
+		})
+	}
+}
+
+func absInt64(value int64) int64 {
+	if value < 0 {
+		return -value
+	}
+	return value
+}
+
+func TestWalletExtensionRejectsCancelledAndDeletingLifecycleStates(t *testing.T) {
+	for _, lifecycle := range []string{SubscriptionStatusCancelled, SubscriptionStatusDeleted, SubscriptionStatusCancelRequested, SubscriptionStatusDeprovisioning} {
+		t.Run(lifecycle, func(t *testing.T) {
+			ctx, userID, subID, planUpdated, expiry := createWalletMutationFixture(t)
+			active := lifecycle == SubscriptionStatusCancelRequested || lifecycle == SubscriptionStatusDeprovisioning
+			if _, err := Pool.Exec(ctx, `UPDATE subscriptions SET status=$1, is_active=$2 WHERE id=$3`, lifecycle, active, subID); err != nil {
+				t.Fatalf("set lifecycle state: %v", err)
+			}
+			desiredExpiry, err := CalculateExtendedExpiry(expiry, 1, time.Now().UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			desiredActive := true
+			intent := WalletSubscriptionMutationIntent{
+				UserID: userID, SubscriptionID: subID, Amount: 500, Description: "blocked renewal",
+				OperationKey:    fmt.Sprintf("wallet-blocked-extension:%d", time.Now().UnixNano()),
+				ExpectedIPLimit: 1, ExpectedExpireTime: expiry, ExpectedIsActive: active,
+				ExpectedPlanUpdatedAt: planUpdated, DesiredExpireTime: &desiredExpiry, DesiredIsActive: &desiredActive,
+			}
+			if err := DebitWalletForSubscriptionMutation(ctx, intent); !errors.Is(err, ErrSubscriptionMutationInProgress) && !errors.Is(err, ErrSubscriptionMutationInvalid) {
+				t.Fatalf("%s renewal error=%v; want blocked lifecycle state", lifecycle, err)
+			}
+			var balance int64
+			if err := Pool.QueryRow(ctx, `SELECT wallet_balance FROM bot_users WHERE id=$1`, userID).Scan(&balance); err != nil {
+				t.Fatal(err)
+			}
+			var debits int
+			if err := Pool.QueryRow(ctx, `SELECT count(*) FROM transactions WHERE operation_key=$1 AND type='debit'`, intent.OperationKey).Scan(&debits); err != nil {
+				t.Fatal(err)
+			}
+			if balance != 100000 || debits != 0 {
+				t.Fatalf("blocked renewal caused economic effect: balance=%d debit_count=%d", balance, debits)
+			}
+		})
+	}
+}

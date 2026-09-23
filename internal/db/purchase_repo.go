@@ -40,10 +40,10 @@ func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, er
 
 	r := &PurchaseRequest{}
 	err := Pool.QueryRow(ctx, `
-		SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at, provisioning_snapshot
+		SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at, provisioning_snapshot, payment_intent_id, receipt_submitted_at, review_reason
 		FROM purchase_requests
 		WHERE id = $1
-	`, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt, &r.ProvisioningSnapshot)
+	`, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt, &r.ProvisioningSnapshot, &r.PaymentIntentID, &r.ReceiptSubmittedAt, &r.ReviewReason)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -100,10 +100,28 @@ func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64, workIt
 	}
 	if r.Type == "extend" || r.Type == "upgrade_ip" {
 		if err := reserveDirectSubscriptionMutation(ctx, tx, r, workItem); err != nil {
+			if isDirectPurchaseRevalidationError(err) {
+				if _, markErr := tx.Exec(ctx, `UPDATE purchase_requests SET status = $1, review_reason = $2, updated_at = NOW() WHERE id = $3`, PurchaseStatusNeedsManualReview, directPurchaseReviewReason(err), r.ID); markErr != nil {
+					return nil, fmt.Errorf("mark paid request for manual review: %w", markErr)
+				}
+				if commitErr := tx.Commit(ctx); commitErr != nil {
+					return nil, fmt.Errorf("persist manual-review state: %w", commitErr)
+				}
+				return nil, err
+			}
 			return nil, err
 		}
 	} else if r.Type == "buy" {
 		if err := validateDirectPurchaseApproval(ctx, tx, r, workItem); err != nil {
+			if isDirectPurchaseRevalidationError(err) {
+				if _, markErr := tx.Exec(ctx, `UPDATE purchase_requests SET status = $1, review_reason = $2, updated_at = NOW() WHERE id = $3`, PurchaseStatusNeedsManualReview, directPurchaseReviewReason(err), r.ID); markErr != nil {
+					return nil, fmt.Errorf("mark paid request for manual review: %w", markErr)
+				}
+				if commitErr := tx.Commit(ctx); commitErr != nil {
+					return nil, fmt.Errorf("persist manual-review state: %w", commitErr)
+				}
+				return nil, err
+			}
 			return nil, err
 		}
 	}
@@ -132,6 +150,12 @@ func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64, workIt
 		return nil, err
 	}
 	return r, nil
+}
+
+func isDirectPurchaseRevalidationError(err error) bool {
+	return errors.Is(err, ErrSubscriptionMutationStale) ||
+		errors.Is(err, ErrSubscriptionMutationInvalid) ||
+		errors.Is(err, ErrSubscriptionMutationInProgress)
 }
 
 func reserveDirectSubscriptionMutation(ctx context.Context, tx pgx.Tx, request *PurchaseRequest, workItem *ReconciliationRecord) error {
@@ -169,8 +193,15 @@ func reserveDirectSubscriptionMutation(ctx context.Context, tx pgx.Tx, request *
 	if expireTime != nil {
 		currentExpiry = *expireTime
 	}
+	if err := ensureNoUnresolvedDirectMutationTx(ctx, tx, *request.SubscriptionID, 0, request.ID); err != nil {
+		return err
+	}
+	stateEligible := status == SubscriptionStatusActive && active
+	if request.Type == "extend" {
+		stateEligible = IsExtensionEligibleState(status, active, expireTime, time.Now().UTC())
+	}
 	if owner != request.UserID || email != request.ClientEmail || planType != PlanTypePaid || planID == nil || request.PlanID == nil || int64(*request.PlanID) != *planID ||
-		status != SubscriptionStatusActive || !active || desiredIP != nil || desiredExpiry != nil || desiredActive != nil ||
+		!stateEligible || desiredIP != nil || desiredExpiry != nil || desiredActive != nil ||
 		!updatedAt.Equal(expectedUpdatedAt) || int64(ipLimit) != expectedIP || currentExpiry != expectedExpiry || active != expectedActive {
 		return ErrSubscriptionMutationStale
 	}
@@ -205,17 +236,11 @@ func reserveDirectSubscriptionMutation(ctx context.Context, tx pgx.Tx, request *
 	if currentExpiry == 0 {
 		return ErrSubscriptionMutationInvalid
 	}
-	monthMillis := int64(request.Months) * 30 * 24 * 60 * 60 * 1000
 	desiredExpiryValue := currentExpiry
 	if request.Type == "extend" {
-		if currentExpiry < 0 {
-			desiredExpiryValue = currentExpiry - monthMillis
-		} else {
-			baseExpiry := currentExpiry
-			if now := time.Now().UTC().UnixMilli(); baseExpiry < now {
-				baseExpiry = now
-			}
-			desiredExpiryValue = baseExpiry + monthMillis
+		desiredExpiryValue, err = CalculateExtendedExpiry(expireTime, request.Months, time.Now().UTC())
+		if err != nil {
+			return err
 		}
 	}
 	desiredIPPtr := desiredIPValue
@@ -273,7 +298,7 @@ func RejectPurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purch
 	err := Pool.QueryRow(ctx, `
 		UPDATE purchase_requests
 		SET status = 'rejected', admin_id = $1, updated_at = NOW()
-		WHERE id = $2 AND status = 'pending'
+		WHERE id = $2 AND status IN ('pending', 'needs_manual_review')
 		RETURNING id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at
 	`, adminID, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
@@ -304,6 +329,32 @@ func GetPendingPurchaseRequests(ctx context.Context) ([]*PurchaseRequest, error)
 	for rows.Next() {
 		r := &PurchaseRequest{}
 		if err := rows.Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		reqs = append(reqs, r)
+	}
+	return reqs, rows.Err()
+}
+
+func GetPurchaseRequestsNeedingManualReview(ctx context.Context) ([]*PurchaseRequest, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	rows, err := Pool.Query(ctx, `
+		SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at, payment_intent_id, receipt_submitted_at, review_reason
+		FROM purchase_requests
+		WHERE status = $1 AND telegram_file_id <> ''
+		ORDER BY receipt_submitted_at ASC NULLS FIRST, id ASC
+	`, PurchaseStatusNeedsManualReview)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reqs []*PurchaseRequest
+	for rows.Next() {
+		r := &PurchaseRequest{}
+		if err := rows.Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt, &r.PaymentIntentID, &r.ReceiptSubmittedAt, &r.ReviewReason); err != nil {
 			return nil, err
 		}
 		reqs = append(reqs, r)
