@@ -188,7 +188,7 @@ func generateTestSubscription(c telebot.Context, user *db.User, planID int64, em
 
 func createAndSendTest(c telebot.Context, user *db.User, plan *db.TestPlan, email string) error {
 	if bot.XUIClient == nil {
-		return c.Send("خطا: کلاینت x-ui متصل نیست.")
+		return c.Send("خطا: پنل سرویس‌دهنده در دسترس نیست.")
 	}
 	if existing, _ := db.GetSubscriptionByEmail(context.Background(), email); existing != nil {
 		return c.Send("نام تولید شده قبلا انتخاب شده است. لطفا مجددا تلاش کنید.")

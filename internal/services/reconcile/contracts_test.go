@@ -35,6 +35,8 @@ func TestPayloadRoundTrips(t *testing.T) {
 		IPLimit:            2,
 		DataGB:             50,
 		Price:              75000,
+		ExpiryTimeMilli:    -2592000000,
+		TotalBytes:         int64(50) * 1073741824,
 		RefundOperationKey: "prov_op_1:refund",
 		DisplayName:        "My Test Sub",
 	}
@@ -93,18 +95,23 @@ func TestPayloadRoundTrips(t *testing.T) {
 
 	// 5. DirectPaymentProvisioning
 	directPayload := &DirectPaymentProvisioningPayload{
-		PurchaseRequestID: 401,
-		UserID:            105,
-		QuoteID:           &qID,
-		OperationKey:      "direct_op_1",
-		ClientEmail:       "direct@test.com",
-		ExpectedUUID:      "uuid-direct-1",
-		ExpectedSubID:     "sub-direct-1",
-		InboundIDs:        []int{3, 4},
-		Months:            2,
-		IPLimit:           1,
-		DataGB:            30,
-		CustomName:        "Direct Sub",
+		PurchaseRequestID:     401,
+		UserID:                105,
+		ActionType:            "buy",
+		AmountToman:           75000,
+		FinancialOperationKey: "direct_op_1:financial",
+		QuoteID:               &qID,
+		OperationKey:          "direct_op_1",
+		ClientEmail:           "direct@test.com",
+		ExpectedUUID:          "uuid-direct-1",
+		ExpectedSubID:         "sub-direct-1",
+		InboundIDs:            []int{3, 4},
+		Months:                2,
+		IPLimit:               1,
+		DataGB:                30,
+		CustomName:            "Direct Sub",
+		ExpiryTimeMilli:       -5184000000,
+		TotalBytes:            int64(30) * 1073741824,
 	}
 	directRec := NewDirectPaymentProvisioningRecord(directPayload)
 	decodedDirect, err := DecodeDirectPaymentProvisioning(directRec.DesiredState, directRec.PurchaseRequestID, directRec.UserID, directRec.OperationKey)

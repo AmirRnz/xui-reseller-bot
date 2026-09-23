@@ -76,6 +76,12 @@ type PurchaseProvisioningPayload struct {
 	IPLimit            int    `json:"ip_limit,omitempty"`
 	DataGB             int    `json:"data_gb,omitempty"`
 	Price              int64  `json:"price"`
+	ExpiryTimeMilli    int64  `json:"expiry_time_milli"`
+	TotalBytes         int64  `json:"total_bytes"`
+	Flow               string `json:"flow"`
+	Group              string `json:"group,omitempty"`
+	TelegramID         int64  `json:"telegram_id,omitempty"`
+	PlanName           string `json:"plan_name,omitempty"`
 	RefundOperationKey string `json:"refund_operation_key,omitempty"`
 	DisplayName        string `json:"display_name,omitempty"`
 }
@@ -89,6 +95,12 @@ func (p *PurchaseProvisioningPayload) Validate() error {
 	}
 	if strings.TrimSpace(p.OperationKey) == "" {
 		return errors.New("operation_key is required")
+	}
+	if strings.TrimSpace(p.ExpectedUUID) == "" || strings.TrimSpace(p.ExpectedSubID) == "" {
+		return errors.New("pre-persisted UUID and SubID are required")
+	}
+	if p.ExpiryTimeMilli == 0 || p.TotalBytes < 0 {
+		return errors.New("exact expiry and non-negative total bytes are required")
 	}
 	return nil
 }
@@ -153,20 +165,29 @@ func (p *SubscriptionDeletePayload) ToMap() map[string]any {
 
 // DirectPaymentProvisioningPayload defines the contract for direct payment provisioning retries.
 type DirectPaymentProvisioningPayload struct {
-	PurchaseRequestID int64  `json:"purchase_request_id"`
-	UserID            int64  `json:"user_id"`
-	QuoteID           *int64 `json:"quote_id,omitempty"`
-	OperationKey      string `json:"operation_key"`
-	ClientEmail       string `json:"client_email"`
-	ExpectedUUID      string `json:"expected_uuid,omitempty"`
-	ExpectedSubID     string `json:"expected_sub_id,omitempty"`
-	PlanID            *int   `json:"plan_id,omitempty"`
-	InboundIDs        []int  `json:"inbound_ids,omitempty"`
-	Months            int    `json:"months,omitempty"`
-	IPLimit           int    `json:"ip_limit,omitempty"`
-	DataGB            int    `json:"data_gb,omitempty"`
-	CustomName        string `json:"custom_name,omitempty"`
-	Flow              string `json:"flow,omitempty"`
+	PurchaseRequestID     int64  `json:"purchase_request_id"`
+	UserID                int64  `json:"user_id"`
+	ActionType            string `json:"action_type"`
+	QuoteID               *int64 `json:"quote_id,omitempty"`
+	AmountToman           int64  `json:"amount_toman"`
+	FinancialOperationKey string `json:"financial_operation_key"`
+	SubscriptionID        *int64 `json:"subscription_id,omitempty"`
+	OperationKey          string `json:"operation_key"`
+	ClientEmail           string `json:"client_email"`
+	ExpectedUUID          string `json:"expected_uuid,omitempty"`
+	ExpectedSubID         string `json:"expected_sub_id,omitempty"`
+	PlanID                *int   `json:"plan_id,omitempty"`
+	InboundIDs            []int  `json:"inbound_ids,omitempty"`
+	Months                int    `json:"months,omitempty"`
+	IPLimit               int    `json:"ip_limit,omitempty"`
+	DataGB                int    `json:"data_gb,omitempty"`
+	ExpiryTimeMilli       int64  `json:"expiry_time_milli"`
+	TotalBytes            int64  `json:"total_bytes"`
+	DesiredIPLimit        *int   `json:"desired_ip_limit,omitempty"`
+	CustomName            string `json:"custom_name,omitempty"`
+	Flow                  string `json:"flow,omitempty"`
+	Group                 string `json:"group,omitempty"`
+	TelegramID            int64  `json:"telegram_id,omitempty"`
 }
 
 func (p *DirectPaymentProvisioningPayload) Validate() error {
@@ -178,6 +199,12 @@ func (p *DirectPaymentProvisioningPayload) Validate() error {
 	}
 	if strings.TrimSpace(p.ClientEmail) == "" {
 		return errors.New("client_email is required")
+	}
+	if p.AmountToman <= 0 || strings.TrimSpace(p.FinancialOperationKey) == "" {
+		return errors.New("integer-Toman amount and financial operation key are required")
+	}
+	if p.ActionType == "buy" && (strings.TrimSpace(p.ExpectedUUID) == "" || strings.TrimSpace(p.ExpectedSubID) == "") {
+		return errors.New("pre-persisted UUID and SubID are required for a direct buy")
 	}
 	return nil
 }
@@ -239,7 +266,7 @@ func NewPurchaseProvisioningRecord(p *PurchaseProvisioningPayload) *db.Reconcili
 		UserID:            &p.UserID,
 		PurchaseRequestID: p.PurchaseRequestID,
 		DesiredState:      p.ToMap(),
-		ObservedState:     map[string]any{"outcome": "unknown"},
+		ObservedState:     map[string]any{"outcome": "unknown", "phase": "create_attempted"},
 		Status:            "pending",
 	}
 }
@@ -328,7 +355,7 @@ func NewDirectPaymentProvisioningRecord(p *DirectPaymentProvisioningPayload) *db
 		UserID:            &p.UserID,
 		PurchaseRequestID: &reqID,
 		DesiredState:      p.ToMap(),
-		ObservedState:     map[string]any{"outcome": "activation_failed"},
+		ObservedState:     map[string]any{"outcome": "approval_committed", "phase": "ready"},
 		Status:            "pending",
 	}
 }
@@ -537,6 +564,18 @@ func DecodePurchaseProvisioning(raw map[string]any, fallbackUserID *int64, fallb
 	if dataGB, ok := coerceInt64(raw["data_gb"]); ok {
 		p.DataGB = int(dataGB)
 	}
+	if expiry, ok := coerceInt64(raw["expiry_time_milli"]); ok {
+		p.ExpiryTimeMilli = expiry
+	}
+	if total, ok := coerceInt64(raw["total_bytes"]); ok {
+		p.TotalBytes = total
+	}
+	p.Flow = coerceString(raw["flow"])
+	p.Group = coerceString(raw["group"])
+	if telegramID, ok := coerceInt64(raw["telegram_id"]); ok {
+		p.TelegramID = telegramID
+	}
+	p.PlanName = coerceString(raw["plan_name"])
 
 	if price, ok := coerceInt64(raw["price"]); ok {
 		p.Price = price
@@ -678,6 +717,14 @@ func DecodeDirectPaymentProvisioning(raw map[string]any, fallbackReqID *int64, f
 	if qID, ok := coerceInt64(raw["quote_id"]); ok && qID > 0 {
 		p.QuoteID = &qID
 	}
+	if amount, ok := coerceInt64(raw["amount_toman"]); ok {
+		p.AmountToman = amount
+	}
+	p.FinancialOperationKey = coerceString(raw["financial_operation_key"])
+	p.ActionType = coerceString(raw["action_type"])
+	if subID, ok := coerceInt64(raw["subscription_id"]); ok && subID > 0 {
+		p.SubscriptionID = &subID
+	}
 
 	p.OperationKey = coerceString(raw["operation_key"])
 	if p.OperationKey == "" {
@@ -720,11 +767,25 @@ func DecodeDirectPaymentProvisioning(raw map[string]any, fallbackReqID *int64, f
 	if dataGB, ok := coerceInt64(raw["data_gb"]); ok {
 		p.DataGB = int(dataGB)
 	}
+	if expiry, ok := coerceInt64(raw["expiry_time_milli"]); ok {
+		p.ExpiryTimeMilli = expiry
+	}
+	if total, ok := coerceInt64(raw["total_bytes"]); ok {
+		p.TotalBytes = total
+	}
+	if desiredIP, ok := coerceInt64(raw["desired_ip_limit"]); ok {
+		value := int(desiredIP)
+		p.DesiredIPLimit = &value
+	}
 	p.CustomName = coerceString(raw["custom_name"])
 	if p.CustomName == "" {
 		p.CustomName = coerceString(raw["display_name"])
 	}
 	p.Flow = coerceString(raw["flow"])
+	p.Group = coerceString(raw["group"])
+	if telegramID, ok := coerceInt64(raw["telegram_id"]); ok {
+		p.TelegramID = telegramID
+	}
 
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid direct payment provisioning payload: %w", err)

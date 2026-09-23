@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"log"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/telebot.v3"
 	"xui-reseller-bot/internal/bot"
+	"xui-reseller-bot/internal/bot/persian"
 	"xui-reseller-bot/internal/db"
 	"xui-reseller-bot/internal/qr"
 	"xui-reseller-bot/internal/services/pricing"
@@ -79,11 +79,6 @@ func parseInt64(s string) (int64, error) {
 	return v, err
 }
 
-func parseFloat(s string) (float64, error) {
-	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-	return v, err
-}
-
 func sanitizeName(input string) string {
 	input = strings.TrimSpace(input)
 	input = strings.ReplaceAll(input, " ", "_")
@@ -112,26 +107,6 @@ func randomToken(n int) string {
 
 func randomName() string {
 	return "random" + randomToken(5)
-}
-
-func CalculateRefund(plan *db.PaidPlan, sub *db.Subscription, ipFactor float64, now time.Time) int64 {
-	if plan == nil || sub == nil || sub.EndDate.IsZero() {
-		return 0
-	}
-	totalMonths := int(sub.EndDate.Sub(sub.StartDate).Hours() / 24 / 30)
-	if totalMonths < 1 {
-		totalMonths = 1
-	}
-	remainingMonths := int(sub.EndDate.Sub(now).Hours() / 24 / 30)
-	if remainingMonths <= 0 {
-		return 0
-	}
-
-	dataGB := int(sub.TrafficLimitBytes / 1073741824)
-	displayIPLimit := sub.IPLimit
-
-	totalPaid := calculatePaidPrice(plan, totalMonths, displayIPLimit, dataGB)
-	return (totalPaid * int64(remainingMonths)) / int64(totalMonths)
 }
 
 func serviceGroup(user *db.User) string {
@@ -199,15 +174,19 @@ func calculatePaidPrice(plan *db.PaidPlan, months, ipLimit int, dataGB int) int6
 	return quote.FinalPriceToman
 }
 
-func bestDiscount(tiers []db.DiscountTier, months int) float64 {
-	sort.Slice(tiers, func(i, j int) bool { return tiers[i].Months < tiers[j].Months })
-	best := 0.0
-	for _, tier := range tiers {
-		if months >= tier.Months && tier.Percent > best {
-			best = tier.Percent
-		}
+func calculateIPUpgradePrice(plan *db.PaidPlan, currentLimit, desiredLimit, months int) int64 {
+	if plan == nil || desiredLimit <= currentLimit || months <= 0 {
+		return 0
 	}
-	return best
+	return int64(desiredLimit-currentLimit) * plan.PricePerExtraIPToman * int64(months)
+}
+
+func formatTomanSetting(value string) string {
+	amount, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return "تنظیم نشده"
+	}
+	return persian.FormatMoney(amount)
 }
 
 func validInboundIDs(ids []int) []int {
@@ -516,6 +495,15 @@ func ReverseIPLimitFactor(adjustedIPLimit int, factorSetting string) int {
 		}
 	}
 	return adjustedIPLimit
+}
+
+func formatBasisPointPercent(basisPoints int64) string {
+	whole, fraction := basisPoints/100, basisPoints%100
+	if fraction == 0 {
+		return strconv.FormatInt(whole, 10)
+	}
+	text := fmt.Sprintf("%d.%02d", whole, fraction)
+	return strings.TrimRight(strings.TrimRight(text, "0"), ".")
 }
 
 var devicesRegex = regexp.MustCompile(`devices:\s*(\d+)`)

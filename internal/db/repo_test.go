@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -475,7 +476,7 @@ func TestPlanSyncSubs(t *testing.T) {
 	}
 }
 
-func TestPurchaseRollbackAndClaim(t *testing.T) {
+func TestPurchaseApprovalPersistsWorkAndRollbackKeepsApproval(t *testing.T) {
 	ctx := setupTestDB(t)
 
 	// Clean up after test
@@ -499,10 +500,11 @@ func TestPurchaseRollbackAndClaim(t *testing.T) {
 		t.Fatalf("failed to create test user: %v", err)
 	}
 
-	// Create purchase request (for claim)
+	priceToman := int64(100)
 	req := &PurchaseRequest{
 		UserID:         userID,
-		Type:           "claim",
+		Type:           "buy",
+		PriceToman:     &priceToman,
 		Price:          100.0,
 		Months:         1,
 		IPLimit:        1,
@@ -518,17 +520,10 @@ func TestPurchaseRollbackAndClaim(t *testing.T) {
 		t.Fatalf("failed to create purchase request: %v", err)
 	}
 
-	// 1. Verify HasPendingClaimRequest
-	hasPending, err := HasPendingClaimRequest(ctx, "sub_claim_123")
-	if err != nil {
-		t.Fatalf("failed to check pending claim: %v", err)
-	}
-	if !hasPending {
-		t.Fatalf("expected HasPendingClaimRequest to be true, got false")
-	}
-
-	// 2. Approve the purchase request
-	approvedReq, err := ApprovePurchaseRequest(ctx, req.ID, 999999998)
+	// Approval and provisioning work are committed together.
+	userPtr, purchaseID := userID, req.ID
+	workItem := &ReconciliationRecord{OperationKey: "direct_payment:" + strconv.FormatInt(req.ID, 10) + ":provisioning", Kind: "direct_payment_provisioning_retry", UserID: &userPtr, PurchaseRequestID: &purchaseID, DesiredState: map[string]any{"purchase_request_id": req.ID, "user_id": userID}}
+	approvedReq, err := ApprovePurchaseRequest(ctx, req.ID, 999999998, workItem)
 	if err != nil {
 		t.Fatalf("failed to approve purchase request: %v", err)
 	}
@@ -549,16 +544,7 @@ func TestPurchaseRollbackAndClaim(t *testing.T) {
 		t.Fatalf("expected 1 transaction, got %d", txCount)
 	}
 
-	// Verify HasPendingClaimRequest is now false since status is no longer 'pending'
-	hasPending, err = HasPendingClaimRequest(ctx, "sub_claim_123")
-	if err != nil {
-		t.Fatalf("failed to check pending claim: %v", err)
-	}
-	if hasPending {
-		t.Fatalf("expected HasPendingClaimRequest to be false after approval, got true")
-	}
-
-	// 3. Rollback the purchase request
+	// Provisioning failure does not roll back the approved payment.
 	err = RollbackPurchaseRequest(ctx, req.ID)
 	if err != nil {
 		t.Fatalf("failed to rollback purchase request: %v", err)
@@ -582,14 +568,6 @@ func TestPurchaseRollbackAndClaim(t *testing.T) {
 		t.Fatalf("expected 1 transaction after provisioning rollback, got %d", txCount)
 	}
 
-	// The claim is no longer pending because the payment was approved.
-	hasPending, err = HasPendingClaimRequest(ctx, "sub_claim_123")
-	if err != nil {
-		t.Fatalf("failed to check pending claim: %v", err)
-	}
-	if hasPending {
-		t.Fatalf("expected HasPendingClaimRequest to remain false after provisioning retry state")
-	}
 }
 
 func TestWalletOperationKeyIsConcurrentIdempotent(t *testing.T) {

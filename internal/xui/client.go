@@ -45,6 +45,26 @@ func (c *Client) SetReady(ready bool) {
 	c.isReady = ready
 }
 
+// StartReadinessChecks periodically revalidates the pinned panel capabilities.
+// A transient startup outage keeps writes blocked until a later check succeeds.
+func (c *Client) StartReadinessChecks(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_, _ = c.CheckReadiness(ctx)
+			}
+		}
+	}()
+}
+
 type WriteOutcome string
 
 const (
@@ -67,6 +87,14 @@ type WriteError struct {
 // not exist.  Callers must use IsNotFound instead of matching human-readable
 // error strings because panel versions/locales vary their messages.
 var ErrNotFound = errors.New("x-ui resource not found")
+var ErrNotReady = errors.New("3x-ui mutation blocked while readiness is false")
+
+func (c *Client) readinessWriteError() error {
+	if !c.IsReady() {
+		return &WriteError{Outcome: WriteDefinitiveFailure, Err: ErrNotReady}
+	}
+	return nil
+}
 
 type NotFoundError struct {
 	StatusCode int
@@ -232,6 +260,9 @@ func (c *Client) UpdateClient(email string, client ClientConfig) error {
 }
 
 func (c *Client) AddClientResult(req AddClientRequest) WriteResult {
+	if err := c.readinessWriteError(); err != nil {
+		return WriteResult{Outcome: WriteDefinitiveFailure, Err: err}
+	}
 	err := c.doRequest("POST", "/panel/api/clients/add", req, nil)
 	if err == nil {
 		return WriteResult{Outcome: WriteSucceeded}
@@ -284,6 +315,9 @@ func (c *Client) UpdateClientPatch(email string, patch ClientPatch) error {
 }
 
 func (c *Client) UpdateClientPatchResult(email string, patch ClientPatch) WriteResult {
+	if err := c.readinessWriteError(); err != nil {
+		return WriteResult{Outcome: WriteDefinitiveFailure, Err: err}
+	}
 	current, err := c.GetClientByEmail(email)
 	if err != nil {
 		outcome := WriteDefinitiveFailure
@@ -357,6 +391,9 @@ func (c *Client) UpdateClientPatchResult(email string, patch ClientPatch) WriteR
 }
 
 func (c *Client) UpdateClientResult(email string, client ClientConfig) WriteResult {
+	if err := c.readinessWriteError(); err != nil {
+		return WriteResult{Outcome: WriteDefinitiveFailure, Err: err}
+	}
 	current, err := c.GetClientByEmail(email)
 	if err != nil {
 		outcome := WriteDefinitiveFailure
@@ -622,10 +659,16 @@ func mergeClientConfigWithPatch(current XUIClientInfo, patch ClientPatch) Client
 }
 
 func (c *Client) DeleteClient(email string) error {
+	if err := c.readinessWriteError(); err != nil {
+		return err
+	}
 	return wrapWriteError(c.doRequest("POST", "/panel/api/clients/del/"+pathEscape(email)+"?keepTraffic=0", nil, nil))
 }
 
 func (c *Client) AttachClient(email string, inboundIDs []int) error {
+	if err := c.readinessWriteError(); err != nil {
+		return err
+	}
 	return wrapWriteError(c.doRequest("POST", "/panel/api/clients/"+pathEscape(email)+"/attach", attachRequest{InboundIDs: inboundIDs}, nil))
 }
 
@@ -783,10 +826,16 @@ type BulkAttachRequest struct {
 }
 
 func (c *Client) BulkAttach(req BulkAttachRequest) error {
+	if err := c.readinessWriteError(); err != nil {
+		return err
+	}
 	return wrapWriteError(c.doRequest("POST", "/panel/api/clients/bulkAttach", req, nil))
 }
 
 func (c *Client) BulkDetach(req BulkAttachRequest) error {
+	if err := c.readinessWriteError(); err != nil {
+		return err
+	}
 	return wrapWriteError(c.doRequest("POST", "/panel/api/clients/bulkDetach", req, nil))
 }
 
@@ -806,6 +855,9 @@ type BulkCreateSkipped struct {
 }
 
 func (c *Client) BulkCreate(req []BulkCreateItem) (*BulkCreateResponse, error) {
+	if err := c.readinessWriteError(); err != nil {
+		return nil, err
+	}
 	var resp BulkCreateResponse
 	if err := c.doRequest("POST", "/panel/api/clients/bulkCreate", req, &resp); err != nil {
 		return nil, wrapWriteError(err)

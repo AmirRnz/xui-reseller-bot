@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"xui-reseller-bot/internal/db"
-	"xui-reseller-bot/internal/services/pricing"
 	"xui-reseller-bot/internal/xui"
 )
 
@@ -399,7 +398,6 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 				Reason: fmt.Sprintf("identity verification failed for remote client %s: %v", payload.Email, idErr),
 			}
 		}
-
 		// 2. Check existing subscription in DB
 		existing, checkErr := p.getSubscriptionByEmail(ctx, payload.Email)
 		if checkErr != nil {
@@ -423,6 +421,9 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 		}
 
 		// 3. Adopt client into local DB
+		if !walletRemoteMatches(remote, payload) {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "remote wallet-purchase client does not match the exact durable desired state"}
+		}
 		displayName := payload.DisplayName
 		if displayName == "" {
 			displayName = payload.Email
@@ -468,87 +469,10 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 		}
 
 	case RemoteConfirmedAbsent:
-		// Remote client is confirmed absent!
-		// Check completed debit ledger transaction before refunding; do not assume quote proves debit.
-		debitKey := payload.DebitOperationKey
-		if debitKey == "" {
-			debitKey = payload.OperationKey
+		if phase, _ := rec.ObservedState["phase"].(string); phase == "ready" {
+			return p.startWalletPurchaseProvisioning(ctx, rec, payload)
 		}
-
-		var refundAmount int64
-		var amountProven bool
-
-		if debitKey != "" {
-			tx, txErr := p.getCompletedDebitTransaction(ctx, payload.UserID, debitKey)
-			if txErr != nil {
-				return ProcessOutcome{
-					Kind: OutcomeRetry,
-					Err:  fmt.Errorf("failed to check ledger debit for %s (key %s): %w", payload.Email, debitKey, txErr),
-				}
-			}
-			if tx != nil {
-				refundAmount = tx.Amount
-				if refundAmount < 0 {
-					refundAmount = -refundAmount
-				}
-				amountProven = true
-
-				// If quote was also specified, verify it matches
-				if payload.QuoteID != nil && *payload.QuoteID > 0 {
-					quote, qErr := pricing.GetQuoteByID(ctx, *payload.QuoteID)
-					if qErr == nil && quote != nil {
-						if quote.FinalPriceToman != refundAmount {
-							return ProcessOutcome{
-								Kind:   OutcomeManualReview,
-								Reason: fmt.Sprintf("quote %d price (%d) does not match debited transaction amount (%d) for %s; manual review required", *payload.QuoteID, quote.FinalPriceToman, refundAmount, payload.Email),
-							}
-						}
-					}
-				}
-			}
-		}
-
-		if !amountProven {
-			// No completed debit transaction exists. Do not refund!
-			if payload.Price > 0 {
-				return ProcessOutcome{
-					Kind:   OutcomeManualReview,
-					Reason: fmt.Sprintf("no completed debit transaction found in ledger for %s (debit key: %s, payload price: %d); manual review required", payload.Email, debitKey, payload.Price),
-				}
-			}
-			// Zero price and no debit: safely resolve without refund
-			return ProcessOutcome{
-				Kind:         OutcomeResolved,
-				TargetStatus: db.ReconciliationStatusResolved,
-				Resolution:   fmt.Sprintf("remote client %s absent, zero price and no debit recorded; resolved without refund", payload.Email),
-			}
-		}
-
-		if refundAmount <= 0 {
-			return ProcessOutcome{
-				Kind:   OutcomeManualReview,
-				Reason: fmt.Sprintf("proven amount is non-positive (%d) for remote absent client %s; manual review required", refundAmount, payload.Email),
-			}
-		}
-
-		refundOpKey := payload.RefundOperationKey
-		if refundOpKey == "" {
-			refundOpKey = payload.OperationKey + ":refund"
-		}
-
-		refundErr := p.executeRefund(ctx, payload.UserID, refundAmount, "refund for failed purchase: "+payload.Email, refundOpKey)
-		if refundErr != nil {
-			return ProcessOutcome{
-				Kind: OutcomeRetry,
-				Err:  refundErr, // Must remain retryable!
-			}
-		}
-		return ProcessOutcome{
-			Kind:         OutcomeResolved,
-			TargetStatus: db.ReconciliationStatusResolved,
-			Resolution:   fmt.Sprintf("remote client absent, refunded %d Toman (key: %s)", refundAmount, refundOpKey),
-		}
-
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "wallet purchase create was previously attempted but the remote client is currently absent; financial and panel state require manual verification"}
 	default: // RemotePresenceUnknown
 		// Timeout or network error or nil client! Ambiguous! NEVER delete or refund.
 		return ProcessOutcome{
@@ -556,6 +480,130 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 			Err:  fmt.Errorf("inconclusive remote existence check for %s: %w", payload.Email, err),
 		}
 	}
+}
+
+func (p *Processor) startWalletPurchaseProvisioning(ctx context.Context, rec *db.ReconciliationRecord, payload *PurchaseProvisioningPayload) ProcessOutcome {
+	debitKey := payload.DebitOperationKey
+	if debitKey == "" {
+		debitKey = payload.OperationKey
+	}
+	debit, err := p.getCompletedDebitTransaction(ctx, payload.UserID, debitKey)
+	if err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to verify wallet debit before create: %w", err)}
+	}
+	if debit == nil || debit.Type != "debit" || debit.Status != "completed" {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "wallet provisioning work has no matching completed debit"}
+	}
+	if debitAmount := abs(debit.Amount); debitAmount <= 0 || (payload.Price > 0 && debitAmount != payload.Price) {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "wallet debit amount does not match durable provisioning terms"}
+	}
+	if payload.ExpectedUUID == "" || payload.ExpectedSubID == "" || len(payload.InboundIDs) == 0 || payload.ExpiryTimeMilli == 0 {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "durable wallet provisioning snapshot is missing its identity or desired state"}
+	}
+
+	version, err := db.MarkReconciliationCreateAttempted(ctx, rec.ID, p.WorkerID, rec.Status, rec.Version)
+	if err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to persist create-attempt boundary: %w", err)}
+	}
+	rec.Version = version
+	rec.ObservedState["phase"] = "create_attempted"
+
+	comment := payload.PlanName
+	if comment == "" {
+		comment = payload.DisplayName
+	}
+	write := p.XUI.AddClientResult(xui.AddClientRequest{
+		InboundIDs: append([]int(nil), payload.InboundIDs...),
+		Client: xui.ClientConfig{
+			ID: payload.ExpectedUUID, Email: payload.Email, SubID: payload.ExpectedSubID,
+			Enable: true, ExpiryTime: payload.ExpiryTimeMilli, LimitIP: payload.IPLimit,
+			TotalGB: payload.TotalBytes, Flow: payload.Flow, Group: payload.Group,
+			TgID: payload.TelegramID, Comment: comment,
+		},
+	})
+	if write.Outcome != xui.WriteSucceeded {
+		if write.Outcome == xui.WriteDefinitiveFailure {
+			version, resetErr := db.ResetReconciliationCreateAttempt(ctx, rec.ID, p.WorkerID, rec.Status, rec.Version)
+			if resetErr != nil {
+				return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to reset confirmed no-write attempt: %w", resetErr)}
+			}
+			rec.Version = version
+			rec.ObservedState["phase"] = "ready"
+		}
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("wallet purchase create did not complete: %v", write.Err)}
+	}
+
+	remote, err := p.XUI.GetClientByEmail(payload.Email)
+	if ClassifyRemoteClient(remote, err) != RemoteConfirmedPresent {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("created wallet client could not be verified: %v", err)}
+	}
+	if err := verifyClientIdentity(remote, payload.Email, payload.ExpectedUUID, payload.ExpectedSubID); err != nil {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: fmt.Sprintf("created wallet client identity could not be proven: %v", err)}
+	}
+	if !walletRemoteMatches(remote, payload) {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "created wallet client does not match the durable desired remote state"}
+	}
+
+	planID := payload.PlanID
+	if planID != nil && *planID <= 0 {
+		planID = nil
+	}
+	displayName := payload.DisplayName
+	if displayName == "" {
+		displayName = payload.Email
+	}
+	expiry := payload.ExpiryTimeMilli
+	sub := &db.Subscription{
+		UserID: payload.UserID, PlanID: planID, QuoteID: payload.QuoteID,
+		ClientEmail: payload.Email, ClientUUID: payload.ExpectedUUID, SubID: payload.ExpectedSubID,
+		Status: db.SubscriptionStatusActive, PlanType: db.PlanTypePaid,
+		DisplayName: displayName, IPLimit: payload.IPLimit, ExpireTime: &expiry,
+		IsActive: remote.Enable, StartDate: time.Now().UTC(), TrafficLimitBytes: payload.TotalBytes,
+	}
+	if err := db.CreateSubscription(ctx, sub); err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("verified wallet client exists but local subscription insert failed: %w", err)}
+	}
+	return ProcessOutcome{
+		Kind: OutcomeResolved, TargetStatus: db.ReconciliationStatusResolvedVerified,
+		Resolution: fmt.Sprintf("wallet purchase provisioned as verified subscription %d", sub.ID),
+	}
+}
+
+func walletRemoteMatches(remote *xui.XUIClientInfo, payload *PurchaseProvisioningPayload) bool {
+	comment := payload.PlanName
+	if comment == "" {
+		comment = payload.DisplayName
+	}
+	return remote != nil && remote.Email == payload.Email && remote.UUID == payload.ExpectedUUID && remote.SubID == payload.ExpectedSubID &&
+		remote.Enable && remote.ExpiryTime == payload.ExpiryTimeMilli && remote.LimitIP == payload.IPLimit && remote.TotalGB == payload.TotalBytes &&
+		remote.Flow == payload.Flow && remote.Group == payload.Group && remote.TgID == payload.TelegramID && remote.Comment == comment && sameIDs(remote.InboundIDs, payload.InboundIDs)
+}
+
+func sameIDs(actual, expected []int) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	return allIDsPresent(actual, expected) && allIDsPresent(expected, actual)
+}
+
+func allIDsPresent(actual, expected []int) bool {
+	actualSet := make(map[int]struct{}, len(actual))
+	for _, id := range actual {
+		actualSet[id] = struct{}{}
+	}
+	for _, id := range expected {
+		if _, ok := actualSet[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func abs(amount int64) int64 {
+	if amount < 0 {
+		return -amount
+	}
+	return amount
 }
 
 func (p *Processor) handleDeleteReconciliation(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
@@ -953,6 +1001,22 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 			Reason: fmt.Sprintf("purchase request %d not found in db", payload.PurchaseRequestID),
 		}
 	}
+	reqAction := req.Type
+	if reqAction == "new_subscription" {
+		reqAction = "buy"
+	}
+	if payload.ActionType == "" {
+		payload.ActionType = reqAction
+	}
+	if payload.ActionType == "new_subscription" {
+		payload.ActionType = "buy"
+	}
+	if payload.ActionType != reqAction {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "durable provisioning action does not match the approved purchase request"}
+	}
+	if payload.ActionType != "buy" && payload.ActionType != "extend" && payload.ActionType != "upgrade_ip" {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: fmt.Sprintf("unsupported approved purchase action type %q", payload.ActionType)}
+	}
 	if req.ProvisioningStatus == db.PurchaseProvisioningSucceeded {
 		return ProcessOutcome{
 			Kind:         OutcomeResolved,
@@ -973,6 +1037,16 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 			Reason: fmt.Sprintf("purchase request %d still pending admin approval (status=%q); awaiting decision", payload.PurchaseRequestID, req.Status),
 		}
 	}
+	if req.PriceToman == nil || *req.PriceToman != payload.AmountToman || req.QuoteID != nil && payload.QuoteID != nil && *req.QuoteID != *payload.QuoteID {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "durable provisioning amount or quote does not match the approved purchase request"}
+	}
+	debit, err := p.getCompletedDebitTransaction(ctx, payload.UserID, payload.FinancialOperationKey)
+	if err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to verify direct-payment approval ledger entry: %w", err)}
+	}
+	if debit == nil || debit.Type != "debit" || debit.Status != "completed" || abs(debit.Amount) != payload.AmountToman {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct-payment approval has no matching completed financial audit entry"}
+	}
 
 	if p.XUI == nil {
 		return ProcessOutcome{
@@ -986,6 +1060,9 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 
 	switch presence {
 	case RemoteConfirmedPresent:
+		if payload.ActionType == "extend" || payload.ActionType == "upgrade_ip" {
+			return p.handleDirectSubscriptionUpdate(ctx, payload, req)
+		}
 		// Verify strong identity before adopting!
 		if idErr := verifyClientIdentity(remote, payload.ClientEmail, payload.ExpectedUUID, payload.ExpectedSubID); idErr != nil {
 			return ProcessOutcome{
@@ -993,7 +1070,6 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 				Reason: fmt.Sprintf("direct payment client identity verification failed: %v", idErr),
 			}
 		}
-
 		existing, checkErr := p.getSubscriptionByEmail(ctx, payload.ClientEmail)
 		if checkErr != nil {
 			return ProcessOutcome{
@@ -1008,18 +1084,21 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 					Reason: fmt.Sprintf("commercial identity verification failed for existing direct payment subscription %d: %v", existing.ID, idErr),
 				}
 			}
-		} else {
-			clientUUID := remote.UUID
-			if clientUUID == "" {
-				clientUUID = payload.ExpectedUUID
+			if payload.ActionType == "buy" && !directRemoteMatches(remote, payload) {
+				return ProcessOutcome{Kind: OutcomeManualReview, Reason: "remote direct-payment client does not match the durable approved desired state"}
 			}
+		} else {
+			if !directRemoteMatches(remote, payload) {
+				return ProcessOutcome{Kind: OutcomeManualReview, Reason: "remote direct-payment client does not match the durable approved desired state"}
+			}
+			clientUUID := payload.ExpectedUUID
 			sub := &db.Subscription{
 				UserID:            payload.UserID,
 				PlanID:            payload.PlanID,
 				QuoteID:           payload.QuoteID,
 				ClientEmail:       payload.ClientEmail,
 				ClientUUID:        clientUUID,
-				SubID:             remote.SubID,
+				SubID:             payload.ExpectedSubID,
 				Status:            db.SubscriptionStatusActive,
 				PlanType:          db.PlanTypePaid,
 				DisplayName:       payload.CustomName,
@@ -1053,61 +1132,78 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 		}
 
 	case RemoteConfirmedAbsent:
+		if payload.ActionType != "buy" {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "approved subscription update refers to a remote client that is absent"}
+		}
 		// Client absent remotely. Create client in XUI first.
-		if len(payload.InboundIDs) == 0 {
+		if len(payload.InboundIDs) == 0 || payload.ExpectedUUID == "" || payload.ExpectedSubID == "" || payload.ExpiryTimeMilli == 0 || payload.TotalBytes < 0 {
 			return ProcessOutcome{
 				Kind:   OutcomeManualReview,
-				Reason: "missing required immutable provisioning snapshot",
+				Reason: "missing required immutable provisioning identity or desired state",
 			}
 		}
-		inbounds := payload.InboundIDs
-
-		// Exact first-use lazy expiry value (negative duration in milliseconds)
-		expiryMilli := int64(0)
-		if payload.Months > 0 {
-			expiryMilli = -int64(payload.Months * 30 * 24 * 3600 * 1000)
+		if phase, _ := rec.ObservedState["phase"].(string); phase != "ready" {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "remote client is absent after a previously attempted direct-payment create; automatic duplicate create is blocked"}
 		}
-		totalBytes := int64(payload.DataGB) * 1024 * 1024 * 1024
-
-		newUUID := payload.ExpectedUUID
-		if newUUID == "" {
-			newUUID = generateUUID()
+		version, err := db.MarkReconciliationCreateAttempted(ctx, rec.ID, p.WorkerID, rec.Status, rec.Version)
+		if err != nil {
+			return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to persist direct create-attempt boundary: %w", err)}
 		}
-		newSubID := payload.ExpectedSubID
-		if newSubID == "" {
-			newSubID = generateSubID()
-		}
+		rec.Version = version
+		rec.ObservedState["phase"] = "create_attempted"
 
 		addReq := xui.AddClientRequest{
-			InboundIDs: inbounds,
+			InboundIDs: append([]int(nil), payload.InboundIDs...),
 			Client: xui.ClientConfig{
-				ID:         newUUID,
+				ID:         payload.ExpectedUUID,
 				Email:      payload.ClientEmail,
-				SubID:      newSubID,
+				SubID:      payload.ExpectedSubID,
 				Enable:     true,
-				ExpiryTime: expiryMilli,
+				ExpiryTime: payload.ExpiryTimeMilli,
 				LimitIP:    payload.IPLimit,
-				TotalGB:    totalBytes,
+				TotalGB:    payload.TotalBytes,
 				Flow:       payload.Flow,
+				Group:      payload.Group,
+				TgID:       payload.TelegramID,
+				Comment:    payload.CustomName,
 			},
 		}
 
 		writeRes := p.XUI.AddClientResult(addReq)
 		if writeRes.Outcome != xui.WriteSucceeded {
+			if writeRes.Outcome == xui.WriteDefinitiveFailure {
+				version, resetErr := db.ResetReconciliationCreateAttempt(ctx, rec.ID, p.WorkerID, rec.Status, rec.Version)
+				if resetErr != nil {
+					return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to reset confirmed no-write attempt: %w", resetErr)}
+				}
+				rec.Version = version
+				rec.ObservedState["phase"] = "ready"
+			}
 			return ProcessOutcome{
 				Kind: OutcomeRetry,
 				Err:  fmt.Errorf("failed to add remote client %s: %v", payload.ClientEmail, writeRes.Err),
 			}
 		}
+		verifiedRemote, verifyErr := p.XUI.GetClientByEmail(payload.ClientEmail)
+		if ClassifyRemoteClient(verifiedRemote, verifyErr) != RemoteConfirmedPresent {
+			return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("direct payment client could not be verified after create: %v", verifyErr)}
+		}
+		if identityErr := verifyClientIdentity(verifiedRemote, payload.ClientEmail, payload.ExpectedUUID, payload.ExpectedSubID); identityErr != nil {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: fmt.Sprintf("direct payment create identity could not be proven: %v", identityErr)}
+		}
+		if !directRemoteMatches(verifiedRemote, payload) {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct payment client does not match durable desired state"}
+		}
 
 		// Remote created! Now create subscription in local DB
+		expiryMilli := payload.ExpiryTimeMilli
 		sub := &db.Subscription{
 			UserID:            payload.UserID,
 			PlanID:            payload.PlanID,
 			QuoteID:           payload.QuoteID,
 			ClientEmail:       payload.ClientEmail,
-			ClientUUID:        newUUID,
-			SubID:             newSubID,
+			ClientUUID:        payload.ExpectedUUID,
+			SubID:             payload.ExpectedSubID,
 			Status:            db.SubscriptionStatusActive,
 			PlanType:          db.PlanTypePaid,
 			DisplayName:       payload.CustomName,
@@ -1115,7 +1211,7 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 			ExpireTime:        &expiryMilli,
 			IsActive:          true,
 			StartDate:         time.Now().UTC(),
-			TrafficLimitBytes: totalBytes,
+			TrafficLimitBytes: payload.TotalBytes,
 		}
 		if expiryMilli > 0 {
 			sub.EndDate = time.UnixMilli(expiryMilli)
@@ -1148,6 +1244,13 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 	}
 }
 
+func directRemoteMatches(remote *xui.XUIClientInfo, payload *DirectPaymentProvisioningPayload) bool {
+	return remote != nil && remote.Email == payload.ClientEmail && remote.UUID == payload.ExpectedUUID && remote.SubID == payload.ExpectedSubID &&
+		remote.Enable && remote.ExpiryTime == payload.ExpiryTimeMilli && remote.LimitIP == payload.IPLimit &&
+		remote.TotalGB == payload.TotalBytes && remote.Flow == payload.Flow && remote.Group == payload.Group &&
+		remote.TgID == payload.TelegramID && remote.Comment == payload.CustomName && sameIDs(remote.InboundIDs, payload.InboundIDs)
+}
+
 func (p *Processor) handleSubscriptionRemoteMissing(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
 	payload, err := DecodeSubscriptionRemoteMissing(rec.DesiredState, rec.SubscriptionID, rec.UserID)
 	if err != nil {
@@ -1160,6 +1263,75 @@ func (p *Processor) handleSubscriptionRemoteMissing(ctx context.Context, rec *db
 		Kind:   OutcomeManualReview,
 		Reason: fmt.Sprintf("subscription %d (%s) is absent on 3x-ui panel: manual review required", payload.SubscriptionID, payload.ClientEmail),
 	}
+}
+
+func (p *Processor) handleDirectSubscriptionUpdate(ctx context.Context, payload *DirectPaymentProvisioningPayload, req *db.PurchaseRequest) ProcessOutcome {
+	if req.SubscriptionID == nil || payload.SubscriptionID == nil || *payload.SubscriptionID != *req.SubscriptionID {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct subscription update is missing its durable subscription identity"}
+	}
+	sub, err := db.GetSubscriptionByID(ctx, int(*req.SubscriptionID))
+	if err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to load subscription for direct update: %w", err)}
+	}
+	if sub == nil || sub.UserID != payload.UserID || sub.ClientEmail != payload.ClientEmail {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct subscription update owner or email does not match the local subscription"}
+	}
+	if sub.ClientUUID == "" || sub.SubID == "" || sub.ClientUUID != payload.ExpectedUUID || sub.SubID != payload.ExpectedSubID {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct subscription update identity cannot be proven"}
+	}
+	remote, err := p.XUI.GetClientByEmail(payload.ClientEmail)
+	if ClassifyRemoteClient(remote, err) != RemoteConfirmedPresent {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct subscription update remote client is absent or unknown"}
+	}
+	if err := verifyClientIdentity(remote, payload.ClientEmail, payload.ExpectedUUID, payload.ExpectedSubID); err != nil {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: fmt.Sprintf("direct update remote identity mismatch: %v", err)}
+	}
+
+	desiredIP := sub.IPLimit
+	if payload.ActionType == "upgrade_ip" {
+		if payload.DesiredIPLimit == nil || *payload.DesiredIPLimit <= 0 {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct IP upgrade has no valid durable target limit"}
+		}
+		desiredIP = *payload.DesiredIPLimit
+	}
+	desiredExpiry := payload.ExpiryTimeMilli
+	if payload.ActionType == "upgrade_ip" && desiredExpiry == 0 && sub.ExpireTime != nil {
+		desiredExpiry = *sub.ExpireTime
+	}
+	if desiredExpiry == 0 {
+		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct subscription update has no exact durable expiry value"}
+	}
+
+	if remote.ExpiryTime != desiredExpiry || remote.LimitIP != desiredIP || !remote.Enable {
+		write := p.XUI.UpdateClientResult(payload.ClientEmail, xui.ClientConfig{
+			Email: payload.ClientEmail, Enable: true, ExpiryTime: desiredExpiry,
+			LimitIP: desiredIP, TotalGB: remote.TotalGB, SubID: payload.ExpectedSubID,
+		})
+		if write.Outcome != xui.WriteSucceeded {
+			return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("direct subscription update did not complete: %v", write.Err)}
+		}
+		remote, err = p.XUI.GetClientByEmail(payload.ClientEmail)
+		if ClassifyRemoteClient(remote, err) != RemoteConfirmedPresent {
+			return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("direct subscription update readback failed: %v", err)}
+		}
+		if err := verifyClientIdentity(remote, payload.ClientEmail, payload.ExpectedUUID, payload.ExpectedSubID); err != nil {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: fmt.Sprintf("direct update readback identity mismatch: %v", err)}
+		}
+	}
+	if remote.ExpiryTime != desiredExpiry || remote.LimitIP != desiredIP || !remote.Enable {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: errors.New("direct subscription update readback does not match durable target state")}
+	}
+
+	sub.ExpireTime = &desiredExpiry
+	sub.IPLimit = desiredIP
+	sub.IsActive = true
+	if err := db.UpdateSubscription(ctx, sub); err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("panel update is verified but local subscription update failed: %w", err)}
+	}
+	if err := db.SetPurchaseProvisioningStatus(ctx, payload.PurchaseRequestID, db.PurchaseProvisioningSucceeded); err != nil {
+		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to mark direct subscription update succeeded: %w", err)}
+	}
+	return ProcessOutcome{Kind: OutcomeResolved, TargetStatus: db.ReconciliationStatusResolvedVerified, Resolution: "direct subscription update verified in panel and database"}
 }
 
 func generateUUID() string {

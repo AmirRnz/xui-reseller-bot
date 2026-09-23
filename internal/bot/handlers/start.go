@@ -115,8 +115,6 @@ func HandleText(c telebot.Context) error {
 			return ProcessSettingText(c, "card_number", text)
 		case "awaiting_setting_card_owner":
 			return ProcessSettingText(c, "card_owner", text)
-		case "awaiting_setting_currency_name":
-			return ProcessSettingText(c, "currency_name", text)
 		case "awaiting_setting_min_topup":
 			return ProcessSettingText(c, "min_topup_amount", text)
 		case "awaiting_setting_topup_description":
@@ -143,6 +141,12 @@ func HandleText(c telebot.Context) error {
 			return ProcessServiceName(c, text)
 		case "awaiting_admin_reconcile_close_reason":
 			return ProcessAdminReconcileCloseReason(c, text)
+		case "awaiting_admin_reconcile_waiver_reason":
+			return ProcessAdminReconcileWaiveReason(c, text)
+		case "awaiting_admin_refund_amount":
+			return ProcessAdminRefundAmountText(c, text)
+		case "awaiting_admin_refund_note":
+			return ProcessAdminRefundNoteText(c, text)
 		}
 	}
 

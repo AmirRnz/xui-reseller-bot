@@ -530,10 +530,6 @@ func cleanDB(ctx context.Context, t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to seed card setting: %v", err)
 	}
-	err = db.SetSetting(ctx, "currency_name", "IRR")
-	if err != nil {
-		t.Fatalf("Failed to seed currency setting: %v", err)
-	}
 	err = db.SetSetting(ctx, "test_reset_days", "30")
 	if err != nil {
 		t.Fatalf("Failed to seed reset days setting: %v", err)
@@ -2000,25 +1996,19 @@ func TestE2ESuite(t *testing.T) {
 			_ = env.ExpectResponse(t, 2*time.Second) // saved
 			_ = env.ExpectResponse(t, 2*time.Second) // settings menu
 
-			// Admin set currency
-			env.SendCallback(adminTGID, adminUsername, 999, "\fadmin_set_currency")
-			_ = env.ExpectResponse(t, 2*time.Second)
-			bot.GlobalFSM.SetState(adminTGID, "awaiting_setting_currency_name", nil)
-			env.SendMessage(adminTGID, adminUsername, "USD")
-			_ = env.ExpectResponse(t, 2*time.Second) // saved
-			_ = env.ExpectResponse(t, 2*time.Second) // settings menu
-
 			// User checks wallet top up details
 			env.SendCallback(userTGID, userUsername, 999, "\fbtn_topup")
 			respTopup := env.ExpectResponse(t, 2*time.Second)
 			if !strings.Contains(getStr(respTopup, "text"), "9876-5432-1098-7654") {
 				t.Fatalf("Expected new card number to be displayed in details, got: %+v", respTopup)
 			}
+			if !strings.Contains(getStr(respTopup, "text"), "تومان") {
+				t.Fatalf("Expected fixed Toman currency in top-up details, got: %+v", respTopup)
+			}
 
 			// Verify settings in DB
 			card, _ := db.GetSetting(env.ctx, "card_number")
-			curr, _ := db.GetSetting(env.ctx, "currency_name")
-			if card != "9876-5432-1098-7654" || curr != "USD" {
+			if card != "9876-5432-1098-7654" {
 				t.Fatalf("Settings values not updated properly in DB")
 			}
 		})
@@ -2222,5 +2212,70 @@ func TestE2ESuite(t *testing.T) {
 			_ = env.ExpectResponse(t, 2*time.Second) // text
 			_ = env.ExpectResponse(t, 2*time.Second) // main menu
 		})
+	})
+
+	t.Run("LegacyManualRefundAmountEntryAndDuplicateConfirmation", func(t *testing.T) {
+		resetState()
+		var userID int64
+		if err := db.Pool.QueryRow(env.ctx, `
+			INSERT INTO bot_users (telegram_id, username, status, wallet_balance)
+			VALUES ($1, $2, 'approved', 100) RETURNING id
+		`, userTGID, userUsername).Scan(&userID); err != nil {
+			t.Fatalf("create refund user: %v", err)
+		}
+		req := &db.RefundRequest{
+			UserID: userID, CalculatedAmount: 0, Status: "pending",
+			OperationKey: fmt.Sprintf("e2e_legacy_refund_%d", time.Now().UnixNano()),
+		}
+		if err := db.CreateRefundRequest(env.ctx, req); err != nil {
+			t.Fatalf("create zero-suggestion legacy refund request: %v", err)
+		}
+
+		env.SendCallback(adminTGID, adminUsername, 999, fmt.Sprintf("\fadmin_approve_refund|%d", req.ID))
+		respRequest := env.ExpectResponse(t, 2*time.Second)
+		if !strings.Contains(getStr(respRequest, "text"), "فاقد مبلغ پیشنهادی") {
+			t.Fatalf("legacy refund should require an admin-entered amount: %+v", respRequest)
+		}
+		editAmount := extractCallbackData(respRequest, "\fadmin_refund_edit")
+		if editAmount == "" {
+			t.Fatalf("legacy refund is missing its amount-entry action: %+v", respRequest)
+		}
+		env.SendCallback(adminTGID, adminUsername, 999, editAmount)
+		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "مبلغ تاییدشده") {
+			t.Fatalf("expected admin amount prompt: %+v", resp)
+		}
+		env.SendMessage(adminTGID, adminUsername, "43210")
+		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "یادداشت حسابرسی") {
+			t.Fatalf("expected required audit-note prompt: %+v", resp)
+		}
+		env.SendMessage(adminTGID, adminUsername, "بررسی دستی سرویس قدیمی")
+		respConfirm := env.ExpectResponse(t, 2*time.Second)
+		confirm := extractCallbackData(respConfirm, "\fadmin_refund_confirm")
+		if confirm == "" || !strings.Contains(getStr(respConfirm, "text"), "43,210 تومان") {
+			t.Fatalf("expected explicit amount confirmation: %+v", respConfirm)
+		}
+
+		env.SendCallback(adminTGID, adminUsername, 999, confirm)
+		_ = env.ExpectResponse(t, 2*time.Second) // user wallet-credit notice
+		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "با مبلغ ۴۳٬۲۱۰ تومان") && !strings.Contains(getStr(resp, "text"), "با مبلغ 43,210 تومان") {
+			t.Fatalf("expected admin approval result with the entered amount: %+v", resp)
+		}
+		env.SendCallback(adminTGID, adminUsername, 999, confirm)
+		if resp := env.ExpectResponse(t, 2*time.Second); !strings.Contains(getStr(resp, "text"), "منقضی") {
+			t.Fatalf("duplicate admin callback should be rejected after confirmation: %+v", resp)
+		}
+
+		approved, err := db.GetRefundRequestByID(env.ctx, req.ID)
+		if err != nil || approved == nil || approved.ApprovedAmount == nil || *approved.ApprovedAmount != 43210 || approved.AdminID == nil || *approved.AdminID != adminTGID || approved.ApprovedAt == nil || approved.AuditNote != "بررسی دستی سرویس قدیمی" {
+			t.Fatalf("missing persisted manual-refund approval audit: req=%+v err=%v", approved, err)
+		}
+		user, err := db.GetUserByID(env.ctx, userID)
+		if err != nil || user == nil || user.WalletBalance != 43310 {
+			t.Fatalf("manual refund wallet credit mismatch: user=%+v err=%v", user, err)
+		}
+		var creditCount int
+		if err := db.Pool.QueryRow(env.ctx, `SELECT COUNT(*) FROM transactions WHERE user_id = $1 AND operation_key = $2 AND type = 'credit' AND status = 'completed'`, userID, fmt.Sprintf("refund_approval:%d", req.ID)).Scan(&creditCount); err != nil || creditCount != 1 {
+			t.Fatalf("duplicate admin callback changed the refund ledger: credits=%d err=%v", creditCount, err)
+		}
 	})
 }

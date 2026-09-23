@@ -67,8 +67,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS purchase_requests_operation_key_uq
     ON purchase_requests (operation_key)
     WHERE operation_key IS NOT NULL;
 
-UPDATE purchase_requests SET price_toman = ROUND(price) WHERE price_toman IS NULL AND price IS NOT NULL;
-
 ALTER TABLE subscriptions
     ADD COLUMN IF NOT EXISTS quote_id BIGINT REFERENCES purchase_quotes(id) ON DELETE SET NULL;
 `,
@@ -123,13 +121,6 @@ ALTER TABLE paid_plans
     ADD COLUMN IF NOT EXISTS price_per_gb_toman BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS price_per_extra_month_toman BIGINT NOT NULL DEFAULT 0;
 
-UPDATE paid_plans SET
-    base_price_toman = COALESCE(base_price_toman, ROUND(base_price)::BIGINT, 0),
-    price_per_extra_ip_toman = COALESCE(price_per_extra_ip_toman, ROUND(price_per_extra_ip)::BIGINT, 0),
-    price_per_gb_toman = COALESCE(price_per_gb_toman, ROUND(price_per_gb)::BIGINT, 0),
-    price_per_extra_month_toman = COALESCE(price_per_extra_month_toman, ROUND(price_per_extra_month)::BIGINT, 0)
-WHERE base_price_toman = 0 AND base_price > 0;
-
 CREATE TABLE IF NOT EXISTS payment_intents (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL REFERENCES bot_users(id) ON DELETE CASCADE,
@@ -167,18 +158,109 @@ CREATE TABLE IF NOT EXISTS bulk_credit_operations (
 		Version: 7,
 		Name:    "corrective_integer_toman_pricing_and_topup_idempotency",
 		SQL: `
-UPDATE paid_plans SET
-    base_price_toman = CASE WHEN base_price_toman = 0 AND base_price > 0 THEN ROUND(base_price)::BIGINT ELSE base_price_toman END,
-    price_per_extra_ip_toman = CASE WHEN price_per_extra_ip_toman = 0 AND price_per_extra_ip > 0 THEN ROUND(price_per_extra_ip)::BIGINT ELSE price_per_extra_ip_toman END,
-    price_per_gb_toman = CASE WHEN price_per_gb_toman = 0 AND price_per_gb > 0 THEN ROUND(price_per_gb)::BIGINT ELSE price_per_gb_toman END,
-    price_per_extra_month_toman = CASE WHEN price_per_extra_month_toman = 0 AND price_per_extra_month > 0 THEN ROUND(price_per_extra_month)::BIGINT ELSE price_per_extra_month_toman END
-WHERE (base_price_toman = 0 AND base_price > 0)
-   OR (price_per_extra_ip_toman = 0 AND price_per_extra_ip > 0)
-   OR (price_per_gb_toman = 0 AND price_per_gb > 0)
-   OR (price_per_extra_month_toman = 0 AND price_per_extra_month > 0);
-
 ALTER TABLE topup_requests
     ADD COLUMN IF NOT EXISTS operation_key TEXT UNIQUE;
+`,
+	},
+	{
+		Version: 8,
+		Name:    "legacy_currency_unit_preflight_report",
+		SQL: `
+CREATE TABLE IF NOT EXISTS currency_unit_preflight (
+    id BIGSERIAL PRIMARY KEY,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    currency_name TEXT NOT NULL,
+    paid_plan_values JSONB NOT NULL DEFAULT '[]'::jsonb,
+    wallet_values JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+INSERT INTO currency_unit_preflight (currency_name, paid_plan_values, wallet_values)
+SELECT
+    COALESCE((SELECT value FROM bot_settings WHERE key = 'currency_name'), '<missing>'),
+    COALESCE((SELECT jsonb_agg(jsonb_build_object(
+        'plan_id', id, 'name', name, 'base_price', base_price,
+        'base_price_toman', base_price_toman,
+        'price_per_extra_ip', price_per_extra_ip,
+        'price_per_extra_ip_toman', price_per_extra_ip_toman,
+        'price_per_gb', price_per_gb, 'price_per_gb_toman', price_per_gb_toman,
+        'price_per_extra_month', price_per_extra_month,
+        'price_per_extra_month_toman', price_per_extra_month_toman,
+        'discount_tiers', discount_tiers
+    ) ORDER BY id) FROM (SELECT * FROM paid_plans ORDER BY id LIMIT 20) p), '[]'::jsonb),
+    jsonb_build_object(
+        'user_count', (SELECT COUNT(*) FROM bot_users),
+        'wallet_balance_sum', (SELECT COALESCE(SUM(wallet_balance), 0) FROM bot_users),
+        'wallet_balance_min', (SELECT COALESCE(MIN(wallet_balance), 0) FROM bot_users),
+        'wallet_balance_max', (SELECT COALESCE(MAX(wallet_balance), 0) FROM bot_users),
+        'sample', COALESCE((SELECT jsonb_agg(jsonb_build_object('user_id', id, 'wallet_balance', wallet_balance) ORDER BY id)
+                            FROM (SELECT id, wallet_balance FROM bot_users ORDER BY id LIMIT 20) u), '[]'::jsonb)
+    );
+`,
+	},
+	{
+		Version: 9,
+		Name:    "durable_purchase_snapshots_and_active_payment_intent_invariant",
+		SQL: `
+ALTER TABLE purchase_requests
+    ADD COLUMN IF NOT EXISTS provisioning_snapshot JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+UPDATE payment_intents SET action_type = 'buy' WHERE action_type = 'new_subscription';
+UPDATE purchase_requests SET type = 'buy' WHERE type = 'new_subscription';
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM payment_intents
+        WHERE status = 'awaiting_receipt'
+        GROUP BY user_id HAVING COUNT(*) > 1
+    ) THEN
+        RAISE EXCEPTION 'multiple active payment intents exist for a user; resolve them explicitly before applying migration 9';
+    END IF;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS payment_intents_one_awaiting_receipt_per_user
+    ON payment_intents (user_id)
+    WHERE status = 'awaiting_receipt';
+`,
+	},
+	{
+		Version: 10,
+		Name:    "auditable_reconciliation_manual_actions",
+		SQL: `
+ALTER TABLE reconciliation_records
+    ADD COLUMN IF NOT EXISTS manual_admin_id BIGINT,
+    ADD COLUMN IF NOT EXISTS manual_action_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS manual_action_reason TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS manual_action_amount BIGINT,
+    ADD COLUMN IF NOT EXISTS manual_action_operation_key TEXT NOT NULL DEFAULT '';
+`,
+	},
+	{
+		Version: 11,
+		Name:    "auditable_editable_refund_approval",
+		SQL: `
+ALTER TABLE refund_requests
+    ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS audit_note TEXT NOT NULL DEFAULT '';
+`,
+	},
+	{
+		Version: 12,
+		Name:    "integer_discount_basis_points_from_preflighted_legacy_values",
+		SQL: `
+UPDATE paid_plans p
+SET discount_tiers = (
+    SELECT COALESCE(jsonb_agg(
+        CASE
+            WHEN tier ? 'basis_points' THEN tier
+            WHEN COALESCE(tier->>'percent', '') ~ '^[0-9]+([.][0-9]+)?$'
+                THEN jsonb_set(tier, '{basis_points}', to_jsonb(ROUND((tier->>'percent')::numeric * 100)::BIGINT), TRUE)
+            ELSE tier
+        END ORDER BY ordinal
+    ), '[]'::jsonb)
+    FROM jsonb_array_elements(COALESCE(p.discount_tiers, '[]'::jsonb)) WITH ORDINALITY AS t(tier, ordinal)
+)
+WHERE p.discount_tiers IS NOT NULL;
 `,
 	},
 }

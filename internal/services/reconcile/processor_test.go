@@ -16,7 +16,13 @@ type mockXUI struct {
 	delErr       error
 	updateRes    xui.WriteResult
 	updatedState *xui.ClientConfig
+	addRes       xui.WriteResult
+	addResults   []xui.WriteResult
+	addCalls     int
+	persistAdded bool
 }
+
+func amountPtr(value int64) *int64 { return &value }
 
 func (m *mockXUI) GetClientByEmail(email string) (*xui.XUIClientInfo, error) {
 	if m.err != nil {
@@ -37,7 +43,24 @@ func (m *mockXUI) AddClient(req xui.AddClientRequest) error {
 }
 
 func (m *mockXUI) AddClientResult(req xui.AddClientRequest) xui.WriteResult {
-	return xui.WriteResult{Outcome: xui.WriteSucceeded}
+	m.addCalls++
+	result := m.addRes
+	if len(m.addResults) > 0 {
+		result = m.addResults[0]
+		m.addResults = m.addResults[1:]
+	}
+	if result.Outcome == "" {
+		result = xui.WriteResult{Outcome: xui.WriteSucceeded}
+	}
+	if m.persistAdded && result.Outcome != xui.WriteDefinitiveFailure {
+		m.client = &xui.XUIClientInfo{
+			Email: req.Client.Email, UUID: req.Client.ID, SubID: req.Client.SubID,
+			Enable: req.Client.Enable, ExpiryTime: req.Client.ExpiryTime, LimitIP: req.Client.LimitIP,
+			TotalGB: req.Client.TotalGB, Flow: req.Client.Flow, Group: req.Client.Group,
+			TgID: req.Client.TgID, Comment: req.Client.Comment, InboundIDs: append([]int(nil), req.InboundIDs...),
+		}
+	}
+	return result
 }
 
 func (m *mockXUI) UpdateClientResult(email string, client xui.ClientConfig) xui.WriteResult {
@@ -393,7 +416,7 @@ func TestHandleSubscriptionCancellation_CorruptedLocalState_RoutesToManualReview
 	}
 }
 
-func TestHandlePurchaseReconciliation_RemoteAbsent_Refunds(t *testing.T) {
+func TestHandlePurchaseReconciliation_PreviouslyAttemptedRemoteAbsentRequiresManualReview(t *testing.T) {
 	userID := int64(456)
 	rec := &db.ReconciliationRecord{
 		ID:           2,
@@ -401,10 +424,12 @@ func TestHandlePurchaseReconciliation_RemoteAbsent_Refunds(t *testing.T) {
 		Kind:         KindPurchaseProvisioningUnknown,
 		UserID:       &userID,
 		DesiredState: map[string]any{
-			"email":                "absent@example.com",
-			"price":                60000,
+			"email": "absent@example.com", "expected_uuid": "wallet-uuid", "expected_sub_id": "wallet-sub",
+			"inbound_ids": []int{1}, "expiry_time_milli": int64(-2592000000), "total_bytes": int64(1000),
+			"price": int64(60000), "debit_operation_key": "op_unknown_create", "operation_key": "op_unknown_create",
 			"refund_operation_key": "op_unknown_create:refund",
 		},
+		ObservedState: map[string]any{"phase": "create_attempted"},
 	}
 
 	refunded := false
@@ -432,14 +457,11 @@ func TestHandlePurchaseReconciliation_RemoteAbsent_Refunds(t *testing.T) {
 	}
 
 	outcome := p.handlePurchaseReconciliation(context.Background(), rec)
-	if outcome.Err != nil {
-		t.Fatalf("expected nil err, got %v", outcome.Err)
+	if refunded {
+		t.Fatal("automatic refund is unsafe after an attempted unknown create")
 	}
-	if !refunded {
-		t.Fatal("expected refund for absent remote client")
-	}
-	if outcome.Kind != OutcomeResolved {
-		t.Fatalf("expected resolved outcome, got %v", outcome.Kind)
+	if outcome.Kind != OutcomeManualReview {
+		t.Fatalf("expected manual review for attempted absent client, got %v", outcome.Kind)
 	}
 }
 
@@ -451,8 +473,9 @@ func TestHandlePurchaseReconciliation_Inconclusive_NoRefund(t *testing.T) {
 		Kind:         KindPurchaseProvisioningUnknown,
 		UserID:       &userID,
 		DesiredState: map[string]any{
-			"email": "timeout@example.com",
-			"price": 70000,
+			"email": "timeout@example.com", "expected_uuid": "timeout-uuid", "expected_sub_id": "timeout-sub",
+			"inbound_ids": []int{1}, "expiry_time_milli": int64(-2592000000), "total_bytes": int64(7000),
+			"price": 70000, "operation_key": "op_timeout", "debit_operation_key": "op_timeout",
 		},
 	}
 
@@ -484,9 +507,9 @@ func TestHandlePurchaseReconciliation_MismatchedUUID_MovesToManualReview(t *test
 		Kind:         KindPurchaseProvisioningUnknown,
 		UserID:       &userID,
 		DesiredState: map[string]any{
-			"email":         "mismatch@example.com",
-			"expected_uuid": "expected-uuid-1111",
-			"price":         70000,
+			"email": "mismatch@example.com", "expected_uuid": "expected-uuid-1111", "expected_sub_id": "expected-sub",
+			"inbound_ids": []int{1}, "expiry_time_milli": int64(-2592000000), "total_bytes": int64(7000),
+			"price": 70000, "operation_key": "op_uuid_mismatch", "debit_operation_key": "op_uuid_mismatch",
 		},
 	}
 
@@ -543,20 +566,22 @@ func TestHandleUpdateReconciliation_DivergentState_MovesToManualReview(t *testin
 func TestHandlePurchaseReconciliation_CommercialIdentityChecks(t *testing.T) {
 	quoteID := int64(123)
 	payload := &PurchaseProvisioningPayload{
-		UserID:        1001,
-		Email:         "user@example.com",
-		ExpectedUUID:  "uuid-abc",
-		ExpectedSubID: "sub-xyz",
-		QuoteID:       &quoteID,
-		OperationKey:  "op_ident_check",
+		UserID:          1001,
+		Email:           "user@example.com",
+		ExpectedUUID:    "uuid-abc",
+		ExpectedSubID:   "sub-xyz",
+		QuoteID:         &quoteID,
+		OperationKey:    "op_ident_check",
+		ExpiryTimeMilli: int64(-2592000000),
+		TotalBytes:      int64(1000),
+		InboundIDs:      []int{1},
 	}
 	rec := NewPurchaseProvisioningRecord(payload)
 
 	xuiClient := &mockXUI{
 		client: &xui.XUIClientInfo{
-			Email: "user@example.com",
-			UUID:  "uuid-abc",
-			SubID: "sub-xyz",
+			Email: "user@example.com", UUID: "uuid-abc", SubID: "sub-xyz",
+			ExpiryTime: int64(-2592000000), TotalGB: 1000, InboundIDs: []int{1},
 		},
 	}
 
@@ -674,19 +699,20 @@ func TestHandleDirectPaymentProvisioning_StatusSemanticsAndIdentity(t *testing.T
 	directPayload := &DirectPaymentProvisioningPayload{
 		PurchaseRequestID: 77,
 		UserID:            1001,
-		ClientEmail:       "direct@example.com",
-		ExpectedUUID:      "uuid-direct",
-		ExpectedSubID:     "sub-direct",
-		QuoteID:           &quoteID,
-		OperationKey:      "op_direct_test",
+		ActionType:        "buy", AmountToman: 100, FinancialOperationKey: "purchase-77",
+		ClientEmail:     "direct@example.com",
+		ExpectedUUID:    "uuid-direct",
+		ExpectedSubID:   "sub-direct",
+		QuoteID:         &quoteID,
+		OperationKey:    "op_direct_test",
+		ExpiryTimeMilli: int64(-2592000000), TotalBytes: 1000, InboundIDs: []int{1},
 	}
 	rec := NewDirectPaymentProvisioningRecord(directPayload)
 
 	xuiClient := &mockXUI{
 		client: &xui.XUIClientInfo{
-			Email: "direct@example.com",
-			UUID:  "uuid-direct",
-			SubID: "sub-direct",
+			Email: "direct@example.com", UUID: "uuid-direct", SubID: "sub-direct",
+			ExpiryTime: int64(-2592000000), TotalGB: 1000, LimitIP: 1, InboundIDs: []int{1},
 		},
 	}
 
@@ -695,7 +721,8 @@ func TestHandleDirectPaymentProvisioning_StatusSemanticsAndIdentity(t *testing.T
 			XUI: xuiClient,
 			GetPurchaseRequestByIDFn: func(ctx context.Context, id int64) (*db.PurchaseRequest, error) {
 				return &db.PurchaseRequest{
-					ID:                 id,
+					ID:     id,
+					UserID: 1001, Type: "buy", PriceToman: amountPtr(100), QuoteID: &quoteID,
 					Status:             "pending", // still pending approval!
 					ProvisioningStatus: db.PurchaseProvisioningPending,
 				}, nil
@@ -715,7 +742,8 @@ func TestHandleDirectPaymentProvisioning_StatusSemanticsAndIdentity(t *testing.T
 			XUI: xuiClient,
 			GetPurchaseRequestByIDFn: func(ctx context.Context, id int64) (*db.PurchaseRequest, error) {
 				return &db.PurchaseRequest{
-					ID:                 id,
+					ID:     id,
+					UserID: 1001, Type: "buy", PriceToman: amountPtr(100), QuoteID: &quoteID,
 					Status:             "rejected",
 					ProvisioningStatus: db.PurchaseProvisioningPending,
 				}, nil
@@ -735,10 +763,14 @@ func TestHandleDirectPaymentProvisioning_StatusSemanticsAndIdentity(t *testing.T
 			XUI: xuiClient,
 			GetPurchaseRequestByIDFn: func(ctx context.Context, id int64) (*db.PurchaseRequest, error) {
 				return &db.PurchaseRequest{
-					ID:                 id,
+					ID:     id,
+					UserID: 1001, Type: "buy", PriceToman: amountPtr(100), QuoteID: &quoteID,
 					Status:             "approved",
 					ProvisioningStatus: db.PurchaseProvisioningPending,
 				}, nil
+			},
+			DebitTxFn: func(ctx context.Context, userID int64, operationKey string) (*db.WalletTransaction, error) {
+				return &db.WalletTransaction{UserID: userID, Amount: 100, Type: "debit", Status: "completed", OperationKey: operationKey}, nil
 			},
 			GetSubscriptionByEmailFn: func(ctx context.Context, email string) (*db.Subscription, error) {
 				return &db.Subscription{

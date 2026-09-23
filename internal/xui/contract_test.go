@@ -35,7 +35,7 @@ func TestContract_CheckReadiness(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(&config.XUIConfig{
+	client, err := newReadyClient(&config.XUIConfig{
 		BaseURL:  server.URL,
 		APIToken: "test_token_123",
 	})
@@ -71,7 +71,7 @@ func TestContract_GetInbounds(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestContract_GetClientByEmail(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestContract_AddClient(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestContract_DeleteClient(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL, APIToken: "token"})
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestContract_UpdatePreservesNonBotFields(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(&config.XUIConfig{
+	client, err := newReadyClient(&config.XUIConfig{
 		BaseURL:  server.URL,
 		APIToken: "token",
 	})

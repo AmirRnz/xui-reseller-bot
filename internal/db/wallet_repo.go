@@ -10,6 +10,62 @@ import (
 
 var ErrWalletOperationAlreadyApplied = errors.New("wallet operation already applied")
 
+// DebitWalletBalanceWithReconciliation atomically commits the wallet debit and
+// its durable recovery work item before any remote XUI mutation can begin.
+func DebitWalletBalanceWithReconciliation(ctx context.Context, userID int64, amount int64, description, operationKey string, record *ReconciliationRecord) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	if Pool == nil || record == nil {
+		return errors.New("database and reconciliation work item are required")
+	}
+	if userID <= 0 || amount <= 0 || operationKey == "" || record.OperationKey == "" {
+		return errors.New("valid debit and reconciliation operation keys are required")
+	}
+
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var transactionID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO transactions (user_id, amount, type, status, description, operation_key)
+		VALUES ($1, $2, 'debit', 'completed', $3, $4)
+		ON CONFLICT (operation_key) DO NOTHING
+		RETURNING id
+	`, userID, -amount, description, operationKey).Scan(&transactionID)
+	newDebit := err == nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		var matched bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM transactions WHERE user_id = $1 AND operation_key = $2 AND type = 'debit' AND status = 'completed' AND amount = $3)`, userID, operationKey, -amount).Scan(&matched); err != nil {
+			return err
+		}
+		if !matched {
+			return errors.New("wallet operation key conflicts with a different ledger entry")
+		}
+	} else if err != nil {
+		return err
+	}
+
+	if newDebit {
+		tag, err := tx.Exec(ctx, `
+			UPDATE bot_users SET wallet_balance = wallet_balance - $1, updated_at = NOW()
+			WHERE id = $2 AND wallet_balance >= $1
+		`, amount, userID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return errors.New("insufficient balance")
+		}
+	}
+	if err := createReconciliationRecordTx(ctx, tx, record); err != nil {
+		return fmt.Errorf("failed to persist provisioning work with wallet debit: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
 func CreateWalletTransaction(ctx context.Context, tx *WalletTransaction) error {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()

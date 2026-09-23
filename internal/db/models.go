@@ -1,9 +1,6 @@
 package db
 
-import (
-	"math"
-	"time"
-)
+import "time"
 
 const (
 	UserStatusPending             = "pending"
@@ -83,15 +80,12 @@ type WalletTransaction struct {
 
 type DiscountTier struct {
 	Months      int     `json:"months"`
-	Percent     float64 `json:"percent"`
+	Percent     float64 `json:"percent,omitempty"` // legacy storage compatibility only
 	BasisPoints int64   `json:"basis_points,omitempty"`
 }
 
 func (d DiscountTier) GetBasisPoints() int64 {
-	if d.BasisPoints > 0 {
-		return d.BasisPoints
-	}
-	return int64(math.Round(d.Percent * 100))
+	return d.BasisPoints
 }
 
 type TestPlan struct {
@@ -195,37 +189,40 @@ type Setting struct {
 }
 
 type PurchaseRequest struct {
-	ID                 int64     `json:"id"`
-	UserID             int64     `json:"user_id"`
-	Type               string    `json:"type"` // 'buy', 'extend', 'upgrade_ip'
-	PlanID             *int64    `json:"plan_id"`
-	SubscriptionID     *int64    `json:"subscription_id"`
-	QuoteID            *int64    `json:"quote_id"`
-	PriceToman         *int64    `json:"price_toman"`
-	Price              float64   `json:"price"`
-	Months             int       `json:"months"`
-	IPLimit            int       `json:"ip_limit"`
-	DataGB             int       `json:"data_gb"`
-	CustomName         string    `json:"custom_name"`
-	ClientEmail        string    `json:"client_email"`
-	TelegramFileID     string    `json:"telegram_file_id"`
-	Status             string    `json:"status"` // 'pending', 'approved', 'rejected'
-	ProvisioningStatus string    `json:"provisioning_status"`
-	OperationKey       string    `json:"operation_key"`
-	AdminID            *int64    `json:"admin_id"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                   int64          `json:"id"`
+	UserID               int64          `json:"user_id"`
+	Type                 string         `json:"type"` // 'buy', 'extend', 'upgrade_ip'
+	PlanID               *int64         `json:"plan_id"`
+	SubscriptionID       *int64         `json:"subscription_id"`
+	QuoteID              *int64         `json:"quote_id"`
+	PriceToman           *int64         `json:"price_toman"`
+	Price                float64        `json:"price"`
+	Months               int            `json:"months"`
+	IPLimit              int            `json:"ip_limit"`
+	DataGB               int            `json:"data_gb"`
+	CustomName           string         `json:"custom_name"`
+	ClientEmail          string         `json:"client_email"`
+	TelegramFileID       string         `json:"telegram_file_id"`
+	Status               string         `json:"status"` // 'pending', 'approved', 'rejected'
+	ProvisioningStatus   string         `json:"provisioning_status"`
+	OperationKey         string         `json:"operation_key"`
+	ProvisioningSnapshot map[string]any `json:"provisioning_snapshot,omitempty"`
+	AdminID              *int64         `json:"admin_id"`
+	CreatedAt            time.Time      `json:"created_at"`
+	UpdatedAt            time.Time      `json:"updated_at"`
 }
 
 type RefundRequest struct {
-	ID               int64     `json:"id"`
-	UserID           int64     `json:"user_id"`
-	SubscriptionID   *int64    `json:"subscription_id"`
-	CalculatedAmount int64     `json:"calculated_amount"`
-	ApprovedAmount   *int64    `json:"approved_amount"`
-	Status           string    `json:"status"` // 'pending', 'approved', 'rejected'
-	AdminID          *int64    `json:"admin_id"`
-	OperationKey     string    `json:"operation_key"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               int64      `json:"id"`
+	UserID           int64      `json:"user_id"`
+	SubscriptionID   *int64     `json:"subscription_id"`
+	CalculatedAmount int64      `json:"calculated_amount"`
+	ApprovedAmount   *int64     `json:"approved_amount"`
+	Status           string     `json:"status"` // 'pending', 'approved', 'rejected'
+	AdminID          *int64     `json:"admin_id"`
+	OperationKey     string     `json:"operation_key"`
+	ApprovedAt       *time.Time `json:"approved_at,omitempty"`
+	AuditNote        string     `json:"audit_note,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }

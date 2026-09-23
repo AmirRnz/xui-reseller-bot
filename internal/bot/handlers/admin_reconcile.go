@@ -24,6 +24,8 @@ func RegisterAdminReconcile(b *telebot.Bot, auth telebot.MiddlewareFunc, admin t
 	b.Handle("\fadmin_reconcile_retry", HandleAdminReconcileRetry, auth, admin)
 	b.Handle("\fadmin_reconcile_mark_manual", HandleAdminReconcileMarkManual, auth, admin)
 	b.Handle("\fadmin_reconcile_close", HandleAdminReconcileClosePrompt, auth, admin)
+	b.Handle("\fadmin_reconcile_verify", HandleAdminReconcileVerify, auth, admin)
+	b.Handle("\fadmin_reconcile_waive", HandleAdminReconcileWaivePrompt, auth, admin)
 }
 
 func HandleAdminReconcile(c telebot.Context) error {
@@ -146,15 +148,115 @@ func HandleAdminReconcileDetail(c telebot.Context) error {
 		sb.WriteString(fmt.Sprintf("\n👁 **خلاصه وضعیت مشاهده شده**:\n%s\n", observedSummary))
 	}
 
+	if r.ManualAdminID != nil {
+		sb.WriteString(fmt.Sprintf("▫️ مدیر اقدام‌کننده: `%d`\n", *r.ManualAdminID))
+	}
+	if r.ManualActionAt != nil {
+		sb.WriteString(fmt.Sprintf("▫️ زمان اقدام: `%s`\n", r.ManualActionAt.Format(time.RFC3339)))
+	}
+	if r.ManualActionReason != "" {
+		sb.WriteString(fmt.Sprintf("▫️ توضیح اقدام: %s\n", r.ManualActionReason))
+	}
+	if r.ManualActionAmount != nil {
+		sb.WriteString(fmt.Sprintf("▫️ مبلغ اقدام: %s تومان\n", persian.FormatMoney(*r.ManualActionAmount)))
+	}
+	if r.ManualActionOperationKey != "" {
+		sb.WriteString(fmt.Sprintf("▫️ کلید مالی: `%s`\n", r.ManualActionOperationKey))
+	}
+
 	menu := &telebot.ReplyMarkup{}
-	menu.Inline(
+	rows := []telebot.Row{
 		menu.Row(menu.Data("⚡ تلاش مجدد اکنون", "admin_reconcile_retry", fmt.Sprintf("%d", r.ID))),
 		menu.Row(menu.Data("⚠️ انتقال به بازبینی دستی", "admin_reconcile_mark_manual", fmt.Sprintf("%d", r.ID))),
-		menu.Row(menu.Data("✅ بستن دستی با ذکر دلیل", "admin_reconcile_close", fmt.Sprintf("%d", r.ID))),
-		menu.Row(menu.Data("« بازگشت به لیست", "admin_reconcile_manual")),
-	)
+	}
+	if isFinancialReconcileRecord(r) {
+		if r.Kind == reconcile.KindPendingRefund {
+			rows = append(rows, menu.Row(menu.Data("✅ اثر مالی راستی‌آزمایی شد", "admin_reconcile_verify", fmt.Sprintf("%d", r.ID))))
+		}
+		rows = append(rows, menu.Row(menu.Data("🚫 صرف‌نظر دستی با ثبت دلیل", "admin_reconcile_waive", fmt.Sprintf("%d", r.ID))))
+	} else {
+		rows = append(rows, menu.Row(menu.Data("✅ بستن دستی با ذکر دلیل", "admin_reconcile_close", fmt.Sprintf("%d", r.ID))))
+	}
+	rows = append(rows, menu.Row(menu.Data("« بازگشت به لیست", "admin_reconcile_manual")))
+	menu.Inline(rows...)
 
 	return maybeEditOrSend(c, sb.String(), menu)
+}
+
+func isFinancialReconcileKind(kind string) bool {
+	switch kind {
+	case reconcile.KindPendingRefund, reconcile.KindPurchaseProvisioningUnknown, reconcile.KindPurchaseRemoteCreatedDbFailed, reconcile.KindDirectPaymentProvisioningRetry:
+		return true
+	default:
+		return false
+	}
+}
+
+func isFinancialReconcileRecord(record *db.ReconciliationRecord) bool {
+	if record == nil || isFinancialReconcileKind(record.Kind) {
+		return record != nil
+	}
+	for _, key := range []string{"refund_amount", "amount", "price"} {
+		if value, ok := coerceAnyInt64(record.DesiredState[key]); ok && value > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func HandleAdminReconcileVerify(c telebot.Context) error {
+	id, err := strconv.ParseInt(callbackPayload(c), 10, 64)
+	if err != nil || id <= 0 {
+		return maybeEditOrSend(c, "شناسه رکورد نامعتبر است.")
+	}
+	if err := db.ResolvePendingRefundVerified(context.Background(), id, c.Sender().ID); err != nil {
+		if errors.Is(err, db.ErrNoVerifiedFinancialEffect) {
+			return maybeEditOrSend(c, "اثر مالی متناظر در دفتر کیف پول ثبت نشده است؛ رکورد همچنان باز می‌ماند.")
+		}
+		return maybeEditOrSend(c, "این رکورد از مسیر تطبیق مالی قابل تایید نیست.")
+	}
+	_ = c.Respond(&telebot.CallbackResponse{Text: "اثر مالی با دفتر کیف پول تطبیق داده شد."})
+	return HandleAdminReconcileDetail(c)
+}
+
+func HandleAdminReconcileWaivePrompt(c telebot.Context) error {
+	user := userFromContext(c)
+	if user == nil {
+		return c.Send("کاربر یافت نشد.")
+	}
+	id, err := strconv.ParseInt(callbackPayload(c), 10, 64)
+	if err != nil || id <= 0 {
+		return maybeEditOrSend(c, "شناسه رکورد نامعتبر است.")
+	}
+	bot.FSM.SetState(user.TelegramID, "awaiting_admin_reconcile_waiver_reason", map[string]interface{}{"record_id": id})
+	_ = c.Respond()
+	return maybeEditOrSend(c, fmt.Sprintf("🚫 دلیل صرف‌نظر دستی از تعهد مالی رکورد #%d را بنویسید. مدیر، زمان، مبلغ و کلید عملیات ثبت می‌شوند.\nبرای انصراف /cancel را بفرستید.", id))
+}
+
+func ProcessAdminReconcileWaiveReason(c telebot.Context, text string) error {
+	user := userFromContext(c)
+	if user == nil {
+		return c.Send("کاربر یافت نشد.")
+	}
+	state := bot.FSM.GetState(user.TelegramID)
+	if state == nil || state.Step != "awaiting_admin_reconcile_waiver_reason" {
+		return c.Send("هیچ فرآیند فعالی یافت نشد.")
+	}
+	id, ok := coerceAnyInt64(state.Data["record_id"])
+	if !ok || id <= 0 {
+		bot.FSM.ClearState(user.TelegramID)
+		return c.Send("شناسه رکورد نامعتبر است.")
+	}
+	reason := strings.TrimSpace(text)
+	if reason == "" {
+		return c.Send("برای صرف‌نظر دستی، ثبت دلیل الزامی است.")
+	}
+	if err := db.ManuallyWaiveReconciliationRecord(context.Background(), id, user.TelegramID, reason); err != nil {
+		return c.Send("ثبت صرف‌نظر دستی انجام نشد؛ رکورد در صف رسیدگی باقی ماند.")
+	}
+	bot.FSM.ClearState(user.TelegramID)
+	_ = c.Send(fmt.Sprintf("🚫 رکورد #%d با صرف‌نظر دستی و ثبت اطلاعات حسابرسی نهایی شد.", id))
+	return HandleAdminReconcileManual(c)
 }
 
 func HandleAdminReconcileRetry(c telebot.Context) error {

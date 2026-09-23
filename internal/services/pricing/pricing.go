@@ -64,21 +64,9 @@ func CalculateQuote(p QuoteParams) *PurchaseQuote {
 	extraIPs := ipLimit - p.Plan.BaseIPLimit
 
 	basePrice := p.Plan.BasePriceToman
-	if basePath := int64(math.Round(p.Plan.BasePrice)); basePath > 0 && basePrice == 0 {
-		basePrice = basePath
-	}
 	pricePerExtraIP := p.Plan.PricePerExtraIPToman
-	if pIP := int64(math.Round(p.Plan.PricePerExtraIP)); pIP > 0 && pricePerExtraIP == 0 {
-		pricePerExtraIP = pIP
-	}
 	pricePerGB := p.Plan.PricePerGBToman
-	if pGB := int64(math.Round(p.Plan.PricePerGB)); pGB > 0 && pricePerGB == 0 {
-		pricePerGB = pGB
-	}
 	pricePerExtraMonth := p.Plan.PricePerExtraMonthToman
-	if pEM := int64(math.Round(p.Plan.PricePerExtraMonth)); pEM > 0 && pricePerExtraMonth == 0 {
-		pricePerExtraMonth = pEM
-	}
 
 	var trafficCost int64
 	var extraMonthCost int64

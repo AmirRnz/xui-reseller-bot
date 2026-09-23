@@ -1,79 +1,71 @@
-# Current Architecture — `xui-resell-bot`
+# Current Architecture — `xui-reseller-bot`
 
-Updated 2026-09-22 after final legacy safety freeze, fixing reconciliation CAS & terminal-state protection, durable payment intents, integer pricing, reseller cancellation recovery, 3x-ui readiness gating, and release hardening pass.
+Updated 2026-09-23. This note describes the reseller legacy bot currently in this repository. It does not describe the separate backend, web panel, or international bots.
 
-## Supported 3x-ui pin
+## Runtime authority
 
-**3x-ui panel: `v3.8.5` (stable).** The configured panel reported `currentVersion=3.8.5`, `latestVersion=v3.8.5`, and `updateAvailable=false` from the read-only `GET /panel/api/server/getPanelUpdateInfo` endpoint. The checked-in OpenAPI document describes the API compatibility line as `3.x`. On bot startup, the client verifies panel readiness and version pinning.
+- PostgreSQL is authoritative for reseller/user ownership, orders, payment intents, integer-Toman quotes, wallet transactions, subscriptions, refunds, notifications, and reconciliation work.
+- XUI is remote infrastructure state. A group value does not establish reseller ownership. Email alone is not enough to adopt a paid client; automatic adoption verifies the exact email, pre-persisted UUID, and SubID, then checks the durable desired state.
+- New commerce uses `buy`, `extend`, `upgrade_ip`, and `topup`. New payment intents canonicalize `new_subscription` to `buy`. Historical rows are normalized by migration 9.
+- After a payment intent exists, its action, plan/subscription, quote, amount, duration, limits, display name, email, and provisioning snapshot are authoritative. FSM state only locates the intent for the UI; it does not set receipt terms.
 
-## Persian-Only Presentation Layer
+## Paid provisioning and crash recovery
 
-Both bots are Persian-only (`internal/bot/persian`).
-- Zero English strings in any customer or admin Telegram flows.
-- Strict Persian terminology: `Flow` is translated to `فلو`.
-- Admin Reconciliation UI maps reconciliation kinds (`purchase_provisioning` -> `ایجاد اشتراک خرید`, etc.) and statuses (`pending` -> `در انتظار پردازش`, etc.) to clean Persian labels.
-- Reusable message builders and formatters for prices (`FormatMoney`), IP limits (`FormatIPLimit` with explicit concurrent IP terminology `حداکثر N آی‌پی همزمان`), traffic (`FormatTraffic`), dates, and lifecycle notifications.
-- No multilingual runtime, locale branching, or i18n package.
-- Customer-safe error messages with tracking IDs, zero raw `err.Error()` / `%v` leaks.
+- Wallet buy persists the exact remote identity and desired client fields before the XUI request. The wallet debit and reconciliation work item commit in one transaction.
+- Direct-payment approval writes the financial audit entry and executable reconciliation work item, including the exact UUID/SubID and desired remote state, in one transaction.
+- The worker stores `phase=ready` before any AddClient request and persists `create_attempted` before crossing that boundary. It can retry a confirmed no-write after resetting the phase. An unknown result keeps the attempted phase; if the remote client is absent later, the worker opens manual review instead of issuing a duplicate create.
+- A remote client found after a crash is adopted only after exact identity and desired-state verification. A database insert failure leaves the durable work available for restart recovery.
+- Approval leaves executable pending work in PostgreSQL. A new worker process can finish it without another admin callback.
 
-## Integer Toman Accounting & Pricing Snapshots
+## Money, refunds, and legacy values
 
-- **Currency Unit**: Strictly Persian Toman (`"تومان"`). All prices, debits, credits, and refunds strictly use integer Toman (`int64` / `BIGINT`).
-- **Integer Pricing Fields**: `PaidPlan` models feature `BasePriceToman`, `PricePerExtraIPToman`, `PricePerGBToman`, and `PricePerExtraMonthToman` to eliminate floating-point arithmetic.
-- **Basis Points Discounts**: `DiscountTier` uses `BasisPoints int64` (`10000 = 100%`) for exact integer math.
-- **Quote Snapshots**: Before debiting wallet balances or submitting direct payment requests, an immutable quote snapshot is generated via `pricing.CalculateQuote` and persisted to `pricing_quotes`.
-- **Auditable Lifecycle**: The `quote_id` is linked to `purchase_requests.quote_id` and `subscriptions.quote_id`.
-- **Checkout Integrity**: Purchases charge exact stored `quote.FinalPriceToman` rather than recalculating from live plan catalog. Quote equality verification strictly asserts user and plan identity.
+- New buy, extend, IP upgrade, top-up, and refund paths use integer Toman (`BIGINT`/`int64`) and integer discount basis points. The shared Persian formatter displays amounts with `تومان`.
+- Runtime commerce reads `BasePriceToman`, `PricePerExtraIPToman`, `PricePerGBToman`, `PricePerExtraMonthToman`, and `BasisPoints`. Legacy float fields remain in the model and DB as compatibility mirrors; they are not runtime price fallbacks.
+- Migration 8 records a one-time preflight snapshot of the existing `currency_name`, representative paid-plan pricing/discount values, and wallet balances. It does not convert or relabel historical money. Migration 12 converts legacy percent discounts to basis points after that snapshot.
+- The `currency_name` setting is not read during normal runtime. Historical settings can remain in old databases for audit.
+- A quote-backed cancellation can use its immutable quote. A legacy subscription without quote history creates a zero-suggestion manual refund request; an admin enters a positive amount, records a required audit note, and confirms before the idempotent wallet credit commits. The current plan catalog is never used to reconstruct a legacy historical refund.
 
-## Database Migrations (Version 7)
+## XUI readiness gate
 
-- **Migration 7**: `20260922_07_payment_intent_durable_fields.sql` adds `card_owner`, `created_by`, `pricing_quote_id`, and `metadata` to `payment_intents`.
-- **Payment Intents**: `payment_intents` table tracks durable checkout intents (`card_number`, `card_owner`, `amount_toman`, `intent_type`, `status`, `pricing_quote_id`) before presenting bank/card details, ensuring receipt submission survives bot restarts. Receipt intake fail-closes if no active durable payment intent is present.
-- **Bulk Credit Operations**: `bulk_credit_operations` table tracks atomic bulk credit batches (`operation_key`, `amount_toman`, `recipient_count`, `recipient_user_ids`) with idempotency guards.
-- **Reconciliation CAS & Terminal Protection**: State transition CAS ensures reconciliation records can only transition from active pending/retryable states (`pending`, `pending_refund`, `reconciliation_required`). Updates to terminal records (`resolved`, `resolved_verified`, `superseded`, `failed_terminal`, `manually_closed`, `manual_waiver`) are rejected.
+- Startup checks the supported panel capability/version. The current gate accepts the normalized 3.8.5 version family, matching the pinned panel API contract. A failed check keeps Telegram available while disabling XUI mutations.
+- Add, update/patch, delete, attach, and other correctness-critical writes fail closed when readiness is false and return a definitive no-write result for readiness failures.
+- A periodic readiness check can restore mutation capability after the panel recovers; restart is not required.
+- Write timeouts remain unknown outcomes and are verified through remote reads. They are never treated as successful writes by themselves.
 
-## Safe 3x-ui ClientPatch & Bounded Pagination
+## Reconciliation contracts and terminal actions
 
-- **ClientPatch Semantics**: Targeted updates via `ClientPatch` use pointers to distinguish between zero-value changes (`limitIp=0`, `expiryTime=0`) and unset fields. Unmanaged metadata (`subId`, `flow`, `group`, `tgId`, `comment`, `limitHwid`) is strictly preserved from full remote readback.
-- **Strict Timeout Verification**: On remote timeout during client update, readback verification requires patched fields to match before reporting `WriteSucceeded`. Mismatched readback or missing client returns `WriteUnknown`.
-- **Bounded Pagination**: `FindClientBySubID` uses targeted paged endpoint (`/panel/api/clients/list/paged?search={subId}&pageSize=10&page={page}`) bounded to at most 3 pages (`page=1..3`). Unconstrained `ListClients()` fallback scans have been completely eliminated from user-facing paths.
+`internal/services/reconcile/contracts.go` defines payload decoders and constructors. `Processor.processRecord` handles:
 
-## DB → bot → 3x-ui flow
+| Kind | Processor handler |
+| --- | --- |
+| `pending_refund` | `handlePendingRefund` |
+| `purchase_provisioning_unknown` | `handlePurchaseReconciliation` |
+| `purchase_remote_created_db_failed` | `handlePurchaseReconciliation` |
+| `subscription_update_db_failed` | `handleUpdateReconciliation` |
+| `subscription_delete_unknown` | `handleDeleteReconciliation` |
+| `subscription_cancellation_db_failure` | `handleDeleteReconciliation` |
+| `direct_payment_provisioning_retry` | `handleDirectPaymentProvisioning` |
+| `subscription_remote_missing` | `handleSubscriptionRemoteMissing` |
+| `subscription_claim_adoption` | `handleSubscriptionClaimAdoption` |
 
-1. **Startup**: Loads `config.yaml`, connects to PostgreSQL, runs versioned migrations (`internal/db/migrations.go`), and normalizes configuration.
-2. **XUI Client & Cache**: Creates an API-token 3x-ui client and starts an inbound cache (`internal/xui/cache.go`). Includes comprehensive contract tests for all API endpoints (`GetInbounds`, `AddClient`, `UpdateClient`, `DeleteClient`, `GetClientByEmail`, `CheckReadiness`).
-3. **Background Workers**:
-   - **Scheduler**: Runs periodically, checking expiring subscriptions from PostgreSQL and enqueueing idempotent notifications via transactional outbox. Only advances `last_scheduler_run` upon complete success.
-   - **Outbox Worker**: (`internal/services/outbox/outbox.go`) Polls pending outbox records and delivers Telegram notifications with typed `telebot.FloodError` backoff handling.
-   - **First-Use Sync Worker**: (`internal/services/sync/sync_worker.go`) Checks unactivated subscriptions (`remote.ExpiryTime <= 0`) for first connection without starvation. On remote missing client or activation DB update failure, persists durable reconciliation records.
-   - **Reconciliation Worker**: (`internal/services/reconcile/processor.go`):
-     - Uses typed reconciliation contracts (`internal/services/reconcile/contracts.go`) with strict schema validation.
-     - Classifies remote client state (`ClassifyRemoteClient`).
-     - Performs safe remote adoption (`verifyClientIdentity`).
-     - Performs 3-way desired-vs-observed update comparison.
-     - Resolves records with explicit target terminal statuses (`resolved`, `resolved_verified`, `superseded`).
-     - Executes idempotent wallet refunds (`db.ErrWalletOperationAlreadyApplied`).
-4. **Telebot**: Starts in webhook or long-poll mode with authentication/admin middleware, FSM, and per-user locking.
-5. **PostgreSQL Authority**: Commercial source of truth for users, plans, subscriptions, wallet balances, transactions, purchase requests, quotes, outbox events, payment intents, and reconciliation records. Subscription rows are preserved for historical audit.
-6. **Remote Create Compensation**: If 3x-ui creation succeeds but DB insertion fails, synchronous compensating deletion is attempted. If outcome is ambiguous, a typed reconciliation record is created.
-7. **Direct Payment Provisioning**: When an admin approves a direct payment, payment approval is recorded immediately. If remote provisioning fails, a `direct_payment_provisioning_retry` reconciliation record is created for the worker.
-8. **Cancellation & Refunds**: Cancellation in reseller bot immediately checks for active XUI connection. If remote delete is ambiguous or DB fails, reconciliation records are created (`subscription_cancellation_db_failure` vs `subscription_delete_unknown`). Legacy subscriptions without quotes route to admin manual refund review with `CalculatedAmount = 0` to preserve accounting safety.
-9. **Admin Reconciliation UI**: Telegram admin interface with inspection (`admin_reconcile_detail`), structured state summary (`formatStateSummary`), immediate retry (`admin_reconcile_retry`), manual review flag (`admin_reconcile_mark_manual`), and auditable manual close requiring reason input (`admin_reconcile_close`).
+Unknown kinds move to manual review. CAS/version checks protect worker transitions. `pending_refund` can become verified only after the matching completed ledger credit is found. Generic manual close refuses financial obligations. Explicit `manual_waiver` records admin, timestamp, reason, amount, and operation key, and remains visibly distinct from verified resolution and manual review.
 
-## Baseline test inventory
+Intentional legacy policies: old subscriptions without quote history remain zero-suggestion requests until an admin enters an amount; ambiguous or unprovable remote provisioning goes to manual review; creating a second direct-payment intent is refused while an externally payable receipt intent remains active.
 
-- `go test -count=1 -p 1 -v ./...`:
-  - `internal/bot`: **PASS**
-  - `internal/bot/handlers`: **PASS** (100% pass)
-  - `internal/bot/persian`: **PASS** (100% pass)
-  - `internal/db`: **PASS** (100% pass including concurrency, migration v7, wallet credit idempotency, and payment intents)
-  - `internal/fsm`: **PASS**
-  - `internal/services/outbox`: **PASS** (100% pass)
-  - `internal/services/pricing`: **PASS** (100% pass including integer pricing and basis points)
-  - `internal/services/reconcile`: **PASS** (100% pass including contracts, identity checks, and ProcessOnce integration)
-  - `internal/services/sync`: **PASS** (100% pass)
-  - `internal/xui`: **PASS** (100% pass including contract tests, ClientPatch, and bounded pagination)
-  - `tests/e2e`: **PASS** (100% pass with JSON mock telegram server, Tier 1-4 tests, and Postgres sequence resets)
-- `go vet ./...` — **PASS**, zero diagnostics.
-- `gofmt -l .` — **PASS**, zero unformatted files.
-- `.github/workflows/ci.yml` — Automated CI with PostgreSQL service container running gofmt, go vet, isolated unit/DB/e2e tests with race detection (`go test -v -race -count=1 -p 1 ./...`), and binary compilation.
+## Other workers and presentation
+
+- The scheduler writes idempotent notifications to the transactional outbox; the outbox worker delivers them after restart.
+- The first-use worker preserves first-use expiry semantics and records reconciliation work when remote/local updates diverge.
+- Telegram customer/admin wording is Persian for this pass. Technical logs, protocol/API names, callback keys, enum values, and identifiers remain English. No locale or multicurrency runtime was added.
+
+## Database changes in the Legacy Exit Gate pass
+
+- Migration 8: one-time legacy currency/pricing/wallet preflight report.
+- Migration 9: durable purchase snapshots, historical action canonicalization, and a partial unique active-intent index.
+- Migration 10: audited reconciliation manual-action fields.
+- Migration 11: refund approval amount, admin audit note, and approval timestamp.
+- Migration 12: integer basis-point discount migration from preflighted legacy percentage values.
+
+## Verification record
+
+The former baseline inventory listed passing commands without tying them to a current commit; that inventory was removed. This document makes no pass claim. Use the current commit’s GitHub Actions run and the completion report for verification results. `go test` runs without `TEST_DATABASE_URL` skip DB-backed cases.

@@ -40,10 +40,20 @@ type PaymentIntent struct {
 }
 
 var ErrPaymentIntentNotFound = errors.New("payment intent not found")
+var ErrActivePaymentIntentExists = errors.New("an active payment intent already exists for this user")
 
 func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIntent, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
+
+	if intent.ActionType == "new_subscription" {
+		intent.ActionType = "buy"
+	}
+	switch intent.ActionType {
+	case "buy", "extend", "upgrade_ip", "topup":
+	default:
+		return nil, fmt.Errorf("unsupported payment intent action %q", intent.ActionType)
+	}
 
 	var snapshotBytes []byte
 	if intent.ProvisioningSnapshot != nil {
@@ -60,13 +70,27 @@ func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIn
 		intent.Status = IntentStatusAwaitingReceipt
 	}
 
-	// P1-9: Cancel any prior active intent for this user to prevent ambiguity
+	tx, err := Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	// Serialize checkout creation per user. An existing card intent may already
+	// have been paid externally, so preserve it and reject the newer checkout.
+	var lockedUserID int64
+	if err := tx.QueryRow(ctx, `SELECT id FROM bot_users WHERE id = $1 FOR UPDATE`, intent.UserID).Scan(&lockedUserID); err != nil {
+		return nil, fmt.Errorf("failed to lock payment-intent owner: %w", err)
+	}
 	if intent.Status == IntentStatusAwaitingReceipt {
-		_, _ = Pool.Exec(ctx, `
-			UPDATE payment_intents
-			SET status = $1, updated_at = NOW()
-			WHERE user_id = $2 AND status = $3
-		`, IntentStatusCancelled, intent.UserID, IntentStatusAwaitingReceipt)
+		var existingID int64
+		err := tx.QueryRow(ctx, `SELECT id FROM payment_intents WHERE user_id = $1 AND status = $2 LIMIT 1`, intent.UserID, IntentStatusAwaitingReceipt).Scan(&existingID)
+		if err == nil {
+			return nil, ErrActivePaymentIntentExists
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("failed to check active payment intent: %w", err)
+		}
 	}
 
 	query := `
@@ -79,7 +103,7 @@ func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIn
 		)
 		RETURNING id, created_at, updated_at
 	`
-	err := Pool.QueryRow(ctx, query,
+	err = tx.QueryRow(ctx, query,
 		intent.UserID, intent.IntentToken, intent.ActionType, intent.PlanID, intent.SubscriptionID, intent.QuoteID,
 		intent.AmountToman, intent.Months, intent.IPLimit, intent.DataGB, intent.DisplayName, intent.ClientEmail,
 		snapshotBytes, intent.Status,
@@ -87,6 +111,9 @@ func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIn
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to create payment intent: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit payment intent: %w", err)
 	}
 	return intent, nil
 }
@@ -134,7 +161,9 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 	}
 
 	if len(snapshotBytes) > 0 {
-		_ = json.Unmarshal(snapshotBytes, &intent.ProvisioningSnapshot)
+		if err := json.Unmarshal(snapshotBytes, &intent.ProvisioningSnapshot); err != nil {
+			return nil, fmt.Errorf("invalid durable provisioning snapshot: %w", err)
+		}
 	}
 
 	isTopup := intent.ActionType == "topup"
@@ -159,10 +188,10 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 		} else {
 			var pr PurchaseRequest
 			err := tx.QueryRow(ctx, `
-				SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at
+				SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at, provisioning_snapshot
 				FROM purchase_requests
 				WHERE operation_key = $1
-			`, opKey).Scan(&pr.ID, &pr.UserID, &pr.Type, &pr.PlanID, &pr.SubscriptionID, &pr.QuoteID, &pr.PriceToman, &pr.Price, &pr.Months, &pr.IPLimit, &pr.DataGB, &pr.CustomName, &pr.ClientEmail, &pr.TelegramFileID, &pr.Status, &pr.ProvisioningStatus, &pr.OperationKey, &pr.AdminID, &pr.CreatedAt, &pr.UpdatedAt)
+			`, opKey).Scan(&pr.ID, &pr.UserID, &pr.Type, &pr.PlanID, &pr.SubscriptionID, &pr.QuoteID, &pr.PriceToman, &pr.Price, &pr.Months, &pr.IPLimit, &pr.DataGB, &pr.CustomName, &pr.ClientEmail, &pr.TelegramFileID, &pr.Status, &pr.ProvisioningStatus, &pr.OperationKey, &pr.AdminID, &pr.CreatedAt, &pr.UpdatedAt, &pr.ProvisioningSnapshot)
 			if err == nil {
 				_ = tx.Commit(ctx)
 				return &ReceiptSubmissionResult{PurchaseRequest: &pr, IsDuplicate: true}, nil
@@ -202,61 +231,37 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 		return &ReceiptSubmissionResult{TopupRequest: topup, IsDuplicate: false}, nil
 	}
 
-	// Purchase flow
-	if reqDetails == nil {
-		reqDetails = &PurchaseRequest{}
-	}
-	reqDetails.UserID = userID
-	reqDetails.TelegramFileID = fileID
-	reqDetails.OperationKey = opKey
-	if reqDetails.Status == "" {
-		reqDetails.Status = "pending"
-	}
-	if reqDetails.ProvisioningStatus == "" {
-		reqDetails.ProvisioningStatus = PurchaseProvisioningPending
-	}
-	if intent.PlanID != nil {
-		reqDetails.PlanID = intent.PlanID
-	}
-	if intent.SubscriptionID != nil {
-		reqDetails.SubscriptionID = intent.SubscriptionID
-	}
-	if intent.QuoteID != nil {
-		reqDetails.QuoteID = intent.QuoteID
-	}
-	if reqDetails.PriceToman == nil || *reqDetails.PriceToman == 0 {
-		reqDetails.PriceToman = &intent.AmountToman
-	}
-	if reqDetails.Price == 0 {
-		reqDetails.Price = float64(intent.AmountToman)
-	}
-	if reqDetails.Months == 0 {
-		reqDetails.Months = intent.Months
-	}
-	if reqDetails.IPLimit == 0 {
-		reqDetails.IPLimit = intent.IPLimit
-	}
-	if reqDetails.DataGB == 0 {
-		reqDetails.DataGB = intent.DataGB
-	}
-	if reqDetails.CustomName == "" {
-		reqDetails.CustomName = intent.DisplayName
-	}
-	if reqDetails.ClientEmail == "" {
-		reqDetails.ClientEmail = intent.ClientEmail
-	}
-	if reqDetails.Type == "" {
-		reqDetails.Type = intent.ActionType
+	// The locked intent is the only source of purchase terms. reqDetails exists
+	// solely for UI compatibility and must never override the durable agreement.
+	priceToman := intent.AmountToman
+	request := &PurchaseRequest{
+		UserID:               intent.UserID,
+		Type:                 canonicalPurchaseAction(intent.ActionType),
+		PlanID:               intent.PlanID,
+		SubscriptionID:       intent.SubscriptionID,
+		QuoteID:              intent.QuoteID,
+		PriceToman:           &priceToman,
+		Price:                0, // legacy compatibility column; runtime commerce uses PriceToman only
+		Months:               intent.Months,
+		IPLimit:              intent.IPLimit,
+		DataGB:               intent.DataGB,
+		CustomName:           intent.DisplayName,
+		ClientEmail:          intent.ClientEmail,
+		TelegramFileID:       fileID,
+		Status:               "pending",
+		ProvisioningStatus:   PurchaseProvisioningPending,
+		OperationKey:         opKey,
+		ProvisioningSnapshot: intent.ProvisioningSnapshot,
 	}
 
 	err = tx.QueryRow(ctx, `
 		INSERT INTO purchase_requests (
-			user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, operation_key
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULLIF($16, ''))
+			user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, operation_key, provisioning_snapshot
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULLIF($16, ''), $17::jsonb)
 		ON CONFLICT (operation_key) DO UPDATE SET updated_at = NOW()
 		RETURNING id, created_at, updated_at
-	`, reqDetails.UserID, reqDetails.Type, reqDetails.PlanID, reqDetails.SubscriptionID, reqDetails.QuoteID, reqDetails.PriceToman, reqDetails.Price, reqDetails.Months, reqDetails.IPLimit, reqDetails.DataGB, reqDetails.CustomName, reqDetails.ClientEmail, reqDetails.TelegramFileID, reqDetails.Status, reqDetails.ProvisioningStatus, reqDetails.OperationKey).
-		Scan(&reqDetails.ID, &reqDetails.CreatedAt, &reqDetails.UpdatedAt)
+	`, request.UserID, request.Type, request.PlanID, request.SubscriptionID, request.QuoteID, request.PriceToman, request.Price, request.Months, request.IPLimit, request.DataGB, request.CustomName, request.ClientEmail, request.TelegramFileID, request.Status, request.ProvisioningStatus, request.OperationKey, snapshotBytes).
+		Scan(&request.ID, &request.CreatedAt, &request.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create purchase request: %w", err)
 	}
@@ -269,7 +274,14 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return &ReceiptSubmissionResult{PurchaseRequest: reqDetails, IsDuplicate: false}, nil
+	return &ReceiptSubmissionResult{PurchaseRequest: request, IsDuplicate: false}, nil
+}
+
+func canonicalPurchaseAction(action string) string {
+	if action == "new_subscription" {
+		return "buy"
+	}
+	return action
 }
 
 func GetPaymentIntentByID(ctx context.Context, id int64) (*PaymentIntent, error) {

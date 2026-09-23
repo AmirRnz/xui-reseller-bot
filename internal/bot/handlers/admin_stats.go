@@ -23,11 +23,6 @@ func HandleAdminStats(c telebot.Context) error {
 	testsToday, _ := db.GetTestsCreatedToday(ctx)
 	monthlyRevenue, _ := db.GetMonthlyRevenue(ctx)
 
-	currency, _ := db.GetSetting(ctx, "currency_name")
-	if currency == "" {
-		currency = "تومان"
-	}
-
 	text := fmt.Sprintf(
 		"📊 **آمار و وضعیت ربات**\n\n"+
 			"👥 کل کاربران: %d\n"+

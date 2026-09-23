@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -15,26 +17,31 @@ import (
 // state here allows a worker or operator to repair the operation without
 // issuing a second non-idempotent XUI write.
 type ReconciliationRecord struct {
-	ID                 int64          `json:"id"`
-	OperationKey       string         `json:"operation_key"`
-	Kind               string         `json:"kind"`
-	UserID             *int64         `json:"user_id"`
-	SubscriptionID     *int64         `json:"subscription_id"`
-	PurchaseRequestID  *int64         `json:"purchase_request_id"`
-	DesiredState       map[string]any `json:"desired_state"`
-	ObservedState      map[string]any `json:"observed_state"`
-	Status             string         `json:"status"`
-	ErrorMessage       string         `json:"error_message"`
-	AttemptCount       int            `json:"attempt_count"`
-	NextAttemptAt      time.Time      `json:"next_attempt_at"`
-	LockedAt           *time.Time     `json:"locked_at"`
-	LockedBy           *string        `json:"locked_by"`
-	ResolvedAt         *time.Time     `json:"resolved_at"`
-	Resolution         string         `json:"resolution"`
-	ManualReviewReason string         `json:"manual_review_reason"`
-	Version            int            `json:"version"`
-	CreatedAt          time.Time      `json:"created_at"`
-	UpdatedAt          time.Time      `json:"updated_at"`
+	ID                       int64          `json:"id"`
+	OperationKey             string         `json:"operation_key"`
+	Kind                     string         `json:"kind"`
+	UserID                   *int64         `json:"user_id"`
+	SubscriptionID           *int64         `json:"subscription_id"`
+	PurchaseRequestID        *int64         `json:"purchase_request_id"`
+	DesiredState             map[string]any `json:"desired_state"`
+	ObservedState            map[string]any `json:"observed_state"`
+	Status                   string         `json:"status"`
+	ErrorMessage             string         `json:"error_message"`
+	AttemptCount             int            `json:"attempt_count"`
+	NextAttemptAt            time.Time      `json:"next_attempt_at"`
+	LockedAt                 *time.Time     `json:"locked_at"`
+	LockedBy                 *string        `json:"locked_by"`
+	ResolvedAt               *time.Time     `json:"resolved_at"`
+	Resolution               string         `json:"resolution"`
+	ManualReviewReason       string         `json:"manual_review_reason"`
+	ManualAdminID            *int64         `json:"manual_admin_id,omitempty"`
+	ManualActionAt           *time.Time     `json:"manual_action_at,omitempty"`
+	ManualActionReason       string         `json:"manual_action_reason,omitempty"`
+	ManualActionAmount       *int64         `json:"manual_action_amount,omitempty"`
+	ManualActionOperationKey string         `json:"manual_action_operation_key,omitempty"`
+	Version                  int            `json:"version"`
+	CreatedAt                time.Time      `json:"created_at"`
+	UpdatedAt                time.Time      `json:"updated_at"`
 }
 
 type ReconciliationStats struct {
@@ -102,6 +109,92 @@ func CreateReconciliationRecord(ctx context.Context, record *ReconciliationRecor
 	`, record.OperationKey, record.Kind, record.UserID, record.SubscriptionID, record.PurchaseRequestID, desired, observed, record.Status, record.ErrorMessage).Scan(&record.ID, &record.Status)
 }
 
+func createReconciliationRecordTx(ctx context.Context, tx pgx.Tx, record *ReconciliationRecord) error {
+	desired, err := json.Marshal(record.DesiredState)
+	if err != nil {
+		return err
+	}
+	observed, err := json.Marshal(record.ObservedState)
+	if err != nil {
+		return err
+	}
+	if record.Status == "" {
+		record.Status = ReconciliationStatusPending
+	}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO reconciliation_records
+			(operation_key, kind, user_id, subscription_id, purchase_request_id, desired_state, observed_state, status, error_message, next_attempt_at)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, NOW())
+		ON CONFLICT (operation_key) DO NOTHING
+		RETURNING id
+	`, record.OperationKey, record.Kind, record.UserID, record.SubscriptionID, record.PurchaseRequestID, desired, observed, record.Status, record.ErrorMessage).Scan(&record.ID)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	var existingID int64
+	err = tx.QueryRow(ctx, `
+		SELECT id FROM reconciliation_records
+		WHERE operation_key = $1 AND kind = $2
+		  AND user_id IS NOT DISTINCT FROM $3
+		  AND purchase_request_id IS NOT DISTINCT FROM $4
+		  AND desired_state = $5::jsonb
+	`, record.OperationKey, record.Kind, record.UserID, record.PurchaseRequestID, desired).Scan(&existingID)
+	if err != nil {
+		return fmt.Errorf("reconciliation operation key conflicts with different durable work: %w", err)
+	}
+	record.ID = existingID
+	return nil
+}
+
+// MarkReconciliationCreateAttempted persists the non-idempotent AddClient
+// boundary while the worker owns the record lease. A restarted worker can
+// distinguish a never-issued create from an ambiguous prior attempt.
+func MarkReconciliationCreateAttempted(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int) (int, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	if Pool == nil {
+		return 0, errors.New("database pool is not initialized")
+	}
+	var version int
+	err := Pool.QueryRow(ctx, `
+		UPDATE reconciliation_records
+		SET observed_state = jsonb_set(COALESCE(observed_state, '{}'::jsonb), '{phase}', '"create_attempted"'::jsonb, TRUE),
+		    updated_at = NOW(), version = COALESCE(version, 1) + 1
+		WHERE id = $1 AND locked_by = $2 AND status = $3 AND version = $4
+		RETURNING version
+	`, id, lockedBy, expectedStatus, expectedVersion).Scan(&version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrReconciliationLeaseLost
+	}
+	return version, err
+}
+
+// ResetReconciliationCreateAttempt is safe only after XUI has classified the
+// request as a definitive no-write. Unknown outcomes keep create_attempted.
+func ResetReconciliationCreateAttempt(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int) (int, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	if Pool == nil {
+		return 0, errors.New("database pool is not initialized")
+	}
+	var version int
+	err := Pool.QueryRow(ctx, `
+		UPDATE reconciliation_records
+		SET observed_state = jsonb_set(COALESCE(observed_state, '{}'::jsonb), '{phase}', '"ready"'::jsonb, TRUE),
+		    updated_at = NOW(), version = COALESCE(version, 1) + 1
+		WHERE id = $1 AND locked_by = $2 AND status = $3 AND version = $4
+		  AND observed_state->>'phase' = 'create_attempted'
+		RETURNING version
+	`, id, lockedBy, expectedStatus, expectedVersion).Scan(&version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrReconciliationLeaseLost
+	}
+	return version, err
+}
+
 // ClaimPendingReconciliationRecords claims pending records using FOR UPDATE SKIP LOCKED.
 func ClaimPendingReconciliationRecords(ctx context.Context, lockedBy string, limit int) ([]*ReconciliationRecord, error) {
 	ctx, cancel := dbCtx(ctx)
@@ -163,6 +256,8 @@ var (
 	ErrReconciliationTransitionNotAllowed = errors.New("reconciliation transition not allowed from current state")
 	ErrReconciliationLeaseLost            = errors.New("reconciliation worker lease lost or superseded")
 	ErrReconciliationNotFound             = errors.New("reconciliation record not found")
+	ErrFinancialWaiverRequired            = errors.New("financial reconciliation requires explicit manual waiver")
+	ErrNoVerifiedFinancialEffect          = errors.New("matching financial ledger effect was not found")
 )
 
 const (
@@ -255,20 +350,73 @@ func ManuallyCloseReconciliationRecord(ctx context.Context, id int64, adminID in
 	if Pool == nil {
 		return errors.New("database pool is not initialized")
 	}
+	if adminID <= 0 || strings.TrimSpace(reason) == "" {
+		return errors.New("admin id and reason are required")
+	}
+	if rec, err := GetReconciliationRecordByID(ctx, id); err != nil {
+		return err
+	} else if rec != nil && reconciliationHasFinancialObligation(rec) {
+		return ErrFinancialWaiverRequired
+	}
 	resolution := fmt.Sprintf("manually closed by admin %d: %s", adminID, reason)
 	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'manually_closed', manual_review_reason = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
-		WHERE id = $3
+		SET status = 'manually_closed', manual_review_reason = $1, resolution = $2,
+		    manual_admin_id = $3, manual_action_at = NOW(), manual_action_reason = $1,
+		    resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
+		WHERE id = $4
+		  AND kind NOT IN ('pending_refund', 'purchase_provisioning_unknown', 'purchase_remote_created_db_failed', 'direct_payment_provisioning_retry')
+		  AND COALESCE(NULLIF(desired_state->>'refund_amount', '')::BIGINT, 0) <= 0
+		  AND COALESCE(NULLIF(desired_state->>'amount', '')::BIGINT, 0) <= 0
+		  AND COALESCE(NULLIF(desired_state->>'price', '')::BIGINT, 0) <= 0
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
-	`, reason, resolution, id)
+	`, reason, resolution, adminID, id)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
+		var kind string
+		if err := Pool.QueryRow(ctx, `SELECT kind FROM reconciliation_records WHERE id = $1`, id).Scan(&kind); err == nil {
+			switch kind {
+			case "pending_refund", "purchase_provisioning_unknown", "purchase_remote_created_db_failed", "direct_payment_provisioning_retry":
+				return ErrFinancialWaiverRequired
+			}
+		}
 		return checkReconciliationRecordTransitionFailure(ctx, id, "", "", 0)
 	}
 	return nil
+}
+
+func reconciliationHasFinancialObligation(rec *ReconciliationRecord) bool {
+	if rec == nil {
+		return false
+	}
+	switch rec.Kind {
+	case "pending_refund", "purchase_provisioning_unknown", "purchase_remote_created_db_failed", "direct_payment_provisioning_retry":
+		return true
+	}
+	for _, key := range []string{"refund_amount", "amount", "price"} {
+		if amount, ok := anyInt64(rec.DesiredState[key]); ok && amount > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func anyInt64(value any) (int64, bool) {
+	switch n := value.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func ManuallyWaiveReconciliationRecord(ctx context.Context, id int64, adminID int64, reason string) error {
@@ -278,13 +426,23 @@ func ManuallyWaiveReconciliationRecord(ctx context.Context, id int64, adminID in
 	if Pool == nil {
 		return errors.New("database pool is not initialized")
 	}
+	if adminID <= 0 || strings.TrimSpace(reason) == "" {
+		return errors.New("admin id and waiver reason are required")
+	}
 	resolution := fmt.Sprintf("manually waived by admin %d: %s", adminID, reason)
 	tag, err := Pool.Exec(ctx, `
 		UPDATE reconciliation_records
-		SET status = 'manual_waiver', manual_review_reason = $1, resolution = $2, resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
-		WHERE id = $3
+		SET status = 'manual_waiver', manual_review_reason = $1, resolution = $2,
+		    manual_admin_id = $3, manual_action_at = NOW(), manual_action_reason = $1,
+		    manual_action_amount = COALESCE(NULLIF(desired_state->>'amount', '')::BIGINT,
+		                                    NULLIF(desired_state->>'price', '')::BIGINT,
+		                                    NULLIF(desired_state->>'refund_amount', '')::BIGINT),
+		    manual_action_operation_key = COALESCE(NULLIF(desired_state->>'operation_key', ''),
+		                                           NULLIF(desired_state->>'refund_operation_key', ''), operation_key),
+		    resolved_at = NOW(), locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
+		WHERE id = $4
 		  AND status NOT IN ('resolved_verified', 'resolved', 'superseded', 'failed_terminal', 'manually_closed', 'manual_waiver')
-	`, reason, resolution, id)
+	`, reason, resolution, adminID, id)
 	if err != nil {
 		return err
 	}
@@ -292,6 +450,88 @@ func ManuallyWaiveReconciliationRecord(ctx context.Context, id int64, adminID in
 		return checkReconciliationRecordTransitionFailure(ctx, id, "", "", 0)
 	}
 	return nil
+}
+
+// ResolvePendingRefundVerified allows an admin to mark a refund complete only
+// after the exact idempotent wallet credit is present in the ledger.
+func ResolvePendingRefundVerified(ctx context.Context, id int64, adminID int64) error {
+	if adminID <= 0 {
+		return errors.New("admin id is required")
+	}
+	rec, err := GetReconciliationRecordByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return ErrReconciliationNotFound
+	}
+	if rec.Kind != "pending_refund" {
+		return errors.New("verified financial action is not supported for this reconciliation kind")
+	}
+	userID, amount, opKey, err := pendingRefundIdentity(rec)
+	if err != nil {
+		return err
+	}
+	var exists bool
+	err = Pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM transactions
+			WHERE user_id = $1 AND operation_key = $2 AND type = 'credit'
+			  AND status = 'completed' AND amount = $3
+		)
+	`, userID, opKey, amount).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrNoVerifiedFinancialEffect
+	}
+	resolution := fmt.Sprintf("admin %d verified matching wallet credit in ledger", adminID)
+	tag, err := Pool.Exec(ctx, `
+		UPDATE reconciliation_records
+		SET status = 'resolved_verified', resolution = $1, resolved_at = NOW(),
+		    manual_admin_id = $2, manual_action_at = NOW(), manual_action_reason = 'verified matching wallet credit',
+		    manual_action_amount = $3, manual_action_operation_key = $4,
+		    locked_at = NULL, locked_by = NULL, updated_at = NOW(), version = COALESCE(version, 1) + 1
+		WHERE id = $5 AND kind = 'pending_refund'
+		  AND status IN ('pending', 'pending_refund', 'reconciliation_required', 'retryable', 'manual_review')
+		  AND locked_by IS NULL
+	`, resolution, adminID, amount, opKey, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrReconciliationTransitionNotAllowed
+	}
+	return nil
+}
+
+func pendingRefundIdentity(rec *ReconciliationRecord) (int64, int64, string, error) {
+	toInt64 := func(value any) (int64, bool) {
+		switch n := value.(type) {
+		case int64:
+			return n, true
+		case int:
+			return int64(n), true
+		case float64:
+			return int64(n), true
+		case string:
+			v, err := strconv.ParseInt(strings.TrimSpace(n), 10, 64)
+			return v, err == nil
+		default:
+			return 0, false
+		}
+	}
+	userID, ok := toInt64(rec.DesiredState["user_id"])
+	if !ok && rec.UserID != nil {
+		userID, ok = *rec.UserID, true
+	}
+	amount, amountOK := toInt64(rec.DesiredState["amount"])
+	opKey, _ := rec.DesiredState["operation_key"].(string)
+	if userID <= 0 || !ok || amount <= 0 || !amountOK || strings.TrimSpace(opKey) == "" {
+		return 0, 0, "", errors.New("pending refund payload is missing verified ledger identity")
+	}
+	return userID, amount, opKey, nil
 }
 
 func FailAndScheduleRetry(ctx context.Context, id int64, lockedBy string, expectedStatus string, expectedVersion int, errMessage string, retryAfter time.Duration) error {
@@ -419,7 +659,8 @@ func GetManualReviewReconciliationRecords(ctx context.Context, limit int) ([]*Re
 		SELECT id, operation_key, kind, user_id, subscription_id, purchase_request_id,
 		       desired_state, observed_state, status, error_message, attempt_count,
 		       next_attempt_at, locked_at, locked_by, resolved_at, resolution,
-		       manual_review_reason, created_at, updated_at, COALESCE(version, 1)
+		       manual_review_reason, created_at, updated_at, COALESCE(version, 1),
+	       manual_admin_id, manual_action_at, manual_action_reason, manual_action_amount, manual_action_operation_key
 		FROM reconciliation_records
 		WHERE status = 'manual_review'
 		ORDER BY updated_at DESC
@@ -439,6 +680,7 @@ func GetManualReviewReconciliationRecords(ctx context.Context, limit int) ([]*Re
 			&desiredBytes, &observedBytes, &r.Status, &r.ErrorMessage, &r.AttemptCount,
 			&r.NextAttemptAt, &r.LockedAt, &r.LockedBy, &r.ResolvedAt, &r.Resolution,
 			&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt, &r.Version,
+			&r.ManualAdminID, &r.ManualActionAt, &r.ManualActionReason, &r.ManualActionAmount, &r.ManualActionOperationKey,
 		)
 		if err != nil {
 			return nil, err
@@ -464,7 +706,8 @@ func GetReconciliationRecordByID(ctx context.Context, id int64) (*Reconciliation
 		SELECT id, operation_key, kind, user_id, subscription_id, purchase_request_id,
 		       desired_state, observed_state, status, error_message, attempt_count,
 		       next_attempt_at, locked_at, locked_by, resolved_at, resolution,
-		       manual_review_reason, created_at, updated_at, COALESCE(version, 1)
+		       manual_review_reason, created_at, updated_at, COALESCE(version, 1),
+	       manual_admin_id, manual_action_at, manual_action_reason, manual_action_amount, manual_action_operation_key
 		FROM reconciliation_records
 		WHERE id = $1
 	`, id).Scan(
@@ -472,6 +715,7 @@ func GetReconciliationRecordByID(ctx context.Context, id int64) (*Reconciliation
 		&desiredBytes, &observedBytes, &r.Status, &r.ErrorMessage, &r.AttemptCount,
 		&r.NextAttemptAt, &r.LockedAt, &r.LockedBy, &r.ResolvedAt, &r.Resolution,
 		&r.ManualReviewReason, &r.CreatedAt, &r.UpdatedAt, &r.Version,
+		&r.ManualAdminID, &r.ManualActionAt, &r.ManualActionReason, &r.ManualActionAmount, &r.ManualActionOperationKey,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

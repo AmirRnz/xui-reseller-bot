@@ -47,6 +47,7 @@ func main() {
 	} else {
 		log.Printf("3x-ui readiness check succeeded: version=%s, inbounds=%d", status.Version, status.InboundsCount)
 	}
+	xuiClient.StartReadinessChecks(ctx, 30*time.Second)
 
 	reconcileProcessor := reconcile.NewProcessor("resell_bot_reconciler", xuiClient)
 	reconcileProcessor.Start(ctx, 30*time.Second)

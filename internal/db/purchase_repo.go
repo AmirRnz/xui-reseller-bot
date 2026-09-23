@@ -2,8 +2,10 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -18,13 +20,17 @@ func CreatePurchaseRequest(ctx context.Context, r *PurchaseRequest) error {
 	if r.ProvisioningStatus == "" {
 		r.ProvisioningStatus = PurchaseProvisioningPending
 	}
+	snapshot, err := json.Marshal(r.ProvisioningSnapshot)
+	if err != nil {
+		return fmt.Errorf("failed to serialize provisioning snapshot: %w", err)
+	}
 
 	return Pool.QueryRow(ctx, `
 		INSERT INTO purchase_requests (
-			user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, operation_key
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULLIF($16, ''))
+			user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, operation_key, provisioning_snapshot
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NULLIF($16, ''), $17::jsonb)
 		RETURNING id, created_at, updated_at
-	`, r.UserID, r.Type, r.PlanID, r.SubscriptionID, r.QuoteID, r.PriceToman, r.Price, r.Months, r.IPLimit, r.DataGB, r.CustomName, r.ClientEmail, r.TelegramFileID, r.Status, r.ProvisioningStatus, r.OperationKey).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
+	`, r.UserID, r.Type, r.PlanID, r.SubscriptionID, r.QuoteID, r.PriceToman, r.Price, r.Months, r.IPLimit, r.DataGB, r.CustomName, r.ClientEmail, r.TelegramFileID, r.Status, r.ProvisioningStatus, r.OperationKey, snapshot).Scan(&r.ID, &r.CreatedAt, &r.UpdatedAt)
 }
 
 func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, error) {
@@ -33,10 +39,10 @@ func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, er
 
 	r := &PurchaseRequest{}
 	err := Pool.QueryRow(ctx, `
-		SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at
+		SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at, provisioning_snapshot
 		FROM purchase_requests
 		WHERE id = $1
-	`, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt)
+	`, id).Scan(&r.ID, &r.UserID, &r.Type, &r.PlanID, &r.SubscriptionID, &r.QuoteID, &r.PriceToman, &r.Price, &r.Months, &r.IPLimit, &r.DataGB, &r.CustomName, &r.ClientEmail, &r.TelegramFileID, &r.Status, &r.ProvisioningStatus, &r.OperationKey, &r.AdminID, &r.CreatedAt, &r.UpdatedAt, &r.ProvisioningSnapshot)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -46,9 +52,12 @@ func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, er
 	return r, nil
 }
 
-func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64) (*PurchaseRequest, error) {
+func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64, workItem *ReconciliationRecord) (*PurchaseRequest, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
+	if workItem == nil {
+		return nil, errors.New("approved purchase requires durable provisioning work")
+	}
 
 	tx, err := Pool.Begin(ctx)
 	if err != nil {
@@ -70,15 +79,25 @@ func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purc
 		return nil, err
 	}
 
-	// Add to transactions table
+	// The approval audit row and executable direct-payment recovery record are
+	// committed together. Price is accepted only from the integer-Toman column.
 	operationKey := r.OperationKey
 	if operationKey == "" {
 		operationKey = fmt.Sprintf("purchase_approval:%d", r.ID)
 	}
-	debitAmount := int64(r.Price)
-	if r.PriceToman != nil && *r.PriceToman > 0 {
-		debitAmount = *r.PriceToman
+	if workItem.PurchaseRequestID == nil || *workItem.PurchaseRequestID != r.ID || workItem.UserID == nil || *workItem.UserID != r.UserID {
+		return nil, errors.New("provisioning work item does not match approved purchase")
 	}
+	if r.Type != "buy" && r.Type != "extend" && r.Type != "upgrade_ip" {
+		return nil, fmt.Errorf("unsupported purchase action type %q", r.Type)
+	}
+	if workItem.Kind != "direct_payment_provisioning_retry" {
+		return nil, errors.New("paid purchase approval requires durable direct-payment work")
+	}
+	if r.PriceToman == nil || *r.PriceToman <= 0 {
+		return nil, errors.New("approved purchase is missing an integer-Toman amount")
+	}
+	debitAmount := *r.PriceToman
 	_, err = tx.Exec(ctx, `
 		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id, operation_key)
 		VALUES ($1, $2, 'debit', 'completed', $3, 'purchase_request', $4, $5)
@@ -86,6 +105,9 @@ func ApprovePurchaseRequest(ctx context.Context, id int64, adminID int64) (*Purc
 	`, r.UserID, debitAmount, "direct purchase approved: "+r.Type+" - "+r.ClientEmail, r.ID, operationKey)
 	if err != nil {
 		return nil, err
+	}
+	if err := createReconciliationRecordTx(ctx, tx, workItem); err != nil {
+		return nil, fmt.Errorf("failed to persist provisioning work with direct-payment approval: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -201,10 +223,10 @@ func GetRefundRequestByID(ctx context.Context, id int64) (*RefundRequest, error)
 
 	r := &RefundRequest{}
 	err := Pool.QueryRow(ctx, `
-		SELECT id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
+		SELECT id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), approved_at, audit_note, created_at, updated_at
 		FROM refund_requests
 		WHERE id = $1
-	`, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.CreatedAt, &r.UpdatedAt)
+	`, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.ApprovedAt, &r.AuditNote, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -220,10 +242,10 @@ func GetRefundRequestByOperationKey(ctx context.Context, operationKey string) (*
 
 	r := &RefundRequest{}
 	err := Pool.QueryRow(ctx, `
-		SELECT id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
+		SELECT id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), approved_at, audit_note, created_at, updated_at
 		FROM refund_requests
 		WHERE operation_key = $1
-	`, operationKey).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.CreatedAt, &r.UpdatedAt)
+	`, operationKey).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.ApprovedAt, &r.AuditNote, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -233,15 +255,18 @@ func GetRefundRequestByOperationKey(ctx context.Context, operationKey string) (*
 	return r, nil
 }
 
-func ApproveRefundRequest(ctx context.Context, id int64, adminID int64, approvedAmount int64) (*RefundRequest, error) {
-	return ApproveRefundRequestAndCredit(ctx, id, adminID, approvedAmount)
+func ApproveRefundRequest(ctx context.Context, id int64, adminID int64, approvedAmount int64, auditNote string) (*RefundRequest, error) {
+	return ApproveRefundRequestAndCredit(ctx, id, adminID, approvedAmount, auditNote)
 }
 
 // ApproveRefundRequestAndCredit makes the approval state transition and wallet
 // credit one durable idempotent database operation.
-func ApproveRefundRequestAndCredit(ctx context.Context, id int64, adminID int64, approvedAmount int64) (*RefundRequest, error) {
+func ApproveRefundRequestAndCredit(ctx context.Context, id int64, adminID int64, approvedAmount int64, auditNote string) (*RefundRequest, error) {
 	if approvedAmount <= 0 {
 		return nil, errors.New("approvedAmount must be greater than 0")
+	}
+	if strings.TrimSpace(auditNote) == "" {
+		return nil, errors.New("auditNote is required")
 	}
 
 	ctx, cancel := dbCtx(ctx)
@@ -256,10 +281,10 @@ func ApproveRefundRequestAndCredit(ctx context.Context, id int64, adminID int64,
 	r := &RefundRequest{}
 	err = tx.QueryRow(ctx, `
 		UPDATE refund_requests
-		SET status = 'approved', admin_id = $1, approved_amount = $2, updated_at = NOW()
-		WHERE id = $3 AND status = 'pending'
-		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
-	`, adminID, approvedAmount, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.CreatedAt, &r.UpdatedAt)
+		SET status = 'approved', admin_id = $1, approved_amount = $2, approved_at = NOW(), audit_note = $3, updated_at = NOW()
+		WHERE id = $4 AND status = 'pending'
+		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), approved_at, audit_note, created_at, updated_at
+	`, adminID, approvedAmount, auditNote, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.ApprovedAt, &r.AuditNote, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -267,8 +292,12 @@ func ApproveRefundRequestAndCredit(ctx context.Context, id int64, adminID int64,
 		return nil, err
 	}
 
-	if _, err := tx.Exec(ctx, `UPDATE bot_users SET wallet_balance = wallet_balance + $1, updated_at = NOW() WHERE id = $2`, approvedAmount, r.UserID); err != nil {
+	walletUpdate, err := tx.Exec(ctx, `UPDATE bot_users SET wallet_balance = wallet_balance + $1, updated_at = NOW() WHERE id = $2`, approvedAmount, r.UserID)
+	if err != nil {
 		return nil, err
+	}
+	if walletUpdate.RowsAffected() != 1 {
+		return nil, errors.New("refund recipient wallet was not found")
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO transactions (user_id, amount, type, status, description, reference_type, reference_id, operation_key)
@@ -293,8 +322,8 @@ func RejectRefundRequest(ctx context.Context, id int64, adminID int64) (*RefundR
 		UPDATE refund_requests
 		SET status = 'rejected', admin_id = $1, updated_at = NOW()
 		WHERE id = $2 AND status = 'pending'
-		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), created_at, updated_at
-	`, adminID, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.CreatedAt, &r.UpdatedAt)
+		RETURNING id, user_id, subscription_id, calculated_amount, approved_amount, status, admin_id, COALESCE(operation_key, ''), approved_at, audit_note, created_at, updated_at
+	`, adminID, id).Scan(&r.ID, &r.UserID, &r.SubscriptionID, &r.CalculatedAmount, &r.ApprovedAmount, &r.Status, &r.AdminID, &r.OperationKey, &r.ApprovedAt, &r.AuditNote, &r.CreatedAt, &r.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil

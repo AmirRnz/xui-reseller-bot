@@ -30,6 +30,9 @@ func RegisterWallet(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.M
 	b.Handle("\fadmin_reject_topup", HandleAdminRejectTopup, auth, admin)
 	b.Handle("\fadmin_approve_purchase", HandleAdminApprovePurchase, auth, admin)
 	b.Handle("\fadmin_reject_purchase", HandleAdminRejectPurchase, auth, admin)
+	b.Handle("\fadmin_refund_accept", HandleAdminRefundAcceptSuggested, auth, admin)
+	b.Handle("\fadmin_refund_edit", HandleAdminRefundEditAmount, auth, admin)
+	b.Handle("\fadmin_refund_confirm", HandleAdminRefundConfirm, auth, admin)
 	b.Handle("\fadmin_approve_refund", HandleAdminApproveRefund, auth, admin)
 	b.Handle("\fadmin_reject_refund", HandleAdminRejectRefund, auth, admin)
 	b.Handle(telebot.OnPhoto, HandleReceiptPhoto, auth)
@@ -44,10 +47,6 @@ func HandleWalletFlow(c telebot.Context) error {
 		return c.Send("برای دسترسی به این بخش، ابتدا باید حساب نمایندگی شما تایید شود.")
 	}
 
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "تومان"
-	}
 	menu := &telebot.ReplyMarkup{}
 	row := []telebot.Row{menu.Row(menu.Data("📥 شارژ کیف پول", "btn_topup"))}
 	if isConfiguredAdmin(c.Sender().ID) {
@@ -55,7 +54,7 @@ func HandleWalletFlow(c telebot.Context) error {
 	}
 	rows := append(row, menu.Row(menu.Data("« بازگشت", "menu_main")))
 	menu.Inline(rows...)
-	return maybeEditOrSend(c, fmt.Sprintf("👛 **موجودی کیف پول شما:** %d %s", user.WalletBalance, currency), menu)
+	return maybeEditOrSend(c, fmt.Sprintf("👛 **موجودی کیف پول شما:** %s تومان", persian.FormatMoney(user.WalletBalance)), menu)
 }
 
 func HandleTopupInstructions(c telebot.Context) error {
@@ -88,7 +87,7 @@ func HandleTopupInstructions(c telebot.Context) error {
 		"operation_token": createdIntent.IntentToken,
 	})
 
-	text := "لطفا پس از واریز مبلغ مورد نظر، تصویر رسید پرداخت (فیش واریزی) خود را در قالب عکس ارسال کنید."
+	text := "لطفا پس از واریز مبلغ مورد نظر به تومان، تصویر رسید پرداخت (فیش واریزی) خود را در قالب عکس ارسال کنید."
 	if card != "" {
 		text += "\n\nشماره کارت جهت واریز:\n`" + card + "`"
 	}
@@ -96,7 +95,7 @@ func HandleTopupInstructions(c telebot.Context) error {
 		text += "\nنام صاحب کارت: **" + owner + "**"
 	}
 	if minAmount != "" && minAmount != "0" {
-		text += "\nحداقل مبلغ شارژ مجاز: " + minAmount
+		text += "\nحداقل مبلغ شارژ مجاز: " + formatTomanSetting(minAmount) + " تومان"
 	}
 	if desc != "" {
 		text += "\n\n" + desc
@@ -134,7 +133,7 @@ func HandleReceiptPhoto(c telebot.Context) error {
 				iID, _ = strconv.ParseInt(v, 10, 64)
 			}
 			if iID > 0 {
-				if in, err := db.GetPaymentIntentByID(context.Background(), iID); err == nil && in != nil && in.UserID == user.ID {
+				if in, err := db.GetPaymentIntentByID(context.Background(), iID); err == nil && in != nil && in.UserID == user.ID && in.Status == db.IntentStatusAwaitingReceipt {
 					activeIntent = in
 				}
 			}
@@ -176,77 +175,9 @@ func HandleReceiptPhoto(c telebot.Context) error {
 		return showMainMenu(c, user)
 	}
 
-	// Purchase flow
-	pType := activeIntent.ActionType
-	if state != nil && state.Data != nil {
-		if tVal, ok := state.Data["type"]; ok && tVal != nil && fmt.Sprintf("%v", tVal) != "" {
-			pType = fmt.Sprintf("%v", tVal)
-		}
-	}
-	priceToman := activeIntent.AmountToman
-	var planIDPtr *int64 = activeIntent.PlanID
-	var subIDPtr *int64 = activeIntent.SubscriptionID
-	var quoteIDPtr *int64 = activeIntent.QuoteID
-	months := activeIntent.Months
-	ipLimit := activeIntent.IPLimit
-	dataGB := activeIntent.DataGB
-	customName := activeIntent.DisplayName
-	email := activeIntent.ClientEmail
-
-	if state != nil && state.Data != nil {
-		if pidStr, ok := state.Data["plan_id"]; ok && pidStr != "" && planIDPtr == nil {
-			if pid, err := parseInt64(fmt.Sprintf("%v", pidStr)); err == nil {
-				planIDPtr = &pid
-			}
-		}
-		if sidStr, ok := state.Data["subscription_id"]; ok && sidStr != "" && subIDPtr == nil {
-			if sid, err := parseInt64(fmt.Sprintf("%v", sidStr)); err == nil {
-				subIDPtr = &sid
-			}
-		}
-		if qIDStr, ok := state.Data["quote_id"]; ok && qIDStr != "" && quoteIDPtr == nil {
-			if qID, err := strconv.ParseInt(fmt.Sprintf("%v", qIDStr), 10, 64); err == nil && qID > 0 {
-				quoteIDPtr = &qID
-			}
-		}
-		if ptStr, ok := state.Data["price_toman"]; ok && ptStr != "" {
-			if pt, err := strconv.ParseInt(fmt.Sprintf("%v", ptStr), 10, 64); err == nil && pt > 0 {
-				priceToman = pt
-			}
-		}
-		if mStr, ok := state.Data["months"]; ok && mStr != "" && months == 0 {
-			months, _ = strconv.Atoi(fmt.Sprintf("%v", mStr))
-		}
-		if ipStr, ok := state.Data["ip_limit"]; ok && ipStr != "" && ipLimit == 0 {
-			ipLimit, _ = strconv.Atoi(fmt.Sprintf("%v", ipStr))
-		}
-		if gbStr, ok := state.Data["data_gb"]; ok && gbStr != "" && dataGB == 0 {
-			dataGB, _ = strconv.Atoi(fmt.Sprintf("%v", gbStr))
-		}
-		if cn, ok := state.Data["custom_name"]; ok && customName == "" {
-			customName = fmt.Sprintf("%v", cn)
-		}
-		if em, ok := state.Data["email"]; ok && email == "" {
-			email = fmt.Sprintf("%v", em)
-		}
-	}
-
-	purchaseDetails := &db.PurchaseRequest{
-		UserID:         user.ID,
-		Type:           pType,
-		PlanID:         planIDPtr,
-		SubscriptionID: subIDPtr,
-		Price:          float64(priceToman),
-		PriceToman:     &priceToman,
-		QuoteID:        quoteIDPtr,
-		Months:         months,
-		IPLimit:        ipLimit,
-		DataGB:         dataGB,
-		CustomName:     customName,
-		ClientEmail:    email,
-		TelegramFileID: fileID,
-		Status:         "pending",
-	}
+	// Only the receipt attachment and authenticated user are incoming facts.
+	// PaymentIntent is the durable source for all commercial and provisioning data.
+	purchaseDetails := &db.PurchaseRequest{TelegramFileID: fileID}
 
 	res, err := db.SubmitReceiptForActiveIntent(context.Background(), activeIntent.ID, user.ID, fileID, purchaseDetails)
 	if err != nil {
@@ -261,6 +192,15 @@ func HandleReceiptPhoto(c telebot.Context) error {
 	}
 
 	req := res.PurchaseRequest
+	pType := req.Type
+	priceToman := purchaseAmountToman(req)
+	customName := snapshotString(req.ProvisioningSnapshot, "plan_name")
+	if customName == "" {
+		customName = req.CustomName
+	}
+	email := req.ClientEmail
+	months, ipLimit, dataGB := req.Months, req.IPLimit, req.DataGB
+	subIDPtr := req.SubscriptionID
 	if walletAdminCfg != nil {
 		for _, adminID := range walletAdminCfg.AdminIDs {
 			menu := &telebot.ReplyMarkup{}
@@ -271,7 +211,7 @@ func HandleReceiptPhoto(c telebot.Context) error {
 
 			var details string
 			switch pType {
-			case "buy", "new_subscription":
+			case "buy":
 				details = fmt.Sprintf("خرید سرویس جدید\nطرح: %s\nایمیل: %s\nمدت: %d ماه\nکاربر همزمان: %d\nحجم: %d گیگابایت", customName, email, months, ipLimit, dataGB)
 			case "extend":
 				subDisplay := int64(0)
@@ -412,114 +352,125 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 		return c.Send("درخواست خرید یافت نشد یا قبلا پردازش شده است.")
 	}
 
+	if req.Type != "buy" && req.Type != "extend" && req.Type != "upgrade_ip" {
+		return c.Send(fmt.Sprintf("نوع درخواست خرید پشتیبانی نمی‌شود: %s. درخواست تایید نشد.", req.Type))
+	}
 	user, err := db.GetUserByID(context.Background(), req.UserID)
 	if err != nil || user == nil {
 		return c.Send("کاربر یافت نشد.")
 	}
-
-	adminUser := userFromContext(c)
-	req, err = db.ApprovePurchaseRequest(context.Background(), reqID, adminUser.TelegramID)
-	if err != nil || req == nil {
-		return c.Send("خطا در تایید درخواست خرید.")
+	amount := int64(0)
+	if req.PriceToman != nil {
+		amount = *req.PriceToman
 	}
-
-	var activationErr error
-	var plan *db.PaidPlan
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "تومان"
+	financialKey := req.OperationKey
+	if financialKey == "" {
+		financialKey = fmt.Sprintf("purchase_approval:%d", req.ID)
 	}
-
-	switch req.Type {
-	case "buy":
-		var err error
-		plan, err = db.GetPaidPlanByID(context.Background(), *req.PlanID)
-		if err != nil || plan == nil {
-			activationErr = fmt.Errorf("طرح خرید یافت نشد")
-			break
-		}
-		activationErr = createSubscriptionFromApprovedRequest(user, plan, req)
-
-	case "extend":
-		sub, err := db.GetSubscriptionByID(context.Background(), int(*req.SubscriptionID))
-		if err != nil || sub == nil {
-			activationErr = fmt.Errorf("اشتراک یافت نشد")
-			break
-		}
-		activationErr = extendSubscriptionFromApprovedRequest(user, sub, req)
-
-	case "upgrade_ip":
-		sub, err := db.GetSubscriptionByID(context.Background(), int(*req.SubscriptionID))
-		if err != nil || sub == nil {
-			activationErr = fmt.Errorf("اشتراک یافت نشد")
-			break
-		}
-		activationErr = upgradeSubscriptionIPFromApprovedRequest(user, sub, req)
+	payload := &reconcile.DirectPaymentProvisioningPayload{
+		PurchaseRequestID: req.ID, UserID: user.ID, ActionType: req.Type, QuoteID: req.QuoteID,
+		AmountToman: amount, FinancialOperationKey: financialKey,
+		OperationKey: fmt.Sprintf("direct_payment:%d:provisioning", req.ID),
+		ClientEmail:  req.ClientEmail, SubscriptionID: req.SubscriptionID,
+		Months: req.Months, IPLimit: req.IPLimit, DataGB: req.DataGB, CustomName: req.CustomName,
 	}
-
-	if activationErr != nil {
-		log.Printf("[CRITICAL] Activation failed for purchase request #%d: %v", reqID, activationErr)
-		provisioningStatus := db.PurchaseProvisioningFailed
-		if xui.IsUnknownOutcome(activationErr) {
-			provisioningStatus = db.PurchaseProvisioningRetryable
+	if payload.ActionType == "buy" {
+		if req.PlanID != nil {
+			planID := int(*req.PlanID)
+			payload.PlanID = &planID
 		}
-		if statusErr := db.SetPurchaseProvisioningStatus(context.Background(), reqID, provisioningStatus); statusErr != nil {
-			log.Printf("[CRITICAL] failed to persist provisioning status for purchase request #%d: %v", reqID, statusErr)
+		payload.ExpectedUUID = snapshotString(req.ProvisioningSnapshot, "client_uuid")
+		payload.ExpectedSubID = snapshotString(req.ProvisioningSnapshot, "sub_id")
+		payload.InboundIDs = snapshotIntSlice(req.ProvisioningSnapshot["inbound_ids"])
+		payload.Flow = snapshotString(req.ProvisioningSnapshot, "flow")
+		payload.Group = snapshotString(req.ProvisioningSnapshot, "group")
+		payload.TelegramID = snapshotInt64(req.ProvisioningSnapshot, "telegram_id")
+		payload.ExpiryTimeMilli = snapshotInt64(req.ProvisioningSnapshot, "expiry_time_milli")
+		payload.TotalBytes = snapshotInt64(req.ProvisioningSnapshot, "total_bytes")
+		if payload.ExpectedUUID == "" || payload.ExpectedSubID == "" || len(payload.InboundIDs) == 0 || payload.ExpiryTimeMilli == 0 || payload.TotalBytes < 0 {
+			return c.Send("اطلاعات هویتی و وضعیت سرویس در درخواست پرداخت ذخیره نشده است؛ درخواست تایید نشد و نیازمند بررسی دستی است.")
 		}
-		if provisioningStatus == db.PurchaseProvisioningRetryable {
-			var expectedUUID, expectedSubID, expectedFlow string
-			var inboundIDs []int
-			var unknownCreate *paidSubscriptionCreateUnknownError
-			if errors.As(activationErr, &unknownCreate) && unknownCreate.Request.Client.ID != "" {
-				expectedUUID = unknownCreate.Request.Client.ID
-				expectedSubID = unknownCreate.Request.Client.SubID
-				expectedFlow = unknownCreate.Request.Client.Flow
-				inboundIDs = unknownCreate.Request.InboundIDs
-			}
-			if len(inboundIDs) == 0 && plan != nil {
-				inboundIDs = validInboundIDs(plan.InboundIDs)
-			}
-			var planID *int
-			if req.PlanID != nil {
-				id := int(*req.PlanID)
-				planID = &id
-			}
-			payload := &reconcile.DirectPaymentProvisioningPayload{
-				PurchaseRequestID: reqID,
-				UserID:            user.ID,
-				QuoteID:           req.QuoteID,
-				OperationKey:      fmt.Sprintf("direct_payment:%d:provisioning", reqID),
-				ClientEmail:       req.ClientEmail,
-				ExpectedUUID:      expectedUUID,
-				ExpectedSubID:     expectedSubID,
-				PlanID:            planID,
-				InboundIDs:        inboundIDs,
-				Months:            req.Months,
-				IPLimit:           req.IPLimit,
-				DataGB:            req.DataGB,
-				CustomName:        req.CustomName,
-				Flow:              expectedFlow,
-			}
-			record := reconcile.NewDirectPaymentProvisioningRecord(payload)
-			record.ObservedState = map[string]any{
-				"outcome": "activation_failed",
-				"error":   activationErr.Error(),
-			}
-			record.ErrorMessage = activationErr.Error()
-			if recErr := db.CreateReconciliationRecord(context.Background(), record); recErr != nil {
-				log.Printf("[CRITICAL] failed to persist provisioning reconciliation for purchase request #%d: %v", reqID, recErr)
-			}
-			return c.Send("پرداخت شما تایید شده است اما نتیجه فعال‌سازی سرویس در پنل نامشخص است؛ مبلغ و تایید پرداخت حفظ شد و وضعیت برای تلاش مجدد خودکار ثبت گردید.")
+	} else {
+		if req.SubscriptionID == nil {
+			return c.Send("شناسه اشتراک در درخواست موجود نیست؛ درخواست تایید نشد.")
 		}
-		return c.Send("پرداخت شما تایید شده است اما فعال‌سازی سرویس انجام نشد؛ تایید پرداخت و تراکنش مالی حفظ شد و وضعیت خطا ثبت گردید.")
+		sub, subErr := db.GetSubscriptionByID(context.Background(), int(*req.SubscriptionID))
+		if subErr != nil || sub == nil || sub.UserID != req.UserID || sub.ClientEmail != req.ClientEmail || sub.ClientUUID == "" || sub.SubID == "" {
+			return c.Send("هویت اشتراک درخواستی قابل تایید نیست؛ درخواست تایید نشد.")
+		}
+		payload.ExpectedUUID, payload.ExpectedSubID = sub.ClientUUID, sub.SubID
+		if sub.ExpireTime != nil {
+			payload.ExpiryTimeMilli = *sub.ExpireTime
+		}
+		if payload.ActionType == "extend" {
+			if payload.ExpiryTimeMilli < 0 {
+				payload.ExpiryTimeMilli -= int64(req.Months) * 30 * 24 * 3600 * 1000
+			} else {
+				end := sub.EndDate
+				if end.Before(nowUTC()) {
+					end = nowUTC()
+				}
+				payload.ExpiryTimeMilli = end.Add(time.Duration(req.Months) * 30 * 24 * time.Hour).UnixMilli()
+			}
+		} else if payload.ActionType == "upgrade_ip" {
+			desiredLimit := req.IPLimit
+			payload.DesiredIPLimit = &desiredLimit
+		}
 	}
-	if err := db.SetPurchaseProvisioningStatus(context.Background(), reqID, db.PurchaseProvisioningSucceeded); err != nil {
-		log.Printf("[CRITICAL] purchase request #%d activated but provisioning status update failed: %v", reqID, err)
-		return c.Send("پرداخت تایید و سرویس فعال شد، اما ثبت وضعیت فعال‌سازی در دیتابیس نیازمند تطبیق است.")
+	workItem := reconcile.NewDirectPaymentProvisioningRecord(payload)
+	approved, err := db.ApprovePurchaseRequest(context.Background(), reqID, c.Sender().ID, workItem)
+	if err != nil || approved == nil {
+		return c.Send("خطا در ثبت تایید و کار فعال‌سازی درخواست خرید.")
 	}
+	if bot.XUIClient != nil {
+		processor := reconcile.NewProcessor("direct_approval", bot.XUIClient)
+		_, _ = processor.ProcessOnce(context.Background())
+	}
+	refreshed, _ := db.GetPurchaseRequestByID(context.Background(), reqID)
+	if refreshed != nil && refreshed.ProvisioningStatus == db.PurchaseProvisioningSucceeded {
+		_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID)})
+		return c.Edit(fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID))
+	}
+	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("تایید درخواست خرید #%d ثبت شد؛ فعال‌سازی ادامه می‌یابد.", reqID)})
+	return c.Edit(fmt.Sprintf("✅ درخواست خرید #%d تایید شد و برای فعال‌سازی امن ثبت گردید.", reqID))
+}
 
-	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID)})
-	return c.Edit(fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID))
+func snapshotString(snapshot map[string]any, key string) string {
+	value := snapshot[key]
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", value))
+}
+
+func snapshotInt64(snapshot map[string]any, key string) int64 {
+	value := snapshot[key]
+	parsed, _ := strconv.ParseInt(strings.TrimSpace(fmt.Sprintf("%v", value)), 10, 64)
+	return parsed
+}
+
+func snapshotIntSlice(value any) []int {
+	switch values := value.(type) {
+	case []int:
+		return append([]int(nil), values...)
+	case []int64:
+		out := make([]int, 0, len(values))
+		for _, value := range values {
+			out = append(out, int(value))
+		}
+		return out
+	case []any:
+		out := make([]int, 0, len(values))
+		for _, value := range values {
+			parsed, err := strconv.Atoi(strings.TrimSpace(fmt.Sprintf("%v", value)))
+			if err == nil {
+				out = append(out, parsed)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func HandleAdminRejectPurchase(c telebot.Context) error {
@@ -552,12 +503,19 @@ func HandleAdminRejectPurchase(c telebot.Context) error {
 		case "claim":
 			actionLabel = "ثبت اشتراک قدیمی"
 		}
-		msg := fmt.Sprintf("❌ درخواست پرداخت مستقیم شما برای **%s** به مبلغ %.0f توسط ادمین رد شد. لطفا رسید واریزی خود را بررسی کنید یا با پشتیبانی در ارتباط باشید.", actionLabel, req.Price)
+		msg := fmt.Sprintf("❌ درخواست پرداخت مستقیم شما برای **%s** به مبلغ %s تومان توسط ادمین رد شد. لطفا رسید واریزی خود را بررسی کنید یا با پشتیبانی در ارتباط باشید.", actionLabel, persian.FormatMoney(purchaseAmountToman(req)))
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
 	}
 
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("❌ درخواست خرید #%d رد شد.", reqID)})
 	return c.Edit(fmt.Sprintf("❌ درخواست خرید #%d رد شد.", reqID))
+}
+
+func purchaseAmountToman(req *db.PurchaseRequest) int64 {
+	if req == nil || req.PriceToman == nil {
+		return 0
+	}
+	return *req.PriceToman
 }
 
 func HandleAdminApproveRefund(c telebot.Context) error {
@@ -569,31 +527,131 @@ func HandleAdminApproveRefund(c telebot.Context) error {
 		return c.Send("درخواست نامعتبر.")
 	}
 
-	unlock := bot.Locker.Lock(fmt.Sprintf("refund_req:%d", reqID))
-	defer unlock()
-
 	req, err := db.GetRefundRequestByID(context.Background(), reqID)
 	if err != nil || req == nil || req.Status != "pending" {
 		return c.Send("درخواست استرداد یافت نشد یا قبلا پردازش شده است.")
 	}
+	menu := &telebot.ReplyMarkup{}
+	if req.CalculatedAmount > 0 {
+		menu.Inline(menu.Row(
+			menu.Data(fmt.Sprintf("تایید مبلغ پیشنهادی %s تومان", persian.FormatMoney(req.CalculatedAmount)), "admin_refund_accept", fmt.Sprintf("%d", reqID)),
+			menu.Data("ویرایش مبلغ", "admin_refund_edit", fmt.Sprintf("%d", reqID)),
+		))
+		return c.Edit(fmt.Sprintf("مبلغ پیشنهادی استرداد #%d: %s تومان\n\nمبلغ را تایید کنید یا ویرایش کنید.", reqID, persian.FormatMoney(req.CalculatedAmount)), menu)
+	}
+	menu.Inline(menu.Row(menu.Data("وارد کردن مبلغ استرداد", "admin_refund_edit", fmt.Sprintf("%d", reqID))))
+	return c.Edit(fmt.Sprintf("درخواست استرداد #%d فاقد مبلغ پیشنهادی است. برای درخواست قدیمی، مبلغ را به تومان وارد کنید.", reqID), menu)
+}
 
-	adminUser := userFromContext(c)
-	req, err = db.ApproveRefundRequestAndCredit(context.Background(), reqID, adminUser.TelegramID, req.CalculatedAmount)
-	if err != nil || req == nil {
+func HandleAdminRefundAcceptSuggested(c telebot.Context) error {
+	if !isConfiguredAdmin(c.Sender().ID) {
+		return c.Send("شما دسترسی لازم برای این کار را ندارید.")
+	}
+	reqID, err := parseInt64(callbackPayload(c))
+	if err != nil || reqID <= 0 {
+		return c.Send("درخواست نامعتبر.")
+	}
+	req, err := db.GetRefundRequestByID(context.Background(), reqID)
+	if err != nil || req == nil || req.Status != "pending" || req.CalculatedAmount <= 0 {
+		return c.Send("برای این درخواست مبلغ پیشنهادی قابل تاییدی وجود ندارد.")
+	}
+	return completeRefundApproval(c, reqID, req.CalculatedAmount, "ادمین مبلغ پیشنهادی محاسبه‌شده را تایید کرد.")
+}
+
+func HandleAdminRefundEditAmount(c telebot.Context) error {
+	if !isConfiguredAdmin(c.Sender().ID) {
+		return c.Send("شما دسترسی لازم برای این کار را ندارید.")
+	}
+	reqID, err := parseInt64(callbackPayload(c))
+	if err != nil || reqID <= 0 {
+		return c.Send("درخواست نامعتبر.")
+	}
+	req, err := db.GetRefundRequestByID(context.Background(), reqID)
+	if err != nil || req == nil || req.Status != "pending" {
+		return c.Send("درخواست استرداد یافت نشد یا قبلا پردازش شده است.")
+	}
+	bot.FSM.SetState(c.Sender().ID, "awaiting_admin_refund_amount", map[string]interface{}{"request_id": reqID})
+	return c.Send("مبلغ تاییدشده استرداد را به تومان و به صورت عدد صحیح وارد کنید:")
+}
+
+func ProcessAdminRefundAmountText(c telebot.Context, amountText string) error {
+	admin := userFromContext(c)
+	state := bot.FSM.GetState(c.Sender().ID)
+	if admin == nil || !isConfiguredAdmin(admin.TelegramID) || state == nil || state.Step != "awaiting_admin_refund_amount" {
+		return c.Send("درخواست ورود مبلغ استرداد فعال نیست.")
+	}
+	amount, err := parseInt64(amountText)
+	if err != nil || amount <= 0 {
+		return c.Send("مبلغ باید عدد صحیح مثبت به تومان باشد. دوباره وارد کنید:")
+	}
+	reqID, _ := parseInt64(fmt.Sprintf("%v", state.Data["request_id"]))
+	req, err := db.GetRefundRequestByID(context.Background(), reqID)
+	if err != nil || req == nil || req.Status != "pending" {
+		bot.FSM.ClearState(admin.TelegramID)
+		return c.Send("درخواست استرداد یافت نشد یا قبلا پردازش شده است.")
+	}
+	bot.FSM.SetState(admin.TelegramID, "awaiting_admin_refund_note", map[string]interface{}{"request_id": reqID, "amount": amount})
+	return c.Send("برای ثبت دلیل تایید مبلغ، یادداشت حسابرسی را وارد کنید:")
+}
+
+func ProcessAdminRefundNoteText(c telebot.Context, note string) error {
+	admin := userFromContext(c)
+	state := bot.FSM.GetState(c.Sender().ID)
+	if admin == nil || !isConfiguredAdmin(admin.TelegramID) || state == nil || state.Step != "awaiting_admin_refund_note" {
+		return c.Send("درخواست یادداشت استرداد فعال نیست.")
+	}
+	note = strings.TrimSpace(note)
+	if note == "" || len(note) > 500 {
+		return c.Send("یادداشت باید بین ۱ تا ۵۰۰ نویسه باشد:")
+	}
+	reqID, _ := parseInt64(fmt.Sprintf("%v", state.Data["request_id"]))
+	amount, _ := parseInt64(fmt.Sprintf("%v", state.Data["amount"]))
+	bot.FSM.SetState(admin.TelegramID, "awaiting_admin_refund_confirm", map[string]interface{}{"request_id": reqID, "amount": amount, "audit_note": note})
+	menu := &telebot.ReplyMarkup{}
+	menu.Inline(menu.Row(menu.Data("تایید و واریز به کیف پول", "admin_refund_confirm", fmt.Sprintf("%d", reqID))))
+	return c.Send(fmt.Sprintf("تایید نهایی استرداد #%d\nمبلغ: %s تومان\nیادداشت: %s", reqID, persian.FormatMoney(amount), note), menu)
+}
+
+func HandleAdminRefundConfirm(c telebot.Context) error {
+	if !isConfiguredAdmin(c.Sender().ID) {
+		return c.Send("شما دسترسی لازم برای این کار را ندارید.")
+	}
+	reqID, err := parseInt64(callbackPayload(c))
+	if err != nil || reqID <= 0 {
+		return c.Send("درخواست نامعتبر.")
+	}
+	state := bot.FSM.GetState(c.Sender().ID)
+	if state == nil || state.Step != "awaiting_admin_refund_confirm" {
+		return c.Send("مرحله تایید استرداد منقضی شده است.")
+	}
+	stateReqID, _ := parseInt64(fmt.Sprintf("%v", state.Data["request_id"]))
+	amount, _ := parseInt64(fmt.Sprintf("%v", state.Data["amount"]))
+	note := fmt.Sprintf("%v", state.Data["audit_note"])
+	if stateReqID != reqID || amount <= 0 || strings.TrimSpace(note) == "" {
+		return c.Send("اطلاعات تایید استرداد معتبر نیست.")
+	}
+	err = completeRefundApproval(c, reqID, amount, note)
+	if err == nil {
+		bot.FSM.ClearState(c.Sender().ID)
+	}
+	return err
+}
+
+func completeRefundApproval(c telebot.Context, reqID, amount int64, note string) error {
+	unlock := bot.Locker.Lock(fmt.Sprintf("refund_req:%d", reqID))
+	defer unlock()
+	req, err := db.ApproveRefundRequestAndCredit(context.Background(), reqID, c.Sender().ID, amount, note)
+	if err != nil {
 		return c.Send("خطا در تایید استرداد.")
 	}
-
-	user, _ := db.GetUserByID(context.Background(), req.UserID)
-	if user != nil {
-		currency, _ := db.GetSetting(context.Background(), "currency_name")
-		if currency == "" {
-			currency = "تومان"
-		}
-		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ مبلغ %d %s بابت لغو سرویس به کیف پول شما اضافه شد.", req.CalculatedAmount, currency))
+	if req == nil {
+		return c.Send("درخواست استرداد قبلا پردازش شده یا یافت نشد.")
 	}
-
+	if user, _ := db.GetUserByID(context.Background(), req.UserID); user != nil {
+		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ مبلغ %s تومان بابت لغو سرویس به کیف پول شما اضافه شد.", persian.FormatMoney(amount)))
+	}
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ درخواست استرداد #%d تایید شد.", reqID)})
-	return c.Edit(fmt.Sprintf("✅ درخواست استرداد #%d تایید شد و مبلغ مربوطه به کیف پول کاربر واریز گردید.", reqID))
+	return c.Edit(fmt.Sprintf("✅ درخواست استرداد #%d با مبلغ %s تومان تایید و به کیف پول واریز شد.", reqID, persian.FormatMoney(amount)))
 }
 
 func HandleAdminRejectRefund(c telebot.Context) error {
@@ -623,188 +681,6 @@ func HandleAdminRejectRefund(c telebot.Context) error {
 
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("❌ درخواست استرداد #%d رد شد.", reqID)})
 	return c.Edit(fmt.Sprintf("❌ درخواست استرداد #%d رد شد.", reqID))
-}
-
-func createSubscriptionFromApprovedRequest(user *db.User, plan *db.PaidPlan, req *db.PurchaseRequest) error {
-	if bot.XUIClient == nil {
-		return fmt.Errorf("x-ui client is not initialized")
-	}
-	inboundIDs := validInboundIDs(plan.InboundIDs)
-	flow := plan.Flow
-	planName := plan.Name
-	if intent, err := db.GetPaymentIntentByClientEmail(context.Background(), req.ClientEmail); err == nil && intent != nil && intent.ProvisioningSnapshot != nil {
-		if snapshotInbounds, ok := intent.ProvisioningSnapshot["inbound_ids"]; ok && snapshotInbounds != nil {
-			var ids []int
-			switch v := snapshotInbounds.(type) {
-			case []int:
-				ids = v
-			case []any:
-				for _, item := range v {
-					if idF, ok := item.(float64); ok {
-						ids = append(ids, int(idF))
-					} else if idI, ok := item.(int); ok {
-						ids = append(ids, idI)
-					}
-				}
-			}
-			if len(ids) > 0 {
-				inboundIDs = validInboundIDs(ids)
-			}
-		}
-		if snapFlow, ok := intent.ProvisioningSnapshot["flow"].(string); ok && snapFlow != "" {
-			flow = snapFlow
-		}
-		if snapName, ok := intent.ProvisioningSnapshot["plan_name"].(string); ok && snapName != "" {
-			planName = snapName
-		}
-	}
-
-	if len(inboundIDs) == 0 {
-		return fmt.Errorf("این طرح هیچ کانکشن معتبری ندارد")
-	}
-
-	expireMilli := -int64(req.Months * 30 * 24 * 3600 * 1000)
-	totalBytes := int64(req.DataGB) * 1073741824
-	subID := makeSubID()
-	clientUUID := makeClientUUID()
-	client := prepareClientConfig(req.ClientEmail, serviceGroup(user), user.TelegramID, totalBytes, expireMilli, req.IPLimit, flow, subID, clientUUID, planName, user)
-
-	err := bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: inboundIDs})
-	if err != nil && !xui.IsUnknownOutcome(err) {
-		log.Printf("XUI AddClient failed: %v. Refreshing cache and retrying...", err)
-		if bot.XUIClient.Cache != nil {
-			bot.XUIClient.Cache.RefreshSync()
-			newInboundIDs := validInboundIDs(plan.InboundIDs)
-			if !intSlicesEqual(newInboundIDs, inboundIDs) {
-				if len(newInboundIDs) == 0 {
-					return fmt.Errorf("این طرح پس از بروزرسانی هیچ کانکشن معتبری ندارد")
-				}
-				err = bot.XUIClient.AddClient(xui.AddClientRequest{Client: client, InboundIDs: newInboundIDs})
-			}
-		}
-	}
-	if err != nil {
-		if xui.IsUnknownOutcome(err) {
-			return &paidSubscriptionCreateUnknownError{cause: err, Request: xui.AddClientRequest{Client: client, InboundIDs: inboundIDs}}
-		}
-		return err
-	}
-
-	planID := int(plan.ID)
-	sub := &db.Subscription{
-		UserID:            user.ID,
-		PlanID:            &planID,
-		QuoteID:           req.QuoteID,
-		ClientEmail:       req.ClientEmail,
-		ClientUUID:        clientUUID,
-		SubID:             subID,
-		Status:            "active",
-		PlanType:          db.PlanTypePaid,
-		DisplayName:       req.CustomName,
-		IPLimit:           req.IPLimit,
-		ExpireTime:        &expireMilli,
-		IsActive:          true,
-		StartDate:         nowUTC(),
-		EndDate:           time.Time{},
-		TrafficLimitBytes: totalBytes,
-	}
-	if err := db.CreateSubscription(context.Background(), sub); err != nil {
-		log.Printf("[CRITICAL] Database save failed for subscription %s: %v. Initiating safe compensation...", req.ClientEmail, err)
-		deleteErr := bot.XUIClient.DeleteClient(req.ClientEmail)
-		resolution, resErr := resolveDeleteOutcome(deleteErr, func() (*xui.XUIClientInfo, error) {
-			return bot.XUIClient.GetClientByEmail(req.ClientEmail)
-		})
-		reqID64 := req.ID
-		desired := map[string]any{
-			"email":               req.ClientEmail,
-			"client_id":           clientUUID,
-			"client_uuid":         clientUUID,
-			"sub_id":              subID,
-			"inbound_ids":         inboundIDs,
-			"expiry_time":         expireMilli,
-			"ip_limit":            req.IPLimit,
-			"total_gb":            client.TotalGB,
-			"plan_id":             plan.ID,
-			"user_id":             user.ID,
-			"purchase_request_id": req.ID,
-			"db_error":            err.Error(),
-		}
-		observed := map[string]any{"remote_created": true}
-		if deleteErr != nil {
-			observed["delete_error"] = deleteErr.Error()
-		}
-		if resErr != nil {
-			observed["resolution_error"] = resErr.Error()
-		}
-
-		if resolution == deleteConfirmed {
-			observed["remote_deleted"] = true
-			if recErr := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
-				OperationKey:      fmt.Sprintf("purchase_request_comp:%d", req.ID),
-				Kind:              "purchase_request_db_failed_compensated",
-				UserID:            &user.ID,
-				PurchaseRequestID: &reqID64,
-				DesiredState:      desired,
-				ObservedState:     observed,
-				Status:            "compensated",
-				ErrorMessage:      fmt.Sprintf("DB save failed: %v; remote client deleted", err),
-			}); recErr != nil {
-				log.Printf("[CRITICAL] failed to persist purchase request compensation record for #%d: %v", req.ID, recErr)
-			}
-			return fmt.Errorf("failed to save subscription in database (remote client cancelled): %w", err)
-		}
-
-		observed["remote_deleted"] = false
-		if resolution == deleteStillPresent {
-			observed["client_present"] = true
-		}
-		if recErr := db.CreateReconciliationRecord(context.Background(), &db.ReconciliationRecord{
-			OperationKey:      fmt.Sprintf("purchase_request_comp:%d", req.ID),
-			Kind:              "purchase_request_db_failed_reconciliation",
-			UserID:            &user.ID,
-			PurchaseRequestID: &reqID64,
-			DesiredState:      desired,
-			ObservedState:     observed,
-			Status:            "reconciliation_required",
-			ErrorMessage:      fmt.Sprintf("DB save failed: %v; remote delete outcome: %s", err, resolution),
-		}); recErr != nil {
-			log.Printf("[CRITICAL] failed to persist purchase request reconciliation record for #%d: %v", req.ID, recErr)
-		}
-		return &xui.WriteError{Outcome: xui.WriteUnknown, Err: fmt.Errorf("DB save failed (%v) and remote client deletion is %s", err, resolution)}
-	}
-
-	links, err := bot.XUIClient.GetSubscriptionLinks(subID)
-	var subLink string
-	if err == nil {
-		for _, l := range links {
-			if strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://") {
-				subLink = l
-				break
-			}
-		}
-	}
-	if subLink == "" {
-		subLink = bot.XUIClient.SubscriptionURLFor(subID)
-	}
-
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "تومان"
-	}
-	var dataLabel = "نامحدود"
-	if plan.IsLimited {
-		dataLabel = fmt.Sprintf("%d گیگابایت", req.DataGB)
-	}
-
-	detailsMsg := fmt.Sprintf("✅ پرداخت شما تایید و اشتراک با موفقیت فعال شد!\n📦 طرح: %s\n⏱️ مدت زمان: %d ماهه (پس از اولین اتصال شروع می‌شود)\n📊 سقف ترافیک: %s\n💰 هزینه پرداخت شده: %.0f %s",
-		plan.Name, req.Months, dataLabel, req.Price, currency)
-
-	if plan.UsageDescription != "" {
-		detailsMsg += fmt.Sprintf("\n\nنکات استفاده:\n%s", plan.UsageDescription)
-	}
-
-	_ = sendSubscriptionResultTo(user.TelegramID, subLink, detailsMsg)
-	return nil
 }
 
 func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, req *db.PurchaseRequest) error {
@@ -860,13 +736,8 @@ func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, 
 		return fmt.Errorf("خطا در ذخیره‌سازی دیتابیس: %w", err)
 	}
 
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "تومان"
-	}
-
-	msg := fmt.Sprintf("✅ پرداخت شما تایید و اشتراک **%s** به مدت %d ماه تمدید شد.\nتاریخ انقضای جدید: %s\nمبلغ پرداخت شده: %.0f %s.",
-		sub.DisplayName, req.Months, newExpiryLabel, req.Price, currency)
+	msg := fmt.Sprintf("✅ پرداخت شما تایید و اشتراک **%s** به مدت %d ماه تمدید شد.\nتاریخ انقضای جدید: %s\nمبلغ پرداخت شده: %s تومان.",
+		sub.DisplayName, req.Months, newExpiryLabel, persian.FormatMoney(purchaseAmountToman(req)))
 	_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
 	return nil
 }
@@ -894,13 +765,8 @@ func upgradeSubscriptionIPFromApprovedRequest(user *db.User, sub *db.Subscriptio
 		return fmt.Errorf("خطا در ذخیره‌سازی دیتابیس: %w", err)
 	}
 
-	currency, _ := db.GetSetting(context.Background(), "currency_name")
-	if currency == "" {
-		currency = "تومان"
-	}
-
-	msg := fmt.Sprintf("✅ پرداخت شما تایید و سقف کاربر همزمان اشتراک **%s** به %d دستگاه ارتقا یافت.\nهزینه ارتقا پرداخت شده: %.0f %s.",
-		sub.DisplayName, req.IPLimit, req.Price, currency)
+	msg := fmt.Sprintf("✅ پرداخت شما تایید و سقف کاربر همزمان اشتراک **%s** به %d دستگاه ارتقا یافت.\nهزینه ارتقا پرداخت شده: %s تومان.",
+		sub.DisplayName, req.IPLimit, persian.FormatMoney(purchaseAmountToman(req)))
 	_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
 	return nil
 }

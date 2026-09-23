@@ -9,15 +9,15 @@ import (
 
 func TestCalculateQuote_FixedPlan(t *testing.T) {
 	plan := &db.PaidPlan{
-		ID:              1,
-		Name:            "Plan 1",
-		BasePrice:       50000,
-		BaseIPLimit:     1,
-		MaxIPLimit:      5,
-		PricePerExtraIP: 15000,
+		ID:                   1,
+		Name:                 "Plan 1",
+		BasePriceToman:       50000,
+		BaseIPLimit:          1,
+		MaxIPLimit:           5,
+		PricePerExtraIPToman: 15000,
 		DiscountTiers: []db.DiscountTier{
-			{Months: 3, Percent: 10},
-			{Months: 6, Percent: 20},
+			{Months: 3, BasisPoints: 1000},
+			{Months: 6, BasisPoints: 2000},
 		},
 	}
 
@@ -70,15 +70,15 @@ func TestCalculateQuote_FixedPlan(t *testing.T) {
 
 func TestCalculateQuote_LimitedPlan(t *testing.T) {
 	plan := &db.PaidPlan{
-		ID:                 2,
-		Name:               "Limited 100GB",
-		IsLimited:          true,
-		PricePerGB:         1000,
-		MinDataGB:          10,
-		PricePerExtraMonth: 20000,
-		BaseIPLimit:        1,
-		MaxIPLimit:         3,
-		PricePerExtraIP:    10000,
+		ID:                      2,
+		Name:                    "Limited 100GB",
+		IsLimited:               true,
+		PricePerGBToman:         1000,
+		MinDataGB:               10,
+		PricePerExtraMonthToman: 20000,
+		BaseIPLimit:             1,
+		MaxIPLimit:              3,
+		PricePerExtraIPToman:    10000,
 	}
 
 	// 50 GB, 1 month, 1 IP
@@ -230,5 +230,17 @@ func TestCalculateQuote_IntegerAndBasisPoints(t *testing.T) {
 	}
 	if q.UserID != 200 || q.PlanID != 1 {
 		t.Fatalf("expected UserID 200, PlanID 1, got %d, %d", q.UserID, q.PlanID)
+	}
+}
+
+func TestCalculateQuoteIgnoresLegacyFloatPricesAndPercent(t *testing.T) {
+	plan := &db.PaidPlan{
+		BasePrice: 90000, PricePerExtraIP: 12000,
+		DiscountTiers: []db.DiscountTier{{Months: 1, Percent: 50}},
+		BaseIPLimit:   1, MaxIPLimit: 3,
+	}
+	quote := CalculateQuote(QuoteParams{Plan: plan, Months: 1, IPLimit: 2})
+	if quote.BasePriceToman != 0 || quote.ExtraIPPriceToman != 0 || quote.DiscountToman != 0 || quote.FinalPriceToman != 0 {
+		t.Fatalf("legacy float fields changed integer-Toman quote: %+v", quote)
 	}
 }

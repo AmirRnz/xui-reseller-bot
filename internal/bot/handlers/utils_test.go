@@ -2,7 +2,28 @@ package handlers
 
 import (
 	"testing"
+
+	"xui-reseller-bot/internal/db"
 )
+
+func TestBuyExtendAndIPUpgradePricingUsesIntegerToman(t *testing.T) {
+	plan := &db.PaidPlan{
+		BasePrice: 99999, BasePriceToman: 10000,
+		PricePerExtraIP: 88888, PricePerExtraIPToman: 2000,
+		BaseIPLimit: 1, MaxIPLimit: 3,
+	}
+	for _, action := range []string{"buy", "extend"} {
+		if got := calculatePaidPrice(plan, 3, 1, 0); got != 30000 {
+			t.Fatalf("%s price = %d; want 30000 from integer-Toman base", action, got)
+		}
+	}
+	if got := calculateIPUpgradePrice(plan, 1, 3, 2); got != 8000 {
+		t.Fatalf("IP-upgrade price = %d; want 8000 from integer-Toman extra-IP price", got)
+	}
+	if got := calculateIPUpgradePrice(plan, 3, 2, 2); got != 0 {
+		t.Fatalf("non-upgrade limit change must not produce a charge, got %d", got)
+	}
+}
 
 func TestFormatMarkdown(t *testing.T) {
 	tests := []struct {

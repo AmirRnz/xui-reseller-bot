@@ -20,9 +20,6 @@ func RegisterAdminSettings(b *telebot.Bot, auth telebot.MiddlewareFunc, admin te
 	b.Handle("\fadmin_set_card_owner", func(c telebot.Context) error {
 		return settingPrompt(c, "awaiting_setting_card_owner", "لطفاً نام صاحب کارت را ارسال کنید:")
 	}, auth, admin)
-	b.Handle("\fadmin_set_currency", func(c telebot.Context) error {
-		return settingPrompt(c, "awaiting_setting_currency_name", "لطفاً واحد پول نمایشی را وارد کنید (مثال: تومان یا IRR):")
-	}, auth, admin)
 	b.Handle("\fadmin_set_min_topup", func(c telebot.Context) error {
 		return settingPrompt(c, "awaiting_setting_min_topup", "لطفاً حداقل مبلغ شارژ کیف پول (به تومان) را ارسال کنید:")
 	}, auth, admin)
@@ -58,7 +55,7 @@ func RegisterAdminSettings(b *telebot.Bot, auth telebot.MiddlewareFunc, admin te
 }
 
 func HandleAdminSettings(c telebot.Context) error {
-	keys := []string{"card_number", "card_owner", "currency_name", "min_topup_amount", "test_reset_days", "support_username", "expiry_notify_days", "ip_limit_factor", "ip_limit_mode"}
+	keys := []string{"card_number", "card_owner", "min_topup_amount", "test_reset_days", "support_username", "expiry_notify_days", "ip_limit_factor", "ip_limit_mode"}
 	values := map[string]string{}
 	for _, key := range keys {
 		values[key], _ = db.GetSetting(context.Background(), key)
@@ -76,19 +73,18 @@ func HandleAdminSettings(c telebot.Context) error {
 	text := fmt.Sprintf("⚙️ **تنظیمات سیستم و ربات**\n\n"+
 		"💳 شماره کارت: `%s`\n"+
 		"👤 نام صاحب کارت: %s\n"+
-		"💱 واحد پول: %s\n"+
 		"💰 حداقل شارژ: %s\n"+
 		"⏱️ دوره ریست اکانت تست: %s روز\n"+
 		"🆘 آیدی پشتیبانی: %s\n"+
 		"🔔 روزهای اعلان انقضا: %s\n"+
 		"🌐 حالت محدودیت آی‌پی همزمان: %s\n"+
 		"🌐 ضریب محدودیت آی‌پی همزمان: %s",
-		values["card_number"], values["card_owner"], values["currency_name"], values["min_topup_amount"], values["test_reset_days"], values["support_username"], values["expiry_notify_days"], strings.ToUpper(values["ip_limit_mode"]), values["ip_limit_factor"])
+		values["card_number"], values["card_owner"], formatTomanSetting(values["min_topup_amount"])+" تومان", values["test_reset_days"], values["support_username"], values["expiry_notify_days"], ipLimitModeLabel(values["ip_limit_mode"]), values["ip_limit_factor"])
 
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
 		menu.Row(menu.Data("💳 شماره کارت", "admin_set_card"), menu.Data("👤 صاحب کارت", "admin_set_card_owner")),
-		menu.Row(menu.Data("💱 واحد پول", "admin_set_currency"), menu.Data("💰 حداقل شارژ", "admin_set_min_topup")),
+		menu.Row(menu.Data("💰 حداقل شارژ", "admin_set_min_topup")),
 		menu.Row(menu.Data("📝 راهنمای شارژ", "admin_set_topup_desc"), menu.Data("⏱️ دوره ریست تست", "admin_set_test_reset_days")),
 		menu.Row(menu.Data("🆘 آیدی پشتیبانی", "admin_set_support_username"), menu.Data("🔔 روزهای اعلان", "admin_set_expiry_notify_days")),
 		menu.Row(menu.Data("🌐 تنظیمات محدودیت آی‌پی", "admin_set_ip_limit_factor")),
@@ -115,7 +111,7 @@ func ProcessSettingText(c telebot.Context, key string, value string) error {
 	value = strings.TrimSpace(value)
 	switch key {
 	case "min_topup_amount":
-		if _, err := strconv.ParseFloat(value, 64); err != nil {
+		if amount, err := strconv.ParseInt(value, 10, 64); err != nil || amount < 0 {
 			return c.Send("حداقل مبلغ شارژ باید یک عدد معتبر باشد.")
 		}
 	case "test_reset_days":
@@ -186,14 +182,14 @@ func HandleAdminIPLimitSettings(c telebot.Context) error {
 		factor = "none"
 	}
 
-	text := fmt.Sprintf("🌐 **تنظیمات محدودیت آی‌پی همزمان (IP Limit)**\n\n"+
-		"نحوه اعمال محدودیت آی‌پی همزمان در پنل 3x-ui را انتخاب کنید:\n\n"+
-		"🔸 **حالت دقیق (Exact)**: محدودیت مجاز عیناً به عنوان LimitIP در پنل ثبت می‌شود.\n"+
-		"🔸 **حالت ضریب (Factor)**: محدودیت مجاز در یک ضریب (مثلاً *100) ضرب شده و در LimitIP ثبت می‌شود.\n"+
-		"🔸 **حالت کامنت (Comment)**: مقدار LimitIP عدد 0 (نامحدود) قرار می‌گیرد و محدودیت در کامنت پنل ثبت می‌شود.\n\n"+
+	text := fmt.Sprintf("🌐 **تنظیمات محدودیت آی‌پی همزمان**\n\n"+
+		"نحوه اعمال محدودیت آی‌پی همزمان در پنل سرویس‌دهنده را انتخاب کنید:\n\n"+
+		"🔸 **حالت دقیق**: محدودیت مجاز عیناً در پنل ثبت می‌شود.\n"+
+		"🔸 **حالت ضریب**: محدودیت مجاز در یک ضریب (مثلاً *100) ضرب می‌شود.\n"+
+		"🔸 **حالت یادداشت**: محدودیت در پنل نامحدود می‌شود و مقدار مجاز در یادداشت سرویس ثبت می‌شود.\n\n"+
 		"⚡ **حالت فعلی:** `%s`\n"+
 		"⚙️ **ضریب فعلی:** `%s` (فقط در حالت ضریب استفاده می‌شود)",
-		strings.ToUpper(mode), factor)
+		ipLimitModeLabel(mode), factor)
 
 	menu := &telebot.ReplyMarkup{}
 
@@ -209,9 +205,9 @@ func HandleAdminIPLimitSettings(c telebot.Context) error {
 		btnFactor = menu.Data("حالت ضریب", "admin_set_ip_mode_factor")
 	}
 	if mode == "comment" {
-		btnComment = menu.Data("حالت کامنت ✅", "admin_set_ip_mode_comment")
+		btnComment = menu.Data("حالت یادداشت ✅", "admin_set_ip_mode_comment")
 	} else {
-		btnComment = menu.Data("حالت کامنت", "admin_set_ip_mode_comment")
+		btnComment = menu.Data("حالت یادداشت", "admin_set_ip_mode_comment")
 	}
 
 	menu.Inline(
@@ -234,7 +230,7 @@ func setIPLimitMode(c telebot.Context, mode string) error {
 	if err := db.SetSetting(context.Background(), "ip_limit_mode", mode); err != nil {
 		return c.Send("خطا در ذخیره حالت.")
 	}
-	_ = c.Respond(&telebot.CallbackResponse{Text: "✅ حالت روی " + strings.ToUpper(mode) + " تنظیم شد."})
+	_ = c.Respond(&telebot.CallbackResponse{Text: "✅ حالت روی " + ipLimitModeLabel(mode) + " تنظیم شد."})
 	return HandleAdminIPLimitSettings(c)
 }
 
@@ -251,9 +247,9 @@ func HandleAdminSyncAllIPLimitsPrompt(c telebot.Context) error {
 	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
 
 	text := fmt.Sprintf("⚠️ **هشدار: اعمال و همگام‌سازی تمامی کاربران**\n\n"+
-		"این عملیات تمامی اشتراک‌های فعال را در پنل 3x-ui مطابق با حالت فعلی (%s) به‌روزرسانی می‌کند.\n\n"+
+		"این عملیات تمامی اشتراک‌های فعال را در پنل سرویس‌دهنده مطابق با حالت فعلی (%s) به‌روزرسانی می‌کند.\n\n"+
 		"همچنین در صورت نیاز مقادیر قبلی دیتابیس را نرمال‌سازی می‌کند (مثلاً تقسیم بر %s).\n\n"+
-		"آیا از انجام این عملیات اطمینان دارید؟", strings.ToUpper(mode), factor)
+		"آیا از انجام این عملیات اطمینان دارید؟", ipLimitModeLabel(mode), factor)
 
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
@@ -321,7 +317,7 @@ func HandleAdminSyncAllIPLimitsConfirm(c telebot.Context) error {
 
 	var report strings.Builder
 	report.WriteString("✅ **همگام‌سازی به پایان رسید**\n\n")
-	report.WriteString(fmt.Sprintf("⚡ **حالت فعال:** `%s`\n", strings.ToUpper(mode)))
+	report.WriteString(fmt.Sprintf("⚡ **حالت فعال:** `%s`\n", ipLimitModeLabel(mode)))
 	report.WriteString(fmt.Sprintf("👥 **با موفقیت همگام‌سازی شد:** %d از %d کلاینت\n", successCount, len(subs)))
 
 	if len(syncErrors) > 0 {
@@ -341,4 +337,17 @@ func HandleAdminSyncAllIPLimitsConfirm(c telebot.Context) error {
 	)
 
 	return maybeEditOrSend(c, report.String(), menu)
+}
+
+func ipLimitModeLabel(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "exact":
+		return "دقیق"
+	case "factor":
+		return "ضریب"
+	case "comment":
+		return "یادداشت"
+	default:
+		return "نامشخص"
+	}
 }
