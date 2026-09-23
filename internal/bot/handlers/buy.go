@@ -869,7 +869,7 @@ func HandleBuyDirectPayment(c telebot.Context) error {
 	createdIntent, err := db.CreatePaymentIntent(context.Background(), intent)
 	if err != nil {
 		log.Printf("[INTENT] Failed to create payment intent for user %d: %v", user.ID, err)
-		return c.Send("عملیات با خطا مواجه شد. لطفا مجددا تلاش کنید.")
+		return paymentIntentCreateFailure(c, user, "عملیات با خطا مواجه شد. لطفا مجددا تلاش کنید.")
 	}
 	state.Data["intent_id"] = fmt.Sprintf("%d", createdIntent.ID)
 	state.Data["intent_token"] = createdIntent.IntentToken

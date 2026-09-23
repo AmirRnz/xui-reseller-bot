@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -35,12 +36,16 @@ type PaymentIntent struct {
 	ClientEmail          string         `json:"client_email"`
 	ProvisioningSnapshot map[string]any `json:"provisioning_snapshot"`
 	Status               string         `json:"status"`
+	CancelledAt          *time.Time     `json:"cancelled_at,omitempty"`
+	CancelledByUserID    *int64         `json:"cancelled_by_user_id,omitempty"`
+	CancellationReason   string         `json:"cancellation_reason,omitempty"`
 	CreatedAt            time.Time      `json:"created_at"`
 	UpdatedAt            time.Time      `json:"updated_at"`
 }
 
 var ErrPaymentIntentNotFound = errors.New("payment intent not found")
 var ErrActivePaymentIntentExists = errors.New("an active payment intent already exists for this user")
+var ErrPaymentIntentNotCancellable = errors.New("payment intent is no longer awaiting receipt")
 
 func CreatePaymentIntent(ctx context.Context, intent *PaymentIntent) (*PaymentIntent, error) {
 	ctx, cancel := dbCtx(ctx)
@@ -139,7 +144,8 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 	err = tx.QueryRow(ctx, `
 		SELECT id, user_id, intent_token, action_type, plan_id, subscription_id, quote_id,
 		       amount_toman, months, ip_limit, data_gb, display_name, client_email,
-		       provisioning_snapshot, status, created_at, updated_at
+		       provisioning_snapshot, status, created_at, updated_at,
+		       cancelled_at, cancelled_by_user_id, cancellation_reason
 		FROM payment_intents
 		WHERE id = $1
 		FOR UPDATE
@@ -148,6 +154,7 @@ func SubmitReceiptForActiveIntent(ctx context.Context, intentID int64, userID in
 		&intent.SubscriptionID, &intent.QuoteID, &intent.AmountToman, &intent.Months,
 		&intent.IPLimit, &intent.DataGB, &intent.DisplayName, &intent.ClientEmail,
 		&snapshotBytes, &intent.Status, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.CancelledAt, &intent.CancelledByUserID, &intent.CancellationReason,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -291,7 +298,8 @@ func GetPaymentIntentByID(ctx context.Context, id int64) (*PaymentIntent, error)
 	query := `
 		SELECT id, user_id, intent_token, action_type, plan_id, subscription_id, quote_id,
 		       amount_toman, months, ip_limit, data_gb, display_name, client_email,
-		       provisioning_snapshot, status, created_at, updated_at
+		       provisioning_snapshot, status, created_at, updated_at,
+		       cancelled_at, cancelled_by_user_id, cancellation_reason
 		FROM payment_intents
 		WHERE id = $1
 	`
@@ -302,6 +310,7 @@ func GetPaymentIntentByID(ctx context.Context, id int64) (*PaymentIntent, error)
 		&intent.SubscriptionID, &intent.QuoteID, &intent.AmountToman, &intent.Months,
 		&intent.IPLimit, &intent.DataGB, &intent.DisplayName, &intent.ClientEmail,
 		&snapshotBytes, &intent.Status, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.CancelledAt, &intent.CancelledByUserID, &intent.CancellationReason,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -323,7 +332,8 @@ func GetLatestActivePaymentIntent(ctx context.Context, userID int64) (*PaymentIn
 	query := `
 		SELECT id, user_id, intent_token, action_type, plan_id, subscription_id, quote_id,
 		       amount_toman, months, ip_limit, data_gb, display_name, client_email,
-		       provisioning_snapshot, status, created_at, updated_at
+		       provisioning_snapshot, status, created_at, updated_at,
+		       cancelled_at, cancelled_by_user_id, cancellation_reason
 		FROM payment_intents
 		WHERE user_id = $1 AND status = $2
 		ORDER BY created_at DESC
@@ -336,6 +346,7 @@ func GetLatestActivePaymentIntent(ctx context.Context, userID int64) (*PaymentIn
 		&intent.SubscriptionID, &intent.QuoteID, &intent.AmountToman, &intent.Months,
 		&intent.IPLimit, &intent.DataGB, &intent.DisplayName, &intent.ClientEmail,
 		&snapshotBytes, &intent.Status, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.CancelledAt, &intent.CancelledByUserID, &intent.CancellationReason,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -357,7 +368,8 @@ func GetPaymentIntentByToken(ctx context.Context, token string) (*PaymentIntent,
 	query := `
 		SELECT id, user_id, intent_token, action_type, plan_id, subscription_id, quote_id,
 		       amount_toman, months, ip_limit, data_gb, display_name, client_email,
-		       provisioning_snapshot, status, created_at, updated_at
+		       provisioning_snapshot, status, created_at, updated_at,
+		       cancelled_at, cancelled_by_user_id, cancellation_reason
 		FROM payment_intents
 		WHERE intent_token = $1
 	`
@@ -368,6 +380,7 @@ func GetPaymentIntentByToken(ctx context.Context, token string) (*PaymentIntent,
 		&intent.SubscriptionID, &intent.QuoteID, &intent.AmountToman, &intent.Months,
 		&intent.IPLimit, &intent.DataGB, &intent.DisplayName, &intent.ClientEmail,
 		&snapshotBytes, &intent.Status, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.CancelledAt, &intent.CancelledByUserID, &intent.CancellationReason,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -397,6 +410,35 @@ func MarkPaymentIntentStatus(ctx context.Context, id int64, status string) error
 	return nil
 }
 
+func CancelPaymentIntent(ctx context.Context, intentID, userID int64, reason string) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return errors.New("payment-intent cancellation reason is required")
+	}
+	tag, err := Pool.Exec(ctx, `
+		UPDATE payment_intents
+		SET status = $1, cancelled_at = NOW(), cancelled_by_user_id = $2,
+		    cancellation_reason = $3, updated_at = NOW()
+		WHERE id = $4 AND user_id = $2 AND status = $5
+	`, IntentStatusCancelled, userID, reason, intentID, IntentStatusAwaitingReceipt)
+	if err != nil {
+		return fmt.Errorf("cancel payment intent: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		var exists bool
+		if err := Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM payment_intents WHERE id = $1 AND user_id = $2)`, intentID, userID).Scan(&exists); err != nil {
+			return fmt.Errorf("check payment intent before cancellation: %w", err)
+		}
+		if !exists {
+			return ErrPaymentIntentNotFound
+		}
+		return ErrPaymentIntentNotCancellable
+	}
+	return nil
+}
+
 func GetPaymentIntentByClientEmail(ctx context.Context, email string) (*PaymentIntent, error) {
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
@@ -404,7 +446,8 @@ func GetPaymentIntentByClientEmail(ctx context.Context, email string) (*PaymentI
 	query := `
 		SELECT id, user_id, intent_token, action_type, plan_id, subscription_id, quote_id,
 		       amount_toman, months, ip_limit, data_gb, display_name, client_email,
-		       provisioning_snapshot, status, created_at, updated_at
+		       provisioning_snapshot, status, created_at, updated_at,
+		       cancelled_at, cancelled_by_user_id, cancellation_reason
 		FROM payment_intents
 		WHERE client_email = $1
 		ORDER BY created_at DESC
@@ -417,6 +460,7 @@ func GetPaymentIntentByClientEmail(ctx context.Context, email string) (*PaymentI
 		&intent.SubscriptionID, &intent.QuoteID, &intent.AmountToman, &intent.Months,
 		&intent.IPLimit, &intent.DataGB, &intent.DisplayName, &intent.ClientEmail,
 		&snapshotBytes, &intent.Status, &intent.CreatedAt, &intent.UpdatedAt,
+		&intent.CancelledAt, &intent.CancelledByUserID, &intent.CancellationReason,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -15,6 +15,9 @@ import (
 func RegisterStart(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.MiddlewareFunc, adminCfg *config.AdminConfig) {
 	b.Handle("/start", HandleStart, auth)
 	b.Handle(telebot.OnText, HandleText, auth)
+	b.Handle("\fpayment_intent_resume", HandlePaymentIntentResume, auth)
+	b.Handle("\fpayment_intent_cancel_prompt", HandlePaymentIntentCancelPrompt, auth)
+	b.Handle("\fpayment_intent_cancel_confirm", HandlePaymentIntentCancelConfirm, auth)
 	b.Handle("\fmenu_main", func(c telebot.Context) error {
 		user := userFromContext(c)
 		if user == nil {
@@ -83,6 +86,9 @@ func HandleText(c telebot.Context) error {
 	if strings.HasPrefix(text, "/") {
 		if text == "/cancel" || text == "/cancel@bot" {
 			bot.FSM.ClearState(user.TelegramID)
+			if intent, err := db.GetLatestActivePaymentIntent(context.Background(), user.ID); err == nil && intent != nil {
+				return showPaymentIntentRecovery(c, intent)
+			}
 			return showMainMenu(c, user)
 		}
 		bot.FSM.ClearState(user.TelegramID) // Clear state to execute command

@@ -200,3 +200,47 @@ func TestConcurrentActivePaymentIntentCreationHasSingleWinner(t *testing.T) {
 		t.Fatalf("partial unique invariant violated: active intents=%d", active)
 	}
 }
+
+func TestExplicitPaymentIntentCancellationAllowsNewCheckout(t *testing.T) {
+	ctx := setupTestDB(t)
+	telegramID := time.Now().UnixNano()
+	var userID int64
+	if err := Pool.QueryRow(ctx, `INSERT INTO bot_users (telegram_id, username, status) VALUES ($1, $2, 'approved') RETURNING id`, telegramID, fmt.Sprintf("intent_cancel_%d", telegramID)).Scan(&userID); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	defer func() {
+		_, _ = Pool.Exec(ctx, `DELETE FROM payment_intents WHERE user_id = $1`, userID)
+		_, _ = Pool.Exec(ctx, `DELETE FROM bot_users WHERE id = $1`, userID)
+	}()
+
+	first, err := CreatePaymentIntent(ctx, &PaymentIntent{
+		UserID: userID, IntentToken: fmt.Sprintf("intent_cancel_first_%d", telegramID),
+		ActionType: "topup", AmountToman: 90000, Status: IntentStatusAwaitingReceipt,
+	})
+	if err != nil {
+		t.Fatalf("create initial checkout: %v", err)
+	}
+	if err := CancelPaymentIntent(ctx, first.ID, userID, "customer_confirmed_not_paid"); err != nil {
+		t.Fatalf("explicitly cancel unpaid checkout: %v", err)
+	}
+	cancelled, err := GetPaymentIntentByID(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("inspect cancelled checkout: %v", err)
+	}
+	if cancelled.Status != IntentStatusCancelled || cancelled.CancelledAt == nil || cancelled.CancelledByUserID == nil || *cancelled.CancelledByUserID != userID || cancelled.CancellationReason != "customer_confirmed_not_paid" {
+		t.Fatalf("cancellation audit was not retained: %+v", cancelled)
+	}
+	if _, err := GetLatestActivePaymentIntent(ctx, userID); err == nil {
+		t.Fatal("cancelled intent still occupies the active checkout slot")
+	}
+	second, err := CreatePaymentIntent(ctx, &PaymentIntent{
+		UserID: userID, IntentToken: fmt.Sprintf("intent_cancel_second_%d", telegramID),
+		ActionType: "buy", AmountToman: 140000, Status: IntentStatusAwaitingReceipt,
+	})
+	if err != nil {
+		t.Fatalf("new checkout after explicit cancellation was rejected: %v", err)
+	}
+	if second.ID == first.ID {
+		t.Fatal("new checkout reused the cancelled intent")
+	}
+}

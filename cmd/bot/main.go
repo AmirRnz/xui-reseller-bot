@@ -36,6 +36,9 @@ func main() {
 	if err := db.Migrate(ctx); err != nil {
 		log.Fatalf("Migration error: %v", err)
 	}
+	if err := db.EnsureMoneyNormalizationComplete(ctx); err != nil {
+		log.Fatalf("Money-unit audit required before commerce startup: %v", err)
+	}
 
 	xuiClient, err := xui.NewClient(&cfg.XUI)
 	if err != nil {

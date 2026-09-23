@@ -21,8 +21,10 @@ Updated 2026-09-23. This note describes the reseller legacy bot currently in thi
 
 - New buy, extend, IP upgrade, top-up, and refund paths use integer Toman (`BIGINT`/`int64`) and integer discount basis points. The shared Persian formatter displays amounts with `تومان`.
 - Runtime commerce reads `BasePriceToman`, `PricePerExtraIPToman`, `PricePerGBToman`, `PricePerExtraMonthToman`, and `BasisPoints`. Legacy float fields remain in the model and DB as compatibility mirrors; they are not runtime price fallbacks.
-- Migration 8 records a one-time preflight snapshot of the existing `currency_name`, representative paid-plan pricing/discount values, and wallet balances. It does not convert or relabel historical money. Migration 12 converts legacy percent discounts to basis points after that snapshot.
-- The `currency_name` setting is not read during normal runtime. Historical settings can remain in old databases for audit.
+- Migration 8 records an initial snapshot, but it cannot settle the edited migration 7 history: deployed databases may have integer plan prices copied from legacy floats, or may still have zero integer prices. Migration 13 captures migration versions, currency, plan values, wallet balances, representative transactions, quotes, and purchase requests, and flags rows that match the old migration 7 copy pattern.
+- Migration 13 leaves the database pending until an operator reviews the report and explicitly selects `toman` or `rial` with `go run ./cmd/money-normalize -apply`. The report prints a database-specific confirmation token. Rial normalization converts legacy monetary columns and the copied plan prices atomically; Toman normalization fills missing integer plan prices. Both align compatibility float mirrors to integer prices and record the operator and decision. Reapplication is refused.
+- Bot startup stays blocked while this decision is pending. Stop the bot, run `go run ./cmd/money-normalize -report`, review every deployment’s history, then apply the audited decision. The migration 7 match is a detection signal, not proof of the historical unit.
+- The `currency_name` setting is not read during normal runtime. Migration 13 preserves its pre-normalization value in the audit snapshot; the operator action records the normalized display unit as `تومان`.
 - A quote-backed cancellation can use its immutable quote. A legacy subscription without quote history creates a zero-suggestion manual refund request; an admin enters a positive amount, records a required audit note, and confirms before the idempotent wallet credit commits. The current plan catalog is never used to reconstruct a legacy historical refund.
 
 ## XUI readiness gate
@@ -43,14 +45,16 @@ Updated 2026-09-23. This note describes the reseller legacy bot currently in thi
 | `purchase_remote_created_db_failed` | `handlePurchaseReconciliation` |
 | `subscription_update_db_failed` | `handleUpdateReconciliation` |
 | `subscription_delete_unknown` | `handleDeleteReconciliation` |
-| `subscription_cancellation_db_failure` | `handleDeleteReconciliation` |
+| `subscription_cancellation_db_failure` | `handleSubscriptionCancellation` |
 | `direct_payment_provisioning_retry` | `handleDirectPaymentProvisioning` |
 | `subscription_remote_missing` | `handleSubscriptionRemoteMissing` |
 | `subscription_claim_adoption` | `handleSubscriptionClaimAdoption` |
 
 Unknown kinds move to manual review. CAS/version checks protect worker transitions. `pending_refund` can become verified only after the matching completed ledger credit is found. Generic manual close refuses financial obligations. Explicit `manual_waiver` records admin, timestamp, reason, amount, and operation key, and remains visibly distinct from verified resolution and manual review.
 
-Intentional legacy policies: old subscriptions without quote history remain zero-suggestion requests until an admin enters an amount; ambiguous or unprovable remote provisioning goes to manual review; creating a second direct-payment intent is refused while an externally payable receipt intent remains active.
+Intentional legacy policies: old subscriptions without quote history remain zero-suggestion requests until an admin enters an amount; ambiguous or unprovable remote provisioning goes to manual review; creating a second direct-payment intent is refused while an externally payable receipt intent remains active. `/cancel` clears the chat FSM but preserves the payment intent and offers resume/send-receipt or an explicitly confirmed cancellation for a checkout the customer says they did not pay. A cancelled intent remains auditable and no longer occupies the active-intent slot.
+
+Admin Sync All treats the PostgreSQL IP limit as authoritative and transforms it for XUI according to the current setting. It never divides or rewrites database IP limits based on that setting. A one-time repair is available through `go run ./cmd/ip-limit-repair -dry-run -factor <factor>`; review divisible and excluded rows, then apply with the printed token, the same factor, and an operator identifier. The repair records original/new values and refuses a second run.
 
 ## Other workers and presentation
 
@@ -65,6 +69,8 @@ Intentional legacy policies: old subscriptions without quote history remain zero
 - Migration 10: audited reconciliation manual-action fields.
 - Migration 11: refund approval amount, admin audit note, and approval timestamp.
 - Migration 12: integer basis-point discount migration from preflighted legacy percentage values.
+- Migration 13: payment-intent cancellation audit fields and an operator-gated money-unit audit/normalization record.
+- Migration 14: durable one-time IP-limit repair audit and row history.
 
 ## Verification record
 

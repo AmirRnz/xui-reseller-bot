@@ -244,12 +244,9 @@ func HandleAdminSyncAllIPLimitsPrompt(c telebot.Context) error {
 	if mode == "" {
 		mode = "factor"
 	}
-	factor, _ := db.GetSetting(context.Background(), "ip_limit_factor")
-
 	text := fmt.Sprintf("⚠️ **هشدار: اعمال و همگام‌سازی تمامی کاربران**\n\n"+
-		"این عملیات تمامی اشتراک‌های فعال را در پنل سرویس‌دهنده مطابق با حالت فعلی (%s) به‌روزرسانی می‌کند.\n\n"+
-		"همچنین در صورت نیاز مقادیر قبلی دیتابیس را نرمال‌سازی می‌کند (مثلاً تقسیم بر %s).\n\n"+
-		"آیا از انجام این عملیات اطمینان دارید؟", ipLimitModeLabel(mode), factor)
+		"این عملیات مقدار IP Limit ذخیره‌شده در دیتابیس را مطابق حالت فعلی (%s) به پنل سرویس‌دهنده همگام‌سازی می‌کند.\n\n"+
+		"آیا از انجام این عملیات اطمینان دارید؟", ipLimitModeLabel(mode))
 
 	menu := &telebot.ReplyMarkup{}
 	menu.Inline(
@@ -271,32 +268,15 @@ func HandleAdminSyncAllIPLimitsConfirm(c telebot.Context) error {
 
 	ctx := context.Background()
 
-	// 1. Normalize database limits if needed
-	factor, _ := db.GetSetting(ctx, "ip_limit_factor")
-	factor = strings.TrimSpace(factor)
-	if factor != "" && strings.HasPrefix(factor, "*") {
-		var mult int
-		_, err := fmt.Sscanf(factor, "*%d", &mult)
-		if err == nil && mult > 1 {
-			_, err = db.Pool.Exec(ctx, `
-				UPDATE subscriptions 
-				SET ip_limit = ip_limit / $1 
-				WHERE ip_limit >= $1
-			`, mult)
-			if err != nil {
-				log.Printf("Sync error during DB normalization: %v", err)
-			}
-		}
-	}
-
-	// 2. Fetch all active subscriptions
+	// Sync uses the PostgreSQL IP limit as authoritative data. Historical data
+	// repair is never inferred from the current XUI transform factor.
 	subs, err := db.GetActiveSubscriptions(ctx)
 	if err != nil {
 		log.Printf("[ERROR] Failed to fetch active subscriptions: %v", err)
 		return c.Send("خطا در بارگذاری اشتراک‌های فعال.")
 	}
 
-	// 3. Sync to XUI
+	// Sync the authoritative database values to XUI.
 	successCount := 0
 	var syncErrors []string
 
@@ -309,7 +289,7 @@ func HandleAdminSyncAllIPLimitsConfirm(c telebot.Context) error {
 		}
 	}
 
-	// 4. Report result
+	// Report result.
 	mode, _ := db.GetSetting(ctx, "ip_limit_mode")
 	if mode == "" {
 		mode = "factor"

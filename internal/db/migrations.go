@@ -263,6 +263,96 @@ SET discount_tiers = (
 WHERE p.discount_tiers IS NOT NULL;
 `,
 	},
+	{
+		Version: 13,
+		Name:    "operator_gated_money_unit_normalization_and_payment_intent_cancellation",
+		SQL: `
+ALTER TABLE payment_intents
+    ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS cancelled_by_user_id BIGINT REFERENCES bot_users(id) ON DELETE SET NULL,
+    ADD COLUMN IF NOT EXISTS cancellation_reason TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS money_normalization_audit (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    report JSONB NOT NULL,
+    legacy_v7_copy_candidate BOOLEAN NOT NULL DEFAULT FALSE,
+    selected_unit TEXT CHECK (selected_unit IN ('toman', 'rial')),
+    normalized_by TEXT NOT NULL DEFAULT '',
+    normalized_at TIMESTAMPTZ
+);
+
+WITH audit AS (
+    SELECT
+        jsonb_build_object(
+            'schema_migrations', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object('version', version, 'name', name, 'applied_at', applied_at) ORDER BY version)
+                FROM schema_migrations
+            ), '[]'::jsonb),
+            'currency_name', COALESCE((SELECT value FROM bot_settings WHERE key = 'currency_name'), '<missing>'),
+            'money_settings', COALESCE((SELECT jsonb_object_agg(key, value) FROM bot_settings WHERE key = 'min_topup_amount'), '{}'::jsonb),
+            'paid_plans', COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                    'id', p.id, 'name', p.name,
+                    'base_price', p.base_price, 'base_price_toman', p.base_price_toman,
+                    'price_per_extra_ip', p.price_per_extra_ip, 'price_per_extra_ip_toman', p.price_per_extra_ip_toman,
+                    'price_per_gb', p.price_per_gb, 'price_per_gb_toman', p.price_per_gb_toman,
+                    'price_per_extra_month', p.price_per_extra_month, 'price_per_extra_month_toman', p.price_per_extra_month_toman
+                ) ORDER BY p.id) FROM (SELECT * FROM paid_plans ORDER BY id) p
+            ), '[]'::jsonb),
+            'wallet_balances', jsonb_build_object(
+                'user_count', (SELECT COUNT(*) FROM bot_users),
+                'sum', (SELECT COALESCE(SUM(wallet_balance), 0) FROM bot_users),
+                'min', (SELECT COALESCE(MIN(wallet_balance), 0) FROM bot_users),
+                'max', (SELECT COALESCE(MAX(wallet_balance), 0) FROM bot_users),
+                'sample', COALESCE((SELECT jsonb_agg(jsonb_build_object('user_id', id, 'wallet_balance', wallet_balance) ORDER BY id)
+                                   FROM (SELECT id, wallet_balance FROM bot_users ORDER BY id LIMIT 20) u), '[]'::jsonb)
+            ),
+            'transactions', COALESCE((SELECT jsonb_agg(to_jsonb(t) ORDER BY t.created_at DESC)
+                                      FROM (SELECT * FROM transactions ORDER BY created_at DESC LIMIT 20) t), '[]'::jsonb),
+            'quotes', COALESCE((SELECT jsonb_agg(to_jsonb(q) ORDER BY q.created_at DESC)
+                                FROM (SELECT * FROM purchase_quotes ORDER BY created_at DESC LIMIT 20) q), '[]'::jsonb),
+            'purchase_requests', COALESCE((SELECT jsonb_agg(to_jsonb(r) ORDER BY r.created_at DESC)
+                                           FROM (SELECT * FROM purchase_requests ORDER BY created_at DESC LIMIT 20) r), '[]'::jsonb)
+        ) AS report,
+        EXISTS (
+            SELECT 1 FROM schema_migrations WHERE version = 7
+        ) AND EXISTS (
+            SELECT 1 FROM paid_plans p WHERE
+                (p.base_price > 0 AND p.base_price_toman = ROUND(p.base_price)::BIGINT) OR
+                (p.price_per_extra_ip > 0 AND p.price_per_extra_ip_toman = ROUND(p.price_per_extra_ip)::BIGINT) OR
+                (p.price_per_gb > 0 AND p.price_per_gb_toman = ROUND(p.price_per_gb)::BIGINT) OR
+                (p.price_per_extra_month > 0 AND p.price_per_extra_month_toman = ROUND(p.price_per_extra_month)::BIGINT)
+        ) AS legacy_v7_copy_candidate
+)
+INSERT INTO money_normalization_audit (singleton, report, legacy_v7_copy_candidate)
+SELECT TRUE, report, legacy_v7_copy_candidate FROM audit
+ON CONFLICT (singleton) DO NOTHING;
+`,
+	},
+	{
+		Version: 14,
+		Name:    "audited_one_time_ip_limit_repair",
+		SQL: `
+CREATE TABLE IF NOT EXISTS ip_limit_repair_runs (
+    id BIGSERIAL PRIMARY KEY,
+    factor INT NOT NULL CHECK (factor > 1),
+    operator TEXT NOT NULL,
+    preview_token TEXT NOT NULL UNIQUE,
+    report JSONB NOT NULL,
+    affected_count INT NOT NULL,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS ip_limit_repair_rows (
+    subscription_id BIGINT PRIMARY KEY REFERENCES subscriptions(id) ON DELETE CASCADE,
+    run_id BIGINT NOT NULL REFERENCES ip_limit_repair_runs(id),
+    original_ip_limit INT NOT NULL,
+    repaired_ip_limit INT NOT NULL,
+    repaired_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`,
+	},
 }
 
 func runMigrations(ctx context.Context) error {

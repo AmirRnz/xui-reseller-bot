@@ -879,7 +879,7 @@ func HandleSubscriptionLimitSetDirect(c telebot.Context) error {
 	}
 	if _, err := db.CreatePaymentIntent(context.Background(), intent); err != nil {
 		log.Printf("[INTENT] Failed to create payment intent for user %d IP upgrade: %v", user.ID, err)
-		return maybeEditOrSend(c, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.")
+		return paymentIntentCreateFailure(c, user, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.")
 	}
 	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", fsmData)
 
@@ -1204,7 +1204,7 @@ func HandleExtendSubscriptionDirect(c telebot.Context) error {
 	}
 	if _, err := db.CreatePaymentIntent(context.Background(), extendIntent); err != nil {
 		log.Printf("[INTENT] Failed to create payment intent for user %d extend: %v", user.ID, err)
-		return maybeEditOrSend(c, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.")
+		return paymentIntentCreateFailure(c, user, "عملیات با خطا مواجه شد. لطفاً مجدداً تلاش کنید یا با پشتیبانی در ارتباط باشید.")
 	}
 	bot.FSM.SetState(user.TelegramID, "awaiting_purchase_receipt", extendData)
 
