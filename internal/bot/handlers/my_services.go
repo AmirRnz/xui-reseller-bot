@@ -108,6 +108,7 @@ func RegisterMyServices(b *telebot.Bot, auth telebot.MiddlewareFunc) {
 	b.Handle("\fsub_limit_direct", HandleSubscriptionLimitSetDirect, auth)
 
 	// Extension handlers
+	b.Handle("\fmenu_extend", HandleExtendMenuFlow, auth)
 	b.Handle("\fsub_extend", HandleSubscriptionExtendMenu, auth)
 	b.Handle("\fsub_extend_custom", HandleExtendCustomMonthsPrompt, auth)
 	b.Handle("\fsub_extend_run", HandleExtendSubscriptionConfirmPrompt, auth)
@@ -856,43 +857,7 @@ func HandleSubscriptionExtendMenu(c telebot.Context) error {
 		return c.Send("طرح مورد نظر یافت نشد.")
 	}
 
-	displayIPLimit := sub.IPLimit
-
-	priceFor := func(months int) int64 {
-		dataGB := int(sub.TrafficLimitBytes / 1073741824)
-		return calculatePaidPrice(plan, months, displayIPLimit, dataGB)
-	}
-	menu := &telebot.ReplyMarkup{}
-	menu.Inline(
-		menu.Row(
-			menu.Data(fmt.Sprintf("۱ ماهه — %s", persian.FormatMoney(priceFor(1))), "sub_extend_run", fmt.Sprintf("1:%d", sub.ID)),
-			menu.Data(fmt.Sprintf("۳ ماهه — %s", persian.FormatMoney(priceFor(3))), "sub_extend_run", fmt.Sprintf("3:%d", sub.ID)),
-		),
-		menu.Row(
-			menu.Data(fmt.Sprintf("۶ ماهه — %s", persian.FormatMoney(priceFor(6))), "sub_extend_run", fmt.Sprintf("6:%d", sub.ID)),
-			menu.Data("✏️ مدت دلخواه", "sub_extend_custom", fmt.Sprintf("%d", sub.ID)),
-		),
-		menu.Row(menu.Data("« بازگشت", "view_sub", fmt.Sprintf("%d", sub.ID))),
-	)
-
-	var expiryLabel string
-	if (sub.ExpireTime != nil && *sub.ExpireTime < 0) || sub.EndDate.IsZero() {
-		if sub.ExpireTime != nil && *sub.ExpireTime < 0 {
-			durMs := -*sub.ExpireTime
-			days := durMs / (24 * 3600 * 1000)
-			if days > 0 {
-				expiryLabel = fmt.Sprintf("شروع پس از اولین اتصال (مدت زمان %d روز)", days)
-			} else {
-				hours := durMs / (3600 * 1000)
-				expiryLabel = fmt.Sprintf("شروع پس از اولین اتصال (مدت زمان %d ساعت)", hours)
-			}
-		} else {
-			expiryLabel = "شروع پس از اولین اتصال"
-		}
-	} else {
-		expiryLabel = sub.EndDate.Format("2006-01-02")
-	}
-	return maybeEditOrSend(c, fmt.Sprintf("⏳ تمدید سرویس **%s**\nتاریخ انقضای فعلی: %s\n\nمدت زمان تمدید را انتخاب کنید:", sub.DisplayName, expiryLabel), menu)
+	return showSubscriptionExtendMenuFor(c, sub, plan)
 }
 
 func HandleExtendCustomMonthsPrompt(c telebot.Context) error {

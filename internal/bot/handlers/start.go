@@ -23,6 +23,7 @@ func RegisterStart(b *telebot.Bot, auth telebot.MiddlewareFunc, admin telebot.Mi
 		if user == nil {
 			return HandleStart(c)
 		}
+		bot.FSM.ClearState(user.TelegramID)
 		return showMainMenu(c, user)
 	}, auth)
 	b.Handle("\fmenu_support", func(c telebot.Context) error {
@@ -133,6 +134,8 @@ func HandleText(c telebot.Context) error {
 			return ProcessSettingText(c, "support_username", text)
 		case "awaiting_sub_rename":
 			return ProcessSubscriptionRename(c, text)
+		case "awaiting_extend_sub_url":
+			return ProcessExtendSubURL(c, text)
 		case "awaiting_extend_months_text":
 			return ProcessExtendMonthsText(c, text)
 		case "awaiting_admin_draft_input":
@@ -161,6 +164,12 @@ func HandleText(c telebot.Context) error {
 		return HandleMyServicesFlow(c)
 	case "wallet", "/wallet", "کیف پول":
 		return HandleWalletFlow(c)
+	case "extend", "/extend", "تمدید", "تمدید اشتراک", "🔄 تمدید":
+		return HandleExtendMenuFlow(c)
+	}
+
+	if user.IsApproved() && (strings.HasPrefix(text, "http://") || strings.HasPrefix(text, "https://") || strings.HasPrefix(text, "vless://") || strings.HasPrefix(text, "vmess://") || strings.HasPrefix(text, "trojan://") || strings.Contains(text, "/sub/")) {
+		return ProcessExtendSubURL(c, text)
 	}
 
 	return showMainMenu(c, user)

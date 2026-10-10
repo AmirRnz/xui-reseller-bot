@@ -38,8 +38,8 @@ func showMainMenu(c telebot.Context, user *db.User) error {
 	if user.IsApproved() {
 		rows := []telebot.Row{
 			menu.Row(menu.Data("🧪 تست رایگان", "menu_test_sub"), menu.Data("💼 خرید سرویس", "menu_buy_sub")),
-			menu.Row(menu.Data("📋 سرویس‌های من", "menu_my_services"), menu.Data("👛 کیف پول", "menu_wallet")),
-			menu.Row(menu.Data("🆘 پشتیبانی", "menu_support")),
+			menu.Row(menu.Data("📋 سرویس‌های من", "menu_my_services"), menu.Data(persian.BtnExtendMenu, "menu_extend")),
+			menu.Row(menu.Data("👛 کیف پول", "menu_wallet"), menu.Data("🆘 پشتیبانی", "menu_support")),
 		}
 		menu.Inline(rows...)
 		return maybeEditOrSend(c, "👋 به پنل کاربری خوش آمدید\nسرویس وی‌پی‌ان خود را مدیریت کنید یا سرویس جدید خریداری نمایید.", menu)

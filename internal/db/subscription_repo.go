@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -752,4 +753,33 @@ func GetActiveSubscriptions(ctx context.Context) ([]*Subscription, error) {
 		subs = append(subs, s)
 	}
 	return subs, rows.Err()
+}
+
+func FindSubscriptionByIdentifier(ctx context.Context, identifier string) (*Subscription, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return nil, nil
+	}
+
+	row := Pool.QueryRow(ctx, subscriptionSelect()+` 
+		WHERE (sub_id = $1 AND sub_id != '') 
+		   OR (client_uuid = $1 AND client_uuid != '') 
+		   OR (client_email = $1 AND client_email != '') 
+		LIMIT 1`, identifier)
+	s, err := scanSubscriptionRow(row)
+	if err == nil {
+		return s, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+
+	if id, parseErr := strconv.Atoi(identifier); parseErr == nil && id > 0 {
+		return GetSubscriptionByID(ctx, id)
+	}
+
+	return nil, nil
 }

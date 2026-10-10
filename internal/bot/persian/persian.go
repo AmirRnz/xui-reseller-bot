@@ -18,6 +18,7 @@ const (
 	BtnAdmin        = "⚙️ پنل مدیریت"
 	BtnRefresh      = "🔄 بروزرسانی"
 	BtnExtend       = "🔄 تمدید اشتراک"
+	BtnExtendMenu   = "🔄 تمدید"
 	BtnUpgradeIP    = "📶 افزایش سقف آی‌پی همزمان"
 	BtnGetLink      = "🔗 دریافت لینک اتصال"
 	BtnToggleStatus = "⏯ قطع / وصل سرویس"

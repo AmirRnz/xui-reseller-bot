@@ -1346,6 +1346,47 @@ func TestE2ESuite(t *testing.T) {
 				t.Fatalf("Expected client to be enabled in XUI after extension")
 			}
 		})
+
+		// 25c. Extend subscription via URL flow (menu_extend)
+		t.Run("ExtendSubscriptionViaURL", func(t *testing.T) {
+			setupApprovedUserWithSub()
+			// Reseller clicks "تمدید"
+			env.SendCallback(userTGID, userUsername, 999, "\fmenu_extend")
+			respPrompt := env.ExpectResponse(t, 2*time.Second)
+			if !strings.Contains(getStr(respPrompt, "text"), "لینک یا آدرس اشتراک") {
+				t.Fatalf("Expected URL prompt, got: %+v", respPrompt)
+			}
+
+			// Reseller sends the URL
+			env.SendMessage(userTGID, userUsername, "https://panel.example.com:2096/sub/sub12345")
+			respOptions := env.ExpectResponse(t, 2*time.Second) // duration selector
+			if !strings.Contains(getStr(respOptions, "text"), "تمدید سرویس") || !strings.Contains(getStr(respOptions, "reply_markup"), "sub_extend_run") {
+				t.Fatalf("Expected duration selection menu, got: %+v", respOptions)
+			}
+
+			// Reseller selects 1 month
+			env.SendCallback(userTGID, userUsername, 999, "\fsub_extend_run|1:1")
+			respInvoice := env.ExpectResponse(t, 2*time.Second)
+			confirmData := extractCallbackData(respInvoice, "\fsub_extend_confirm")
+			if confirmData == "" {
+				t.Fatalf("Expected sub_extend_confirm button in invoice: %+v", respInvoice)
+			}
+
+			// Reseller confirms payment via wallet
+			env.SendCallback(userTGID, userUsername, 999, confirmData)
+			_ = env.ExpectResponse(t, 2*time.Second) // callback response
+			resp := env.ExpectResponse(t, 2*time.Second)
+			if !strings.Contains(getStr(resp, "text"), "پایدار ثبت شد") && !strings.Contains(getStr(resp, "text"), "با موفقیت") && !strings.Contains(getStr(resp, "text"), "تمدید شد") {
+				t.Fatalf("Expected extension success, got: %+v", resp)
+			}
+			processReconciliationWork(t, env)
+
+			// Verify DB (balance deducted)
+			u, _ := db.GetUserByTelegramID(env.ctx, userTGID)
+			if u.WalletBalance != 19000 { // 20000 - 1000 extension cost
+				t.Fatalf("Wallet balance should be 19000, got %d", u.WalletBalance)
+			}
+		})
 	})
 
 	// ==========================================
