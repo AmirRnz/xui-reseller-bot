@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"xui-reseller-bot/internal/db"
@@ -158,3 +160,94 @@ func TestParseDevicesFromComment(t *testing.T) {
 		})
 	}
 }
+
+func TestSnapshotInt64_FloatAndScientificNotation(t *testing.T) {
+	snapshot := map[string]any{
+		"expiry_float":   float64(-2592000000),
+		"expiry_sci":     "-2.592e+09",
+		"expiry_int":     int64(-2592000000),
+		"telegram_id":    float64(96937669),
+		"total_bytes":    float64(10737418240),
+		"total_bytes_str": "1.073741824e+10",
+		"zero_float":     float64(0),
+		"zero_int":       0,
+		"json_number":    json.Number("-2592000000"),
+	}
+
+	if got := snapshotInt64(snapshot, "expiry_float"); got != -2592000000 {
+		t.Fatalf("expected -2592000000 from float64, got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "expiry_sci"); got != -2592000000 {
+		t.Fatalf("expected -2592000000 from scientific string, got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "expiry_int"); got != -2592000000 {
+		t.Fatalf("expected -2592000000 from int64, got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "telegram_id"); got != 96937669 {
+		t.Fatalf("expected 96937669 from float64, got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "total_bytes"); got != 10737418240 {
+		t.Fatalf("expected 10737418240 from float64, got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "total_bytes_str"); got != 10737418240 {
+		t.Fatalf("expected 10737418240 from string, got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "zero_float"); got != 0 {
+		t.Fatalf("expected 0 from float64(0), got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "zero_int"); got != 0 {
+		t.Fatalf("expected 0 from 0, got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "json_number"); got != -2592000000 {
+		t.Fatalf("expected -2592000000 from json.Number, got %d", got)
+	}
+	if got := snapshotInt64(snapshot, "nonexistent"); got != 0 {
+		t.Fatalf("expected 0 for missing key, got %d", got)
+	}
+}
+
+func TestSnapshotIntSlice(t *testing.T) {
+	s1 := snapshotIntSlice([]int{1, 2, 3})
+	if len(s1) != 3 || s1[0] != 1 || s1[1] != 2 || s1[2] != 3 {
+		t.Fatalf("unexpected result from []int: %+v", s1)
+	}
+
+	s2 := snapshotIntSlice([]float64{1, 2, 3})
+	if len(s2) != 3 || s2[0] != 1 || s2[1] != 2 || s2[2] != 3 {
+		t.Fatalf("unexpected result from []float64: %+v", s2)
+	}
+
+	s3 := snapshotIntSlice([]any{float64(4), "5", int64(6)})
+	if len(s3) != 3 || s3[0] != 4 || s3[1] != 5 || s3[2] != 6 {
+		t.Fatalf("unexpected result from []any: %+v", s3)
+	}
+
+	s4 := snapshotIntSlice(nil)
+	if s4 != nil {
+		t.Fatalf("expected nil from nil input, got %+v", s4)
+	}
+}
+
+func TestFormatPlanIPLimitDescription(t *testing.T) {
+	// Infinite and free IP limit
+	p1 := &db.PaidPlan{BaseIPLimit: 0, MaxIPLimit: 0}
+	desc1 := formatPlanIPLimitDescription(p1)
+	if !strings.Contains(desc1, "نامحدود (رایگان)") {
+		t.Fatalf("expected 'نامحدود (رایگان)' for Base=0, Max=0, got %q", desc1)
+	}
+
+	// Single fixed IP limit
+	p2 := &db.PaidPlan{BaseIPLimit: 2, MaxIPLimit: 2}
+	desc2 := formatPlanIPLimitDescription(p2)
+	if !strings.Contains(desc2, "اتصال IP همزمان: 2") || strings.Contains(desc2, "تا سقف") {
+		t.Fatalf("expected 'اتصال IP همزمان: 2' without extra range, got %q", desc2)
+	}
+
+	// Range IP limit with extra cost
+	p3 := &db.PaidPlan{BaseIPLimit: 1, MaxIPLimit: 5, PricePerExtraIPToman: 15000}
+	desc3 := formatPlanIPLimitDescription(p3)
+	if !strings.Contains(desc3, "1 تا سقف 5") || !strings.Contains(desc3, "15,000") {
+		t.Fatalf("expected range and extra price, got %q", desc3)
+	}
+}
+

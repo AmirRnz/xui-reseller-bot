@@ -58,10 +58,19 @@ func CalculateQuote(p QuoteParams) *PurchaseQuote {
 	}
 
 	ipLimit := p.IPLimit
-	if ipLimit < p.Plan.BaseIPLimit {
-		ipLimit = p.Plan.BaseIPLimit
+	if p.Plan.MaxIPLimit == 0 {
+		ipLimit = 0
+	} else {
+		if ipLimit < p.Plan.BaseIPLimit {
+			ipLimit = p.Plan.BaseIPLimit
+		} else if ipLimit > p.Plan.MaxIPLimit {
+			ipLimit = p.Plan.MaxIPLimit
+		}
 	}
-	extraIPs := ipLimit - p.Plan.BaseIPLimit
+	extraIPs := 0
+	if p.Plan.MaxIPLimit > 0 && ipLimit > p.Plan.BaseIPLimit {
+		extraIPs = ipLimit - p.Plan.BaseIPLimit
+	}
 
 	basePrice := p.Plan.BasePriceToman
 	pricePerExtraIP := p.Plan.PricePerExtraIPToman

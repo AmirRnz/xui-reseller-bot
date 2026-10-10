@@ -442,10 +442,10 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 			displayName = payload.Email
 		}
 		ipLimit := remote.LimitIP
-		if ipLimit <= 0 {
+		if ipLimit < 0 {
 			ipLimit = payload.IPLimit
-			if ipLimit <= 0 {
-				ipLimit = 1
+			if ipLimit < 0 {
+				ipLimit = 0
 			}
 		}
 

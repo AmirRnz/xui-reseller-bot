@@ -244,3 +244,62 @@ func TestCalculateQuoteIgnoresLegacyFloatPricesAndPercent(t *testing.T) {
 		t.Fatalf("legacy float fields changed integer-Toman quote: %+v", quote)
 	}
 }
+
+func TestCalculateQuote_InfiniteIPLimit(t *testing.T) {
+	// Finite plan with infinite (0) and free IP limit
+	limitedPlan := &db.PaidPlan{
+		ID:                      10,
+		Name:                    "Limited Infinite IP",
+		IsLimited:               true,
+		PricePerGBToman:         2000,
+		MinDataGB:               10,
+		PricePerExtraMonthToman: 15000,
+		BaseIPLimit:             0,
+		MaxIPLimit:              0,
+		PricePerExtraIPToman:    5000,
+	}
+	qLimited := CalculateQuote(QuoteParams{
+		UserID:  100,
+		Plan:    limitedPlan,
+		Months:  2,
+		IPLimit: 0,
+		DataGB:  20,
+	})
+	// 20 GB * 2000 = 40000; 1 extra month = 15000; extra IP = 0
+	if qLimited.IPLimit != 0 {
+		t.Fatalf("expected IPLimit 0, got %d", qLimited.IPLimit)
+	}
+	if qLimited.ExtraIPPriceToman != 0 {
+		t.Fatalf("expected ExtraIPPriceToman 0, got %d", qLimited.ExtraIPPriceToman)
+	}
+	if qLimited.FinalPriceToman != 55000 {
+		t.Fatalf("expected FinalPriceToman 55000, got %d", qLimited.FinalPriceToman)
+	}
+
+	// Unlimited plan with infinite (0) IP limit
+	unlimitedPlan := &db.PaidPlan{
+		ID:                   11,
+		Name:                 "Unlimited Infinite IP",
+		IsLimited:            false,
+		BasePriceToman:       80000,
+		BaseIPLimit:          0,
+		MaxIPLimit:           0,
+		PricePerExtraIPToman: 10000,
+	}
+	qUnlimited := CalculateQuote(QuoteParams{
+		UserID:  100,
+		Plan:    unlimitedPlan,
+		Months:  1,
+		IPLimit: 0,
+	})
+	if qUnlimited.IPLimit != 0 {
+		t.Fatalf("expected IPLimit 0, got %d", qUnlimited.IPLimit)
+	}
+	if qUnlimited.ExtraIPPriceToman != 0 {
+		t.Fatalf("expected ExtraIPPriceToman 0, got %d", qUnlimited.ExtraIPPriceToman)
+	}
+	if qUnlimited.FinalPriceToman != 80000 {
+		t.Fatalf("expected FinalPriceToman 80000, got %d", qUnlimited.FinalPriceToman)
+	}
+}
+

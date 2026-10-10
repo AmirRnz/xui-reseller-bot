@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -221,7 +222,11 @@ func HandleReceiptPhoto(c telebot.Context) error {
 			var details string
 			switch pType {
 			case "buy":
-				details = fmt.Sprintf("خرید سرویس جدید\nطرح: %s\nایمیل: %s\nمدت: %d ماه\nIP همزمان: %d\nحجم: %d گیگابایت", customName, email, months, ipLimit, dataGB)
+				dataLabel := "نامحدود"
+				if dataGB > 0 {
+					dataLabel = fmt.Sprintf("%d گیگابایت", dataGB)
+				}
+				details = fmt.Sprintf("خرید سرویس جدید\nطرح: %s\nایمیل: %s\nمدت: %d ماه\nIP همزمان: %s\nحجم: %s", customName, email, months, persian.FormatIPLimit(ipLimit), dataLabel)
 			case "extend":
 				subDisplay := int64(0)
 				if subIDPtr != nil {
@@ -461,27 +466,92 @@ func snapshotString(snapshot map[string]any, key string) string {
 }
 
 func snapshotInt64(snapshot map[string]any, key string) int64 {
+	if snapshot == nil {
+		return 0
+	}
 	value := snapshot[key]
-	parsed, _ := strconv.ParseInt(strings.TrimSpace(fmt.Sprintf("%v", value)), 10, 64)
-	return parsed
+	if value == nil {
+		return 0
+	}
+	switch v := value.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case int32:
+		return int64(v)
+	case float64:
+		return int64(v)
+	case float32:
+		return int64(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return n
+		}
+		if f, err := v.Float64(); err == nil {
+			return int64(f)
+		}
+	case string:
+		str := strings.TrimSpace(v)
+		if n, err := strconv.ParseInt(str, 10, 64); err == nil {
+			return n
+		}
+		if f, err := strconv.ParseFloat(str, 64); err == nil {
+			return int64(f)
+		}
+	default:
+		str := strings.TrimSpace(fmt.Sprintf("%v", value))
+		if n, err := strconv.ParseInt(str, 10, 64); err == nil {
+			return n
+		}
+		if f, err := strconv.ParseFloat(str, 64); err == nil {
+			return int64(f)
+		}
+	}
+	return 0
 }
 
 func snapshotIntSlice(value any) []int {
+	if value == nil {
+		return nil
+	}
 	switch values := value.(type) {
 	case []int:
 		return append([]int(nil), values...)
 	case []int64:
 		out := make([]int, 0, len(values))
-		for _, value := range values {
-			out = append(out, int(value))
+		for _, v := range values {
+			out = append(out, int(v))
+		}
+		return out
+	case []float64:
+		out := make([]int, 0, len(values))
+		for _, v := range values {
+			out = append(out, int(v))
 		}
 		return out
 	case []any:
 		out := make([]int, 0, len(values))
-		for _, value := range values {
-			parsed, err := strconv.Atoi(strings.TrimSpace(fmt.Sprintf("%v", value)))
-			if err == nil {
-				out = append(out, parsed)
+		for _, val := range values {
+			switch v := val.(type) {
+			case int:
+				out = append(out, v)
+			case int64:
+				out = append(out, int(v))
+			case float64:
+				out = append(out, int(v))
+			case json.Number:
+				if n, err := v.Int64(); err == nil {
+					out = append(out, int(n))
+				}
+			case string:
+				if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+					out = append(out, parsed)
+				}
+			default:
+				if parsed, err := strconv.Atoi(strings.TrimSpace(fmt.Sprintf("%v", val))); err == nil {
+					out = append(out, parsed)
+				}
 			}
 		}
 		return out
