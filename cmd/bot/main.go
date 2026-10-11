@@ -53,6 +53,12 @@ func main() {
 	xuiClient.StartReadinessChecks(ctx, 30*time.Second)
 
 	reconcileProcessor := reconcile.NewProcessor("resell_bot_reconciler", xuiClient)
+	reconcileProcessor.OnPurchaseProvisioned = func(pCtx context.Context, pReqID int64) {
+		handlers.NotifyUserPurchaseFulfilled(pCtx, pReqID)
+	}
+	if err := db.ResetStuckDirectPaymentReconciliations(ctx); err != nil {
+		log.Printf("Warning: failed to reset stuck direct payment reconciliations: %v", err)
+	}
 	reconcileProcessor.Start(ctx, 30*time.Second)
 
 	syncWorker := sync.NewSyncWorker(xuiClient, 5*time.Minute)
@@ -66,6 +72,16 @@ func main() {
 	scheduler.Start(ctx, cfg)
 
 	bot.Start(&cfg.Bot, xuiClient)
+
+	go func() {
+		time.Sleep(1 * time.Second)
+		_, _ = reconcileProcessor.ProcessOnce(context.Background())
+		if ids, err := db.GetUnnotifiedSucceededPurchaseIDs(context.Background()); err == nil {
+			for _, id := range ids {
+				handlers.NotifyUserPurchaseFulfilled(context.Background(), id)
+			}
+		}
+	}()
 
 	outboxWorker := outbox.NewWorker(bot.Bot)
 	outboxWorker.Start(ctx, 15*time.Second)

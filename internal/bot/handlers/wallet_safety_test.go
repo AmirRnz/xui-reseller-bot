@@ -710,3 +710,9 @@ func TestNilXUIClientLeavesCancellationAndRefundDurable(t *testing.T) {
 		t.Fatalf("expected wallet balance unchanged (%d), got %d", initialBalance, currentBalance)
 	}
 }
+
+func TestNotifyUserPurchaseFulfilled_Safety(t *testing.T) {
+	ctx := context.Background()
+	// Should not panic on non-existent purchase
+	NotifyUserPurchaseFulfilled(ctx, 999999999)
+}

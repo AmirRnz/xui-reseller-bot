@@ -446,15 +446,149 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 	}
 	if bot.XUIClient != nil {
 		processor := reconcile.NewProcessor("direct_approval", bot.XUIClient)
+		processor.OnPurchaseProvisioned = func(pCtx context.Context, pReqID int64) {
+			NotifyUserPurchaseFulfilled(pCtx, pReqID)
+		}
 		_, _ = processor.ProcessOnce(context.Background())
 	}
 	refreshed, _ := db.GetPurchaseRequestByID(context.Background(), reqID)
+	if refreshed == nil || refreshed.ProvisioningStatus != db.PurchaseProvisioningSucceeded {
+		time.Sleep(150 * time.Millisecond)
+		refreshed, _ = db.GetPurchaseRequestByID(context.Background(), reqID)
+	}
 	if refreshed != nil && refreshed.ProvisioningStatus == db.PurchaseProvisioningSucceeded {
+		NotifyUserPurchaseFulfilled(context.Background(), reqID)
 		_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID)})
 		return c.Edit(fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID))
 	}
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("تایید درخواست خرید #%d ثبت شد؛ فعال‌سازی ادامه می‌یابد.", reqID)})
 	return c.Edit(fmt.Sprintf("✅ درخواست خرید #%d تایید شد و برای فعال‌سازی امن ثبت گردید.", reqID))
+}
+
+// NotifyUserPurchaseFulfilled delivers the provisioned service details, subscription links,
+// and QR codes to the reseller/buyer after an approved purchase succeeds.
+// It is idempotent and safe to call multiple times.
+func NotifyUserPurchaseFulfilled(ctx context.Context, purchaseRequestID int64) {
+	req, err := db.GetPurchaseRequestByID(ctx, purchaseRequestID)
+	if err != nil || req == nil {
+		return
+	}
+	if req.Status != "approved" || req.ProvisioningStatus != db.PurchaseProvisioningSucceeded {
+		return
+	}
+
+	user, err := db.GetUserByID(ctx, req.UserID)
+	if err != nil || user == nil || user.TelegramID == 0 {
+		return
+	}
+
+	var sub *db.Subscription
+	if req.Type == "buy" {
+		if req.ClientEmail != "" {
+			sub, _ = db.GetSubscriptionByEmail(ctx, req.ClientEmail)
+		}
+		if sub == nil && req.ProvisioningSnapshot != nil {
+			if subID := snapshotString(req.ProvisioningSnapshot, "sub_id"); subID != "" {
+				sub, _ = db.GetSubscriptionBySubID(ctx, subID)
+			}
+		}
+		if sub == nil {
+			log.Printf("[WARN] subscription for purchase #%d not yet found in DB for notification", purchaseRequestID)
+			return
+		}
+	}
+
+	marked, err := db.MarkPurchaseRequestNotified(ctx, purchaseRequestID)
+	if err != nil || !marked {
+		return // already notified
+	}
+
+	var notifyErr error
+	switch req.Type {
+	case "buy":
+		var subLink string
+		if bot.XUIClient != nil && sub != nil {
+			links, _ := bot.XUIClient.GetSubscriptionLinks(sub.SubID)
+			for _, link := range links {
+				if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
+					subLink = link
+					break
+				}
+			}
+			if subLink == "" {
+				subLink = bot.XUIClient.SubscriptionURLFor(sub.SubID)
+			}
+		}
+
+		planName := "طرح اختصاصی"
+		var usageDesc string
+		if req.PlanID != nil {
+			if plan, pErr := db.GetPaidPlanByID(ctx, *req.PlanID); pErr == nil && plan != nil {
+				planName = plan.Name
+				usageDesc = plan.UsageDescription
+			}
+		} else if req.CustomName != "" {
+			planName = req.CustomName
+		}
+
+		durationLabel := "نامحدود"
+		if req.Months > 0 {
+			durationLabel = fmt.Sprintf("%d ماهه (پس از اولین اتصال شروع می‌شود)", req.Months)
+		}
+
+		dataLabel := "نامحدود"
+		if req.DataGB > 0 {
+			dataLabel = fmt.Sprintf("%d گیگابایت", req.DataGB)
+		}
+
+		ipLabel := "نامحدود"
+		if req.IPLimit > 0 {
+			ipLabel = fmt.Sprintf("%d کاربر / IP", req.IPLimit)
+		}
+
+		details := fmt.Sprintf("✅ پرداخت شما تایید شد و اشتراک با موفقیت فعال گردید!\n\n📦 نام طرح: %s\n⏱️ مدت زمان: %s\n📊 سقف ترافیک: %s\n👥 سقف کاربر: %s\n💰 هزینه پرداخت شده: %s",
+			planName, durationLabel, dataLabel, ipLabel, persian.FormatMoney(purchaseAmountToman(req)))
+		if usageDesc != "" {
+			details += fmt.Sprintf("\n\nنکات استفاده:\n%s", usageDesc)
+		}
+
+		notifyErr = sendSubscriptionResultTo(user.TelegramID, subLink, details)
+
+	case "extend":
+		subDisplay := req.ClientEmail
+		if req.SubscriptionID != nil {
+			if s, _ := db.GetSubscriptionByID(ctx, int(*req.SubscriptionID)); s != nil && s.DisplayName != "" {
+				subDisplay = s.DisplayName
+			}
+		}
+		msg := fmt.Sprintf("✅ پرداخت شما تایید و اشتراک **%s** به مدت %d ماه با موفقیت تمدید شد.\n💰 مبلغ پرداخت شده: %s",
+			subDisplay, req.Months, persian.FormatMoney(purchaseAmountToman(req)))
+		if bot.Bot != nil {
+			_, notifyErr = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
+		}
+
+	case "upgrade_ip":
+		subDisplay := req.ClientEmail
+		if req.SubscriptionID != nil {
+			if s, _ := db.GetSubscriptionByID(ctx, int(*req.SubscriptionID)); s != nil && s.DisplayName != "" {
+				subDisplay = s.DisplayName
+			}
+		}
+		ipLabel := "نامحدود"
+		if req.IPLimit > 0 {
+			ipLabel = fmt.Sprintf("%d کاربر / IP", req.IPLimit)
+		}
+		msg := fmt.Sprintf("✅ پرداخت شما تایید و سقف IP همزمان اشتراک **%s** به %s با موفقیت ارتقا یافت.\n💰 هزینه ارتقا پرداخت شده: %s",
+			subDisplay, ipLabel, persian.FormatMoney(purchaseAmountToman(req)))
+		if bot.Bot != nil {
+			_, notifyErr = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
+		}
+	}
+
+	if notifyErr != nil {
+		log.Printf("[ERROR] failed to deliver purchase fulfillment notification to user %d: %v", user.TelegramID, notifyErr)
+		_ = db.UnmarkPurchaseRequestNotified(ctx, purchaseRequestID)
+	}
 }
 
 func snapshotString(snapshot map[string]any, key string) string {

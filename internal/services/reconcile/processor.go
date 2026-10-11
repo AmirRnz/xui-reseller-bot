@@ -74,6 +74,7 @@ type Processor struct {
 	GetPurchaseRequestByIDFn       func(ctx context.Context, id int64) (*db.PurchaseRequest, error)
 	UpdateSubscriptionFn           func(ctx context.Context, sub *db.Subscription) error
 	CreateRefundRequestFn          func(ctx context.Context, r *db.RefundRequest) error
+	OnPurchaseProvisioned          func(ctx context.Context, purchaseRequestID int64)
 	BatchSize                      int
 	MaxRetry                       int
 }
@@ -531,7 +532,8 @@ func (p *Processor) startWalletPurchaseProvisioning(ctx context.Context, rec *db
 			ID: payload.ExpectedUUID, Email: payload.Email, SubID: payload.ExpectedSubID,
 			Enable: true, ExpiryTime: payload.ExpiryTimeMilli, LimitIP: payload.IPLimit,
 			TotalGB: payload.TotalBytes, Flow: payload.Flow, Group: payload.Group,
-			TgID: payload.TelegramID, Comment: comment,
+			TgID: payload.TelegramID, Comment: comment, Password: payload.ExpectedUUID,
+			Auth: payload.ExpectedUUID, Security: "auto",
 		},
 	})
 	if write.Outcome != xui.WriteSucceeded {
@@ -583,13 +585,39 @@ func (p *Processor) startWalletPurchaseProvisioning(ctx context.Context, rec *db
 }
 
 func walletRemoteMatches(remote *xui.XUIClientInfo, payload *PurchaseProvisioningPayload) bool {
+	if remote == nil || remote.Email != payload.Email || remote.SubID != payload.ExpectedSubID || !remote.Enable {
+		return false
+	}
+	remoteUUID := remote.UUID
+	if remoteUUID == "" {
+		remoteUUID = remote.Password
+	}
+	if remoteUUID == "" {
+		remoteUUID = remote.Auth
+	}
+	if remoteUUID != payload.ExpectedUUID {
+		return false
+	}
+	if remote.ExpiryTime != payload.ExpiryTimeMilli || remote.LimitIP != payload.IPLimit || remote.TotalGB != payload.TotalBytes {
+		return false
+	}
+	if payload.Flow != "" && remote.Flow != "" && cleanFlow(remote.Flow) != cleanFlow(payload.Flow) {
+		return false
+	}
+	if payload.Group != "" && remote.Group != "" && remote.Group != payload.Group {
+		return false
+	}
+	if payload.TelegramID != 0 && remote.TgID != 0 && remote.TgID != payload.TelegramID {
+		return false
+	}
 	comment := payload.PlanName
 	if comment == "" {
 		comment = payload.DisplayName
 	}
-	return remote != nil && remote.Email == payload.Email && remote.UUID == payload.ExpectedUUID && remote.SubID == payload.ExpectedSubID &&
-		remote.Enable && remote.ExpiryTime == payload.ExpiryTimeMilli && remote.LimitIP == payload.IPLimit && remote.TotalGB == payload.TotalBytes &&
-		remote.Flow == payload.Flow && remote.Group == payload.Group && remote.TgID == payload.TelegramID && remote.Comment == comment && sameIDs(remote.InboundIDs, payload.InboundIDs)
+	if comment != "" && remote.Comment != "" && remote.Comment != comment {
+		return false
+	}
+	return sameIDs(remote.InboundIDs, payload.InboundIDs)
 }
 
 func sameIDs(actual, expected []int) bool {
@@ -1216,6 +1244,9 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 				Err:  fmt.Errorf("failed to set provisioning status succeeded: %w", statusErr),
 			}
 		}
+		if p.OnPurchaseProvisioned != nil {
+			p.OnPurchaseProvisioned(ctx, payload.PurchaseRequestID)
+		}
 		return ProcessOutcome{
 			Kind:         OutcomeResolved,
 			TargetStatus: db.ReconciliationStatusResolvedVerified,
@@ -1257,6 +1288,9 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 				Group:      payload.Group,
 				TgID:       payload.TelegramID,
 				Comment:    payload.CustomName,
+				Password:   payload.ExpectedUUID,
+				Auth:       payload.ExpectedUUID,
+				Security:   "auto",
 			},
 		}
 
@@ -1321,6 +1355,9 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 				Err:  fmt.Errorf("failed to set provisioning status succeeded: %w", statusErr),
 			}
 		}
+		if p.OnPurchaseProvisioned != nil {
+			p.OnPurchaseProvisioned(ctx, payload.PurchaseRequestID)
+		}
 		return ProcessOutcome{
 			Kind:         OutcomeResolved,
 			TargetStatus: db.ReconciliationStatusResolved,
@@ -1336,10 +1373,39 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 }
 
 func directRemoteMatches(remote *xui.XUIClientInfo, payload *DirectPaymentProvisioningPayload) bool {
-	return remote != nil && remote.Email == payload.ClientEmail && remote.UUID == payload.ExpectedUUID && remote.SubID == payload.ExpectedSubID &&
-		remote.Enable && remote.ExpiryTime == payload.ExpiryTimeMilli && remote.LimitIP == payload.IPLimit &&
-		remote.TotalGB == payload.TotalBytes && remote.Flow == payload.Flow && remote.Group == payload.Group &&
-		remote.TgID == payload.TelegramID && remote.Comment == payload.CustomName && sameIDs(remote.InboundIDs, payload.InboundIDs)
+	if remote == nil || remote.Email != payload.ClientEmail || remote.SubID != payload.ExpectedSubID || !remote.Enable {
+		return false
+	}
+	remoteUUID := remote.UUID
+	if remoteUUID == "" {
+		remoteUUID = remote.Password
+	}
+	if remoteUUID == "" {
+		remoteUUID = remote.Auth
+	}
+	if remoteUUID != payload.ExpectedUUID {
+		return false
+	}
+	if remote.ExpiryTime != payload.ExpiryTimeMilli || remote.LimitIP != payload.IPLimit || remote.TotalGB != payload.TotalBytes {
+		return false
+	}
+	if payload.Flow != "" && remote.Flow != "" && cleanFlow(remote.Flow) != cleanFlow(payload.Flow) {
+		return false
+	}
+	if payload.Group != "" && remote.Group != "" && remote.Group != payload.Group {
+		return false
+	}
+	if payload.TelegramID != 0 && remote.TgID != 0 && remote.TgID != payload.TelegramID {
+		return false
+	}
+	if payload.CustomName != "" && remote.Comment != "" && remote.Comment != payload.CustomName {
+		return false
+	}
+	return sameIDs(remote.InboundIDs, payload.InboundIDs)
+}
+
+func cleanFlow(flow string) string {
+	return strings.Trim(strings.TrimSpace(flow), `'"`)
 }
 
 func (p *Processor) handleSubscriptionRemoteMissing(ctx context.Context, rec *db.ReconciliationRecord) ProcessOutcome {
@@ -1440,6 +1506,9 @@ func (p *Processor) handleDirectSubscriptionUpdate(ctx context.Context, payload 
 	}
 	if err := db.SetPurchaseProvisioningStatus(ctx, payload.PurchaseRequestID, db.PurchaseProvisioningSucceeded); err != nil {
 		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("failed to mark direct subscription update succeeded: %w", err)}
+	}
+	if p.OnPurchaseProvisioned != nil {
+		p.OnPurchaseProvisioned(ctx, payload.PurchaseRequestID)
 	}
 	return ProcessOutcome{Kind: OutcomeResolved, TargetStatus: db.ReconciliationStatusResolvedVerified, Resolution: "direct subscription update verified in panel and database"}
 }

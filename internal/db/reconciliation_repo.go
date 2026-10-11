@@ -790,3 +790,33 @@ func ResetReconciliationForRetry(ctx context.Context, id int64) error {
 	}
 	return nil
 }
+
+// ResetStuckDirectPaymentReconciliations resets manual_review direct payment records
+// for approved purchases back to pending so that the processor can resolve and deliver them.
+func ResetStuckDirectPaymentReconciliations(ctx context.Context) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return nil
+	}
+	_, err := Pool.Exec(ctx, `
+		UPDATE reconciliation_records r
+		SET status = 'pending',
+		    manual_review_reason = '',
+		    locked_at = NULL,
+		    locked_by = NULL,
+		    next_attempt_at = NOW(),
+		    updated_at = NOW(),
+		    version = COALESCE(version, 1) + 1,
+		    observed_state = jsonb_build_object('outcome', 'approval_committed', 'phase', 'ready')
+		FROM purchase_requests pr
+		WHERE r.purchase_request_id = pr.id
+		  AND r.kind = 'direct_payment_provisioning_retry'
+		  AND r.status IN ('manual_review', 'failed_terminal', 'pending')
+		  AND pr.status = 'approved'
+		  AND pr.provisioning_status != 'succeeded'
+	`)
+	return err
+}
+

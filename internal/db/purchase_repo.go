@@ -38,6 +38,10 @@ func GetPurchaseRequestByID(ctx context.Context, id int64) (*PurchaseRequest, er
 	ctx, cancel := dbCtx(ctx)
 	defer cancel()
 
+	if Pool == nil {
+		return nil, nil
+	}
+
 	r := &PurchaseRequest{}
 	err := Pool.QueryRow(ctx, `
 		SELECT id, user_id, type, plan_id, subscription_id, quote_id, price_toman, price, months, ip_limit, data_gb, custom_name, client_email, telegram_file_id, status, provisioning_status, COALESCE(operation_key, ''), admin_id, created_at, updated_at, provisioning_snapshot, payment_intent_id, receipt_submitted_at, review_reason
@@ -567,4 +571,74 @@ func RejectRefundRequest(ctx context.Context, id int64, adminID int64) (*RefundR
 		return nil, err
 	}
 	return r, nil
+}
+
+// MarkPurchaseRequestNotified atomically marks a purchase request as notified if it hasn't been yet.
+// Returns true if the status was successfully marked, false if it was already marked or not eligible.
+func MarkPurchaseRequestNotified(ctx context.Context, id int64) (bool, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return false, nil
+	}
+	res, err := Pool.Exec(ctx, `
+		UPDATE purchase_requests
+		SET provisioning_snapshot = jsonb_set(COALESCE(provisioning_snapshot, '{}'::jsonb), '{user_notified}', 'true'::jsonb),
+		    updated_at = NOW()
+		WHERE id = $1
+		  AND (provisioning_snapshot IS NULL OR (provisioning_snapshot->>'user_notified') IS DISTINCT FROM 'true')
+	`, id)
+	if err != nil {
+		return false, err
+	}
+	return res.RowsAffected() > 0, nil
+}
+
+// UnmarkPurchaseRequestNotified unsets user_notified flag so that notification can be retried.
+func UnmarkPurchaseRequestNotified(ctx context.Context, id int64) error {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return nil
+	}
+	_, err := Pool.Exec(ctx, `
+		UPDATE purchase_requests
+		SET provisioning_snapshot = provisioning_snapshot - 'user_notified',
+		    updated_at = NOW()
+		WHERE id = $1
+	`, id)
+	return err
+}
+
+// GetUnnotifiedSucceededPurchaseIDs returns the IDs of approved purchase requests that have succeeded but not yet notified.
+func GetUnnotifiedSucceededPurchaseIDs(ctx context.Context) ([]int64, error) {
+	ctx, cancel := dbCtx(ctx)
+	defer cancel()
+
+	if Pool == nil {
+		return nil, nil
+	}
+	rows, err := Pool.Query(ctx, `
+		SELECT id FROM purchase_requests
+		WHERE status = 'approved'
+		  AND provisioning_status = 'succeeded'
+		  AND (provisioning_snapshot IS NULL OR (provisioning_snapshot->>'user_notified') IS DISTINCT FROM 'true')
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
