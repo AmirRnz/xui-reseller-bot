@@ -1261,3 +1261,42 @@ func TestUpdateClientPatchResult(t *testing.T) {
 		}
 	})
 }
+
+func TestGetClientByEmail_WrappedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/panel/api/clients/get/wrapped@example.com" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"success": true,
+				"obj": map[string]any{
+					"client": map[string]any{
+						"id":         1006,
+						"email":      "wrapped@example.com",
+						"subId":      "sub123",
+						"uuid":       "u-1",
+						"password":   "p-1",
+						"enable":     true,
+						"totalGB":    int64(5368709120),
+						"expiryTime": int64(-2592000000),
+					},
+					"inboundIds": []int{31, 62, 103},
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client, err := newReadyClient(&config.XUIConfig{BaseURL: server.URL})
+	if err != nil {
+		t.Fatalf("newReadyClient failed: %v", err)
+	}
+
+	info, err := client.GetClientByEmail("wrapped@example.com")
+	if err != nil {
+		t.Fatalf("GetClientByEmail failed: %v", err)
+	}
+	if info.Email != "wrapped@example.com" || info.SubID != "sub123" || len(info.InboundIDs) != 3 {
+		t.Fatalf("unexpected client info decoded: %+v", info)
+	}
+}

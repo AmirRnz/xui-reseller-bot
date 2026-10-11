@@ -2,6 +2,7 @@ package xui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -923,10 +924,29 @@ func (c *Client) GetClientEmailsByGroup(group string) ([]string, error) {
 }
 
 func (c *Client) GetClientByEmail(email string) (*XUIClientInfo, error) {
-	var client XUIClientInfo
-	if err := c.doRequest("GET", "/panel/api/clients/get/"+pathEscape(email), nil, &client); err != nil {
+	var raw json.RawMessage
+	if err := c.doRequest("GET", "/panel/api/clients/get/"+pathEscape(email), nil, &raw); err != nil {
 		return nil, err
 	}
+
+	var client XUIClientInfo
+	// Real 3x-ui 3.8.5 wraps client details in {"client": {...}, "inboundIds": [...]}
+	var wrapped struct {
+		Client     XUIClientInfo `json:"client"`
+		InboundIDs []int         `json:"inboundIds"`
+	}
+	if err := json.Unmarshal(raw, &wrapped); err == nil && wrapped.Client.Email != "" {
+		client = wrapped.Client
+		if len(wrapped.InboundIDs) > 0 && len(client.InboundIDs) == 0 {
+			client.InboundIDs = wrapped.InboundIDs
+		}
+	} else {
+		// Fallback for unwrapped responses (mock servers / legacy format)
+		if err := json.Unmarshal(raw, &client); err != nil {
+			return nil, fmt.Errorf("failed to decode client info: %w", err)
+		}
+	}
+
 	if strings.TrimSpace(client.Email) == "" || client.Email != email {
 		return nil, fmt.Errorf("x-ui returned an empty or mismatched client for email %s", email)
 	}
