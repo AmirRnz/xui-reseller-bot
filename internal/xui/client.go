@@ -191,6 +191,10 @@ type PanelUpdateInfo struct {
 	UpdateAvailable bool   `json:"updateAvailable"`
 }
 
+type ServerStatusInfo struct {
+	PanelVersion string `json:"panelVersion"`
+}
+
 type ReadinessStatus struct {
 	MasterReachable bool   `json:"master_reachable"`
 	TokenValid      bool   `json:"token_valid"`
@@ -208,17 +212,28 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 		return status, status.Error
 	}
 
-	var updateInfo PanelUpdateInfo
-	err := c.doRequestContext(ctx, "GET", "/panel/api/server/getPanelUpdateInfo", nil, &updateInfo)
-	if err != nil {
-		status.Error = fmt.Errorf("master server unreachable or token invalid: %w", err)
-		c.SetReady(false)
-		return status, status.Error
+	var version string
+	var serverStatus ServerStatusInfo
+	err := c.doRequestContext(ctx, "GET", "/panel/api/server/status", nil, &serverStatus)
+	if err == nil && serverStatus.PanelVersion != "" {
+		version = serverStatus.PanelVersion
+	} else {
+		var updateInfo PanelUpdateInfo
+		if updateErr := c.doRequestContext(ctx, "GET", "/panel/api/server/getPanelUpdateInfo", nil, &updateInfo); updateErr != nil {
+			if err != nil {
+				status.Error = fmt.Errorf("master server unreachable or token invalid: %w", err)
+			} else {
+				status.Error = fmt.Errorf("master server unreachable or token invalid: %w", updateErr)
+			}
+			c.SetReady(false)
+			return status, status.Error
+		}
+		version = updateInfo.CurrentVersion
 	}
 	status.MasterReachable = true
 	status.TokenValid = true
-	status.Version = updateInfo.CurrentVersion
-	normalizedVersion := strings.TrimPrefix(strings.TrimSpace(updateInfo.CurrentVersion), "v")
+	status.Version = version
+	normalizedVersion := strings.TrimPrefix(strings.TrimSpace(version), "v")
 	status.VersionOK = isSupportedPanelVersion(normalizedVersion)
 	if !status.VersionOK {
 		status.Error = fmt.Errorf("unsupported 3x-ui version %s (expected 3.8.5)", status.Version)
