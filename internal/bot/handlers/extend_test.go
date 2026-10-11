@@ -61,6 +61,16 @@ func TestExtractSubscriptionCandidates(t *testing.T) {
 			input:    "سلام لطفا این اشتراک را تمدید کنید: https://sub.domain.ir:8443/sub/subtoken9988 ممنون",
 			contains: "subtoken9988",
 		},
+		{
+			name:     "dub subscription URL",
+			input:    "https://gorbe.rnziscoding.baby:2096/dub/9df82d79c0ed9b78",
+			contains: "9df82d79c0ed9b78",
+		},
+		{
+			name:     "dub subscription URL without scheme",
+			input:    "gorbe.rnziscoding.baby:2096/dub/9df82d79c0ed9b78",
+			contains: "9df82d79c0ed9b78",
+		},
 	}
 
 	for _, tt := range tests {

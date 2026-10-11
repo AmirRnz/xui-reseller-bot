@@ -138,6 +138,8 @@ func HandleText(c telebot.Context) error {
 			return ProcessExtendSubURL(c, text)
 		case "awaiting_extend_months_text":
 			return ProcessExtendMonthsText(c, text)
+		case "awaiting_extend_data_gb_text":
+			return ProcessExtendDataGBText(c, text)
 		case "awaiting_admin_draft_input":
 			return ProcessAdminDraftInput(c, text)
 		case "awaiting_admin_plan_access":
@@ -168,7 +170,7 @@ func HandleText(c telebot.Context) error {
 		return HandleExtendMenuFlow(c)
 	}
 
-	if user.IsApproved() && (strings.HasPrefix(text, "http://") || strings.HasPrefix(text, "https://") || strings.HasPrefix(text, "vless://") || strings.HasPrefix(text, "vmess://") || strings.HasPrefix(text, "trojan://") || strings.Contains(text, "/sub/")) {
+	if user.IsApproved() && (strings.HasPrefix(text, "http://") || strings.HasPrefix(text, "https://") || strings.HasPrefix(text, "vless://") || strings.HasPrefix(text, "vmess://") || strings.HasPrefix(text, "trojan://") || strings.Contains(text, "/sub/") || strings.Contains(text, "/dub/")) {
 		return ProcessExtendSubURL(c, text)
 	}
 

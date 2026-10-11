@@ -5,20 +5,10 @@ import (
 	"time"
 )
 
-// IsExtensionEligibleState preserves legacy renewals for active and manually
-// disabled paid services, and allows expired services to restart from now.
-// Cancelled, deleted, and reconciliation-conflicted rows remain ineligible.
+// IsExtensionEligibleState preserves renewals for active, disabled, and expired paid services.
+// Cancelled, deleted, and transitional rows remain ineligible.
 func IsExtensionEligibleState(status string, active bool, expireTime *int64, now time.Time) bool {
-	if status == SubscriptionStatusActive && active {
-		return true
-	}
-	if active || expireTime == nil || *expireTime <= 0 {
-		return false
-	}
-	if status == SubscriptionStatusDisabled {
-		return true
-	}
-	return status == SubscriptionStatusExpired && *expireTime <= now.UTC().UnixMilli()
+	return status == SubscriptionStatusActive || status == SubscriptionStatusDisabled || status == SubscriptionStatusExpired
 }
 
 // CalculateExtendedExpiry uses the current paid-service rule: months are fixed

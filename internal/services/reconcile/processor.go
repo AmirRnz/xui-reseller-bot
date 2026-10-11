@@ -1457,8 +1457,13 @@ func (p *Processor) handleDirectSubscriptionUpdate(ctx context.Context, payload 
 		if planErr != nil || plan == nil || plan.MaxIPLimit <= 0 || desiredIP > plan.MaxIPLimit {
 			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct IP upgrade exceeds the current paid plan limit"}
 		}
-	} else if payload.ActionType == "extend" && (payload.Months < 1 || payload.Months > 120) {
-		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct extension duration is outside the supported range"}
+	} else if payload.ActionType == "extend" {
+		if payload.Months < 1 || payload.Months > 120 {
+			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct extension duration is outside the supported range"}
+		}
+		if payload.DesiredIPLimit != nil {
+			desiredIP = *payload.DesiredIPLimit
+		}
 	}
 	desiredExpiry := payload.ExpiryTimeMilli
 	if payload.ActionType == "upgrade_ip" && desiredExpiry == 0 && sub.ExpireTime != nil {
@@ -1468,10 +1473,26 @@ func (p *Processor) handleDirectSubscriptionUpdate(ctx context.Context, payload 
 		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct subscription update has no exact durable expiry value"}
 	}
 
-	if remote.ExpiryTime != desiredExpiry || remote.LimitIP != desiredIP || !remote.Enable {
+	desiredTotalGB := remote.TotalGB
+	if payload.ActionType == "extend" {
+		if payload.PlanID != nil && *payload.PlanID > 0 {
+			plan, _ := db.GetPaidPlanByID(ctx, int64(*payload.PlanID))
+			if plan != nil {
+				if plan.IsLimited {
+					desiredTotalGB = payload.TotalBytes
+				} else {
+					desiredTotalGB = 0
+				}
+			}
+		} else if payload.TotalBytes > 0 {
+			desiredTotalGB = payload.TotalBytes
+		}
+	}
+
+	if remote.ExpiryTime != desiredExpiry || remote.LimitIP != desiredIP || remote.TotalGB != desiredTotalGB || !remote.Enable {
 		write := p.XUI.UpdateClientResult(payload.ClientEmail, xui.ClientConfig{
 			Email: payload.ClientEmail, Enable: true, ExpiryTime: desiredExpiry,
-			LimitIP: desiredIP, TotalGB: remote.TotalGB, SubID: payload.ExpectedSubID,
+			LimitIP: desiredIP, TotalGB: desiredTotalGB, SubID: payload.ExpectedSubID,
 		})
 		if write.Outcome != xui.WriteSucceeded {
 			return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("direct subscription update did not complete: %v", write.Err)}
@@ -1484,12 +1505,16 @@ func (p *Processor) handleDirectSubscriptionUpdate(ctx context.Context, payload 
 			return ProcessOutcome{Kind: OutcomeManualReview, Reason: fmt.Sprintf("direct update readback identity mismatch: %v", err)}
 		}
 	}
-	if remote.ExpiryTime != desiredExpiry || remote.LimitIP != desiredIP || !remote.Enable {
+	if remote.ExpiryTime != desiredExpiry || remote.LimitIP != desiredIP || remote.TotalGB != desiredTotalGB || !remote.Enable {
 		return ProcessOutcome{Kind: OutcomeRetry, Err: errors.New("direct subscription update readback does not match durable target state")}
 	}
 
 	sub.ExpireTime = &desiredExpiry
 	sub.IPLimit = desiredIP
+	sub.TrafficLimitBytes = desiredTotalGB
+	if payload.ActionType == "extend" && payload.PlanID != nil && *payload.PlanID > 0 {
+		sub.PlanID = payload.PlanID
+	}
 	sub.IsActive = true
 	sub.Status = db.SubscriptionStatusActive
 	sub.DesiredIPLimit = nil

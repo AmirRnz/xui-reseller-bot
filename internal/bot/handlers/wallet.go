@@ -431,6 +431,15 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 			if err != nil {
 				return c.Send("تاریخ انقضای فعلی برای تمدید معتبر نیست؛ درخواست تایید نشد.")
 			}
+			desiredLimit := req.IPLimit
+			payload.DesiredIPLimit = &desiredLimit
+			if req.PlanID != nil {
+				pInt := int(*req.PlanID)
+				payload.PlanID = &pInt
+			}
+			if req.DataGB > 0 {
+				payload.TotalBytes = int64(req.DataGB) * 1024 * 1024 * 1024
+			}
 		} else if payload.ActionType == "upgrade_ip" {
 			desiredLimit := req.IPLimit
 			payload.DesiredIPLimit = &desiredLimit
@@ -556,15 +565,44 @@ func NotifyUserPurchaseFulfilled(ctx context.Context, purchaseRequestID int64) {
 
 	case "extend":
 		subDisplay := req.ClientEmail
+		var sub *db.Subscription
 		if req.SubscriptionID != nil {
-			if s, _ := db.GetSubscriptionByID(ctx, int(*req.SubscriptionID)); s != nil && s.DisplayName != "" {
-				subDisplay = s.DisplayName
+			sub, _ = db.GetSubscriptionByID(ctx, int(*req.SubscriptionID))
+			if sub != nil && sub.DisplayName != "" {
+				subDisplay = sub.DisplayName
 			}
 		}
-		msg := fmt.Sprintf("✅ پرداخت شما تایید و اشتراک **%s** به مدت %d ماه با موفقیت تمدید شد.\n💰 مبلغ پرداخت شده: %s",
-			subDisplay, req.Months, persian.FormatMoney(purchaseAmountToman(req)))
-		if bot.Bot != nil {
-			_, notifyErr = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(msg), telebot.ModeMarkdown)
+		var subLink string
+		if bot.XUIClient != nil && sub != nil && sub.SubID != "" {
+			links, _ := bot.XUIClient.GetSubscriptionLinks(sub.SubID)
+			for _, link := range links {
+				if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
+					subLink = link
+					break
+				}
+			}
+			if subLink == "" {
+				subLink = bot.XUIClient.SubscriptionURLFor(sub.SubID)
+			}
+		}
+
+		durationLabel := fmt.Sprintf("%d ماه", req.Months)
+		dataLabel := "نامحدود"
+		if req.DataGB > 0 {
+			dataLabel = fmt.Sprintf("%d گیگابایت", req.DataGB)
+		}
+		ipLabel := "نامحدود"
+		if req.IPLimit > 0 {
+			ipLabel = fmt.Sprintf("%d کاربر / IP", req.IPLimit)
+		}
+
+		details := fmt.Sprintf("✅ پرداخت شما تایید شد و اشتراک **%s** با موفقیت تمدید شد!\n\n⏱️ مدت زمان تمدید: %s\n📊 سقف ترافیک: %s\n👥 سقف کاربر: %s\n💰 هزینه پرداخت شده: %s",
+			subDisplay, durationLabel, dataLabel, ipLabel, persian.FormatMoney(purchaseAmountToman(req)))
+
+		if subLink != "" {
+			notifyErr = sendSubscriptionResultTo(user.TelegramID, subLink, details)
+		} else if bot.Bot != nil {
+			_, notifyErr = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, FormatMarkdown(details), telebot.ModeMarkdown)
 		}
 
 	case "upgrade_ip":
