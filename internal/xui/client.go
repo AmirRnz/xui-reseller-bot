@@ -286,6 +286,36 @@ func (c *Client) GetCachedInbounds() []Inbound {
 	return nil
 }
 
+func (c *Client) FilterValidInboundIDs(ids []int) []int {
+	if len(ids) == 0 || c == nil {
+		return ids
+	}
+	cached := c.GetCachedInbounds()
+	if len(cached) == 0 {
+		inbounds, err := c.GetInbounds()
+		if err == nil && len(inbounds) > 0 {
+			cached = inbounds
+		}
+	}
+	if len(cached) == 0 {
+		return ids
+	}
+	known := make(map[int]bool, len(cached))
+	for _, in := range cached {
+		known[in.ID] = true
+	}
+	filtered := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if known[id] {
+			filtered = append(filtered, id)
+		}
+	}
+	if len(filtered) == 0 {
+		return ids
+	}
+	return filtered
+}
+
 func (c *Client) AddClient(req AddClientRequest) error {
 	return c.AddClientResult(req).Err
 }
@@ -298,6 +328,7 @@ func (c *Client) AddClientResult(req AddClientRequest) WriteResult {
 	if err := c.readinessWriteError(); err != nil {
 		return WriteResult{Outcome: WriteDefinitiveFailure, Err: err}
 	}
+	req.InboundIDs = c.FilterValidInboundIDs(req.InboundIDs)
 	err := c.doRequest("POST", "/panel/api/clients/add", req, nil)
 	if err == nil {
 		return WriteResult{Outcome: WriteSucceeded}

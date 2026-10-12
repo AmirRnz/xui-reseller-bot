@@ -436,7 +436,7 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 		}
 
 		// 3. Adopt client into local DB
-		if !walletRemoteMatches(remote, payload) {
+		if !p.walletRemoteMatches(remote, payload) {
 			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "remote wallet-purchase client does not match the exact durable desired state"}
 		}
 		displayName := payload.DisplayName
@@ -559,7 +559,7 @@ func (p *Processor) startWalletPurchaseProvisioning(ctx context.Context, rec *db
 	if err := verifyClientIdentity(remote, payload.Email, payload.ExpectedUUID, payload.ExpectedSubID); err != nil {
 		return ProcessOutcome{Kind: OutcomeManualReview, Reason: fmt.Sprintf("created wallet client identity could not be proven: %v", err)}
 	}
-	if !walletRemoteMatches(remote, payload) {
+	if !p.walletRemoteMatches(remote, payload) {
 		return ProcessOutcome{Kind: OutcomeManualReview, Reason: "created wallet client does not match the durable desired remote state"}
 	}
 
@@ -591,7 +591,28 @@ func (p *Processor) startWalletPurchaseProvisioning(ctx context.Context, rec *db
 	}
 }
 
+func (p *Processor) filterInbounds(expected []int) []int {
+	if p != nil && p.XUI != nil {
+		if f, ok := p.XUI.(interface{ FilterValidInboundIDs([]int) []int }); ok {
+			return f.FilterValidInboundIDs(expected)
+		}
+	}
+	return expected
+}
+
+func (p *Processor) walletRemoteMatches(remote *xui.XUIClientInfo, payload *PurchaseProvisioningPayload) bool {
+	expected := payload.InboundIDs
+	if p != nil {
+		expected = p.filterInbounds(payload.InboundIDs)
+	}
+	return walletRemoteMatchesWithFilter(remote, payload, expected)
+}
+
 func walletRemoteMatches(remote *xui.XUIClientInfo, payload *PurchaseProvisioningPayload) bool {
+	return walletRemoteMatchesWithFilter(remote, payload, payload.InboundIDs)
+}
+
+func walletRemoteMatchesWithFilter(remote *xui.XUIClientInfo, payload *PurchaseProvisioningPayload, expectedInbounds []int) bool {
 	if remote == nil || remote.Email != payload.Email || remote.SubID != payload.ExpectedSubID || !remote.Enable {
 		return false
 	}
@@ -624,7 +645,7 @@ func walletRemoteMatches(remote *xui.XUIClientInfo, payload *PurchaseProvisionin
 	if comment != "" && remote.Comment != "" && remote.Comment != comment {
 		return false
 	}
-	return sameIDs(remote.InboundIDs, payload.InboundIDs)
+	return sameIDs(remote.InboundIDs, expectedInbounds)
 }
 
 func sameIDs(actual, expected []int) bool {
@@ -1210,11 +1231,11 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 					Reason: fmt.Sprintf("commercial identity verification failed for existing direct payment subscription %d: %v", existing.ID, idErr),
 				}
 			}
-			if payload.ActionType == "buy" && !directRemoteMatches(remote, payload) {
+			if payload.ActionType == "buy" && !p.directRemoteMatches(remote, payload) {
 				return ProcessOutcome{Kind: OutcomeManualReview, Reason: "remote direct-payment client does not match the durable approved desired state"}
 			}
 		} else {
-			if !directRemoteMatches(remote, payload) {
+			if !p.directRemoteMatches(remote, payload) {
 				return ProcessOutcome{Kind: OutcomeManualReview, Reason: "remote direct-payment client does not match the durable approved desired state"}
 			}
 			clientUUID := payload.ExpectedUUID
@@ -1323,7 +1344,7 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 		if identityErr := verifyClientIdentity(verifiedRemote, payload.ClientEmail, payload.ExpectedUUID, payload.ExpectedSubID); identityErr != nil {
 			return ProcessOutcome{Kind: OutcomeManualReview, Reason: fmt.Sprintf("direct payment create identity could not be proven: %v", identityErr)}
 		}
-		if !directRemoteMatches(verifiedRemote, payload) {
+		if !p.directRemoteMatches(verifiedRemote, payload) {
 			return ProcessOutcome{Kind: OutcomeManualReview, Reason: "direct payment client does not match durable desired state"}
 		}
 
@@ -1379,7 +1400,19 @@ func (p *Processor) handleDirectPaymentProvisioning(ctx context.Context, rec *db
 	}
 }
 
+func (p *Processor) directRemoteMatches(remote *xui.XUIClientInfo, payload *DirectPaymentProvisioningPayload) bool {
+	expected := payload.InboundIDs
+	if p != nil {
+		expected = p.filterInbounds(payload.InboundIDs)
+	}
+	return directRemoteMatchesWithFilter(remote, payload, expected)
+}
+
 func directRemoteMatches(remote *xui.XUIClientInfo, payload *DirectPaymentProvisioningPayload) bool {
+	return directRemoteMatchesWithFilter(remote, payload, payload.InboundIDs)
+}
+
+func directRemoteMatchesWithFilter(remote *xui.XUIClientInfo, payload *DirectPaymentProvisioningPayload, expectedInbounds []int) bool {
 	if remote == nil || remote.Email != payload.ClientEmail || remote.SubID != payload.ExpectedSubID || !remote.Enable {
 		return false
 	}
@@ -1408,7 +1441,7 @@ func directRemoteMatches(remote *xui.XUIClientInfo, payload *DirectPaymentProvis
 	if payload.CustomName != "" && remote.Comment != "" && remote.Comment != payload.CustomName {
 		return false
 	}
-	return sameIDs(remote.InboundIDs, payload.InboundIDs)
+	return sameIDs(remote.InboundIDs, expectedInbounds)
 }
 
 func cleanFlow(flow string) string {
