@@ -56,6 +56,9 @@ func main() {
 	reconcileProcessor.OnPurchaseProvisioned = func(pCtx context.Context, pReqID int64) {
 		handlers.NotifyUserPurchaseFulfilled(pCtx, pReqID)
 	}
+	reconcileProcessor.OnWalletPurchaseProvisioned = func(pCtx context.Context, sub *db.Subscription, payload *reconcile.PurchaseProvisioningPayload) {
+		handlers.NotifyUserWalletPurchaseFulfilled(pCtx, sub, payload)
+	}
 	if err := db.ResetStuckDirectPaymentReconciliations(ctx); err != nil {
 		log.Printf("Warning: failed to reset stuck direct payment reconciliations: %v", err)
 	}

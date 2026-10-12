@@ -75,6 +75,7 @@ type Processor struct {
 	UpdateSubscriptionFn           func(ctx context.Context, sub *db.Subscription) error
 	CreateRefundRequestFn          func(ctx context.Context, r *db.RefundRequest) error
 	OnPurchaseProvisioned          func(ctx context.Context, purchaseRequestID int64)
+	OnWalletPurchaseProvisioned    func(ctx context.Context, sub *db.Subscription, payload *PurchaseProvisioningPayload)
 	BatchSize                      int
 	MaxRetry                       int
 }
@@ -476,6 +477,9 @@ func (p *Processor) handlePurchaseReconciliation(ctx context.Context, rec *db.Re
 				Err:  fmt.Errorf("failed to adopt subscription %s: %w", payload.Email, err),
 			}
 		}
+		if p.OnWalletPurchaseProvisioned != nil {
+			p.OnWalletPurchaseProvisioned(ctx, sub, payload)
+		}
 		return ProcessOutcome{
 			Kind:         OutcomeResolved,
 			TargetStatus: db.ReconciliationStatusResolvedVerified,
@@ -577,6 +581,9 @@ func (p *Processor) startWalletPurchaseProvisioning(ctx context.Context, rec *db
 	}
 	if err := db.CreateSubscription(ctx, sub); err != nil {
 		return ProcessOutcome{Kind: OutcomeRetry, Err: fmt.Errorf("verified wallet client exists but local subscription insert failed: %w", err)}
+	}
+	if p.OnWalletPurchaseProvisioned != nil {
+		p.OnWalletPurchaseProvisioned(ctx, sub, payload)
 	}
 	return ProcessOutcome{
 		Kind: OutcomeResolved, TargetStatus: db.ReconciliationStatusResolvedVerified,

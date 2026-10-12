@@ -237,7 +237,7 @@ func (c *Client) CheckReadiness(ctx context.Context) (*ReadinessStatus, error) {
 	normalizedVersion := strings.TrimPrefix(strings.TrimSpace(version), "v")
 	status.VersionOK = isSupportedPanelVersion(normalizedVersion)
 	if !status.VersionOK {
-		status.Error = fmt.Errorf("unsupported 3x-ui version %s (expected 3.8.5)", status.Version)
+		status.Error = fmt.Errorf("unsupported 3x-ui version %s (expected 3.8.x or 3.9.x)", status.Version)
 		c.SetReady(false)
 		return status, status.Error
 	}
@@ -259,7 +259,16 @@ func isSupportedPanelVersion(version string) bool {
 	if i := strings.IndexAny(version, "-+"); i >= 0 {
 		version = version[:i]
 	}
-	return version == "3.8.5"
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return major == 3 && (minor == 8 || minor == 9)
 }
 
 func (c *Client) GetInbounds() ([]Inbound, error) {

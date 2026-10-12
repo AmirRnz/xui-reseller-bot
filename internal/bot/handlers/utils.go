@@ -305,6 +305,22 @@ func sendSubscriptionResultTo(recipientID int64, link string, detailsMsg string)
 	return nil
 }
 
+func editMessageOrCaption(c telebot.Context, text string, opts ...interface{}) error {
+	msg := c.Message()
+	if msg != nil && (msg.Photo != nil || msg.Document != nil || msg.Video != nil || msg.Animation != nil) {
+		if err := c.EditCaption(text, opts...); err == nil {
+			return nil
+		}
+	}
+	err := c.Edit(text, opts...)
+	if err != nil && (strings.Contains(strings.ToLower(err.Error()), "no text") || strings.Contains(strings.ToLower(err.Error()), "message to edit")) {
+		if captionErr := c.EditCaption(text, opts...); captionErr == nil {
+			return nil
+		}
+	}
+	return err
+}
+
 func maybeEditOrSend(c telebot.Context, text string, opts ...interface{}) error {
 	var hasParseMode bool
 	for _, opt := range opts {
@@ -319,7 +335,7 @@ func maybeEditOrSend(c telebot.Context, text string, opts ...interface{}) error 
 	}
 
 	if c.Callback() != nil {
-		if err := c.Edit(formattedText, opts...); err == nil {
+		if err := editMessageOrCaption(c, formattedText, opts...); err == nil {
 			return nil
 		}
 	}

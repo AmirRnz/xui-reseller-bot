@@ -353,7 +353,7 @@ func HandleAdminRejectTopup(c telebot.Context) error {
 		_, _ = bot.Bot.Send(&telebot.User{ID: target.TelegramID}, "درخواست افزایش موجودی کیف پول شما رد شد.")
 	}
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("❌ درخواست شارژ #%d رد شد.", reqID)})
-	return c.Edit(fmt.Sprintf("❌ درخواست شارژ #%d رد شد.", reqID))
+	return editMessageOrCaption(c, fmt.Sprintf("❌ درخواست شارژ #%d رد شد.", reqID))
 }
 
 func HandleAdminApprovePurchase(c telebot.Context) error {
@@ -468,10 +468,10 @@ func HandleAdminApprovePurchase(c telebot.Context) error {
 	if refreshed != nil && refreshed.ProvisioningStatus == db.PurchaseProvisioningSucceeded {
 		NotifyUserPurchaseFulfilled(context.Background(), reqID)
 		_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID)})
-		return c.Edit(fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID))
+		return editMessageOrCaption(c, fmt.Sprintf("✅ درخواست خرید #%d تایید و فعال شد.", reqID))
 	}
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("تایید درخواست خرید #%d ثبت شد؛ فعال‌سازی ادامه می‌یابد.", reqID)})
-	return c.Edit(fmt.Sprintf("✅ درخواست خرید #%d تایید شد و برای فعال‌سازی امن ثبت گردید.", reqID))
+	return editMessageOrCaption(c, fmt.Sprintf("✅ درخواست خرید #%d تایید شد و برای فعال‌سازی امن ثبت گردید.", reqID))
 }
 
 // NotifyUserPurchaseFulfilled delivers the provisioned service details, subscription links,
@@ -629,6 +629,69 @@ func NotifyUserPurchaseFulfilled(ctx context.Context, purchaseRequestID int64) {
 	}
 }
 
+// NotifyUserWalletPurchaseFulfilled delivers the provisioned service details, subscription links,
+// and QR codes to the reseller/buyer after an asynchronous wallet purchase succeeds.
+func NotifyUserWalletPurchaseFulfilled(ctx context.Context, sub *db.Subscription, payload *reconcile.PurchaseProvisioningPayload) {
+	if sub == nil || payload == nil {
+		return
+	}
+	user, err := db.GetUserByID(ctx, sub.UserID)
+	if err != nil || user == nil || user.TelegramID == 0 {
+		return
+	}
+
+	var subLink string
+	if bot.XUIClient != nil && sub.SubID != "" {
+		links, _ := bot.XUIClient.GetSubscriptionLinks(sub.SubID)
+		for _, link := range links {
+			if strings.HasPrefix(link, "http://") || strings.HasPrefix(link, "https://") {
+				subLink = link
+				break
+			}
+		}
+		if subLink == "" {
+			subLink = bot.XUIClient.SubscriptionURLFor(sub.SubID)
+		}
+	}
+
+	planName := payload.PlanName
+	if planName == "" {
+		planName = "طرح اختصاصی"
+	}
+	var usageDesc string
+	if payload.PlanID != nil {
+		if plan, pErr := db.GetPaidPlanByID(ctx, int64(*payload.PlanID)); pErr == nil && plan != nil {
+			if planName == "طرح اختصاصی" || planName == "" {
+				planName = plan.Name
+			}
+			usageDesc = plan.UsageDescription
+		}
+	}
+
+	durationLabel := "نامحدود"
+	if payload.Months > 0 {
+		durationLabel = fmt.Sprintf("%d ماهه (پس از اولین اتصال شروع می‌شود)", payload.Months)
+	}
+	dataLabel := "نامحدود"
+	if payload.DataGB > 0 {
+		dataLabel = fmt.Sprintf("%d گیگابایت", payload.DataGB)
+	}
+	ipLabel := "نامحدود"
+	if payload.IPLimit > 0 {
+		ipLabel = fmt.Sprintf("%d کاربر / IP", payload.IPLimit)
+	}
+
+	details := fmt.Sprintf("✅ اشتراک شما با موفقیت فعال شد!\n\n📦 نام طرح: %s\n⏱️ مدت زمان: %s\n📊 سقف ترافیک: %s\n👥 سقف کاربر: %s\n💰 هزینه پرداخت شده: %s",
+		planName, durationLabel, dataLabel, ipLabel, persian.FormatMoney(payload.Price))
+	if usageDesc != "" {
+		details += fmt.Sprintf("\n\nنکات استفاده:\n%s", usageDesc)
+	}
+
+	if notifyErr := sendSubscriptionResultTo(user.TelegramID, subLink, details); notifyErr != nil {
+		log.Printf("[ERROR] failed to deliver wallet purchase fulfillment notification to user %d: %v", user.TelegramID, notifyErr)
+	}
+}
+
 func snapshotString(snapshot map[string]any, key string) string {
 	value := snapshot[key]
 	if value == nil {
@@ -767,7 +830,7 @@ func HandleAdminRejectPurchase(c telebot.Context) error {
 	}
 
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("❌ درخواست خرید #%d رد شد.", reqID)})
-	return c.Edit(fmt.Sprintf("❌ درخواست خرید #%d رد شد.", reqID))
+	return editMessageOrCaption(c, fmt.Sprintf("❌ درخواست خرید #%d رد شد.", reqID))
 }
 
 func HandleAdminManualPaymentReviews(c telebot.Context) error {
@@ -821,10 +884,10 @@ func HandleAdminApproveRefund(c telebot.Context) error {
 			menu.Data(fmt.Sprintf("تایید مبلغ پیشنهادی %s", persian.FormatMoney(req.CalculatedAmount)), "admin_refund_accept", fmt.Sprintf("%d", reqID)),
 			menu.Data("ویرایش مبلغ", "admin_refund_edit", fmt.Sprintf("%d", reqID)),
 		))
-		return c.Edit(fmt.Sprintf("مبلغ پیشنهادی استرداد #%d: %s\n\nمبلغ را تایید کنید یا ویرایش کنید.", reqID, persian.FormatMoney(req.CalculatedAmount)), menu)
+		return editMessageOrCaption(c, fmt.Sprintf("مبلغ پیشنهادی استرداد #%d: %s\n\nمبلغ را تایید کنید یا ویرایش کنید.", reqID, persian.FormatMoney(req.CalculatedAmount)), menu)
 	}
 	menu.Inline(menu.Row(menu.Data("وارد کردن مبلغ استرداد", "admin_refund_edit", fmt.Sprintf("%d", reqID))))
-	return c.Edit(fmt.Sprintf("درخواست استرداد #%d فاقد مبلغ پیشنهادی است. برای درخواست قدیمی، مبلغ را به تومان وارد کنید.", reqID), menu)
+	return editMessageOrCaption(c, fmt.Sprintf("درخواست استرداد #%d فاقد مبلغ پیشنهادی است. برای درخواست قدیمی، مبلغ را به تومان وارد کنید.", reqID), menu)
 }
 
 func HandleAdminRefundAcceptSuggested(c telebot.Context) error {
@@ -942,7 +1005,7 @@ func completeRefundApproval(c telebot.Context, reqID, amount int64, note string)
 		_, _ = bot.Bot.Send(&telebot.User{ID: user.TelegramID}, fmt.Sprintf("✅ مبلغ %s بابت لغو سرویس به کیف پول شما اضافه شد.", persian.FormatMoney(amount)))
 	}
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("✅ درخواست استرداد #%d تایید شد.", reqID)})
-	return c.Edit(fmt.Sprintf("✅ درخواست استرداد #%d با مبلغ %s تایید و به کیف پول واریز شد.", reqID, persian.FormatMoney(amount)))
+	return editMessageOrCaption(c, fmt.Sprintf("✅ درخواست استرداد #%d با مبلغ %s تایید و به کیف پول واریز شد.", reqID, persian.FormatMoney(amount)))
 }
 
 func HandleAdminRejectRefund(c telebot.Context) error {
@@ -971,7 +1034,7 @@ func HandleAdminRejectRefund(c telebot.Context) error {
 	}
 
 	_ = c.Respond(&telebot.CallbackResponse{Text: fmt.Sprintf("❌ درخواست استرداد #%d رد شد.", reqID)})
-	return c.Edit(fmt.Sprintf("❌ درخواست استرداد #%d رد شد.", reqID))
+	return editMessageOrCaption(c, fmt.Sprintf("❌ درخواست استرداد #%d رد شد.", reqID))
 }
 
 func extendSubscriptionFromApprovedRequest(user *db.User, sub *db.Subscription, req *db.PurchaseRequest) error {

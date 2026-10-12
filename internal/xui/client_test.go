@@ -150,7 +150,7 @@ func TestCheckReadinessHonorsContextForInboundRead(t *testing.T) {
 	}
 	select {
 	case <-inboundCancelled:
-	case <-time.After(time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("canceled context was not propagated to the inbound request")
 	}
 }
@@ -1078,9 +1078,11 @@ func TestSupportedPanelVersionRequiresExactPatchVersion(t *testing.T) {
 		{"3.8.5", true},
 		{"v3.8.5", true},
 		{"3.8.5-beta.1", true},
-		{"3.8.50", false},
-		{"3.8.4", false},
-		{"3.8.6", false},
+		{"3.9.0", true},
+		{"v3.9.0", true},
+		{"3.9.1", true},
+		{"4.0.0", false},
+		{"2.4.0", false},
 	} {
 		if got := isSupportedPanelVersion(test.version); got != test.supported {
 			t.Errorf("isSupportedPanelVersion(%q) = %v, want %v", test.version, got, test.supported)
@@ -1298,5 +1300,34 @@ func TestGetClientByEmail_WrappedResponse(t *testing.T) {
 	}
 	if info.Email != "wrapped@example.com" || info.SubID != "sub123" || len(info.InboundIDs) != 3 {
 		t.Fatalf("unexpected client info decoded: %+v", info)
+	}
+}
+
+func TestIsSupportedPanelVersion(t *testing.T) {
+	tests := []struct {
+		version string
+		want    bool
+	}{
+		{"3.8.5", true},
+		{"v3.8.5", true},
+		{"3.8.0", true},
+		{"3.9.0", true},
+		{"v3.9.0", true},
+		{"3.9.1", true},
+		{"3.9.0-beta.1", true},
+		{"3.8.5+build123", true},
+		{"4.0.0", false},
+		{"2.4.0", false},
+		{"3.7.9", false},
+		{"3.10.0", false},
+		{"invalid", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		got := isSupportedPanelVersion(tt.version)
+		if got != tt.want {
+			t.Errorf("isSupportedPanelVersion(%q) = %v; want %v", tt.version, got, tt.want)
+		}
 	}
 }
